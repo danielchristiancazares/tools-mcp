@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (can be included for binaries)
+Cargo.lock
+
+# IDE files
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Environment files with secrets
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
