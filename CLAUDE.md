@@ -24,10 +24,22 @@ This is a **Rust-based MCP (Model Context Protocol) server** that provides file 
    - Core functions: `upload_file`, `create_vector_store`, `responses_with_file_search`
 
 3. **WebFetch Pipeline (`src/webfetch/`)**
-   - Retrieves remote pages with caching under `/tmp/tools-mcp-webfetch`
+   - Retrieves remote pages with HTTP or headless browser rendering
+   - Caches under `/tmp/tools-mcp-webfetch` (separate cache keys for http vs browser)
    - **Respects robots.txt** - Fetches and caches robots.txt per domain, blocks disallowed URLs [robotstxt v0.3.0]
-   - **SSRF protection** - Validates URLs, blocks file://, localhost, private IPs, and non-HTTP(S) schemes
+   - **SSRF protection** - Validates URLs, blocks file://, localhost, private IPs, and non-HTTP(S) schemes (applied to both HTTP and browser paths)
    - User agent: `tools-mcp-webfetch/0.1`
+   - **Hybrid rendering strategy**:
+     - HTTP-first with automatic browser fallback for JS-heavy sites
+     - Whitelisted domains (e.g., medium.com, notion.so) automatically use browser
+     - Heuristics detect client-side rendering (React, Vue, Angular patterns)
+     - Explicit `force_browser` parameter available
+   - **Headless browser** (optional, requires Chrome/Chromium):
+     - Uses chromiumoxide v0.7 with Chrome DevTools Protocol [chromiumoxide, https://docs.rs/chromiumoxide/]
+     - Stealth configuration to avoid detection
+     - Browser pool with automatic restart (every 100 requests or 1 hour)
+     - 15s navigation timeout, 2s network idle wait
+     - Blocks images/media for performance
    - Extracts `<body>` content only, converts to Markdown with `htmd` [htmd v0.3.2, https://docs.rs/htmd/]
    - Filters nav/footer/header/script/style tags to reduce duplication and noise
    - Produces inline links `[text](url)` for cleaner, more token-efficient output
@@ -101,10 +113,14 @@ The `env` field allows direct configuration of environment variables without nee
 
 2. **WebFetch** - Fetch and process web content
    - Required: `url`
-   - Optional: `max_chunk_tokens` (default: 2000), `no_cache` (default: false)
-   - Returns JSON with `chunks[]`, `title`, `language`, `fetched_at`, cache metadata
+   - Optional: `max_chunk_tokens` (default: 2000), `no_cache` (default: false), `force_browser` (default: false)
+   - Returns JSON with `chunks[]`, `title`, `language`, `fetched_at`, `rendering_method` ("http" or "browser"), cache metadata, `note`
    - Respects robots.txt and includes SSRF protection
    - Produces inline markdown links for clean output
+   - **Rendering behavior**:
+     - `force_browser=true`: Always use headless browser (requires Chrome/Chromium)
+     - `force_browser=false` (default): HTTP-first, automatic browser fallback for whitelisted domains or JS-heavy heuristics
+     - If Chrome not installed: Falls back to HTTP-only mode with warning
 
 3. **ping** - Health check
    - Returns "pong"
@@ -156,6 +172,19 @@ All tool responses follow the MCP content format:
 - Logs errors to stderr using tracing
 - HTTP error responses include status code and body for debugging
 
+## System Requirements
+
+### Required
+- **Rust toolchain** (edition 2021+)
+- **OPENAI_API_KEY** environment variable
+
+### Optional (for WebFetch browser rendering)
+- **Chrome or Chromium** browser installed
+  - Common paths: `/usr/bin/google-chrome`, `/usr/bin/chromium`, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
+  - If not found: WebFetch operates in HTTP-only mode with warning log
+  - Install on Ubuntu/Debian: `sudo apt install chromium-browser`
+  - Install on macOS: `brew install --cask google-chrome`
+
 ## Environment Variables
 
 - **OPENAI_API_KEY** (required): OpenAI API key for vector store operations
@@ -166,6 +195,7 @@ All tool responses follow the MCP content format:
 
 - **anyhow**: Error handling
 - **reqwest**: HTTP client for OpenAI API
+- **chromiumoxide**: Headless Chrome automation via Chrome DevTools Protocol [chromiumoxide v0.7, https://docs.rs/chromiumoxide/]
 - **readability**: Boilerplate removal for HTML extraction [readability v0.3.0, https://docs.rs/readability/0.3.0/readability/]
 - **htmd**: HTML to Markdown conversion with inline links and tag filtering [htmd v0.3.2, https://docs.rs/htmd/]
 - **scraper**: DOM parsing helpers for metadata [scraper v0.24.0, https://docs.rs/scraper/0.24.0/scraper/]
@@ -174,6 +204,30 @@ All tool responses follow the MCP content format:
 - **serde/serde_json**: JSON serialization
 - **tokio**: Async runtime
 - **tracing/tracing-subscriber**: Logging
+
+## Security Considerations
+
+### Prompt Injection from Web Content
+WebFetch extracts content from untrusted external websites that may contain adversarial text designed to manipulate LLM behavior (e.g., "Ignore previous instructions..."). Key mitigations:
+
+1. **Content is clearly marked as external**: The `rendering_method` field distinguishes between "http" and "browser" sources
+2. **Consuming agents must contextualize**: LLM systems should treat fetched content as untrusted user input, not system instructions
+3. **No automatic command execution**: WebFetch returns structured data; it never executes commands based on scraped content
+4. **SSRF protection**: URL validation prevents fetching from private networks, even if instructed by web content
+
+**Best practice**: Consuming systems should frame WebFetch responses as "external document content" in their prompts to maintain instruction/data separation.
+
+### SSRF Protection
+- Both HTTP and browser rendering paths validate URLs before fetch
+- DNS resolution checks prevent hostname-based bypasses (e.g., `malicious.com` → `127.0.0.1`)
+- Blocks: `file://`, `localhost`, private IPs (10.x, 172.16-31.x, 192.168.x), reserved IPs
+- robots.txt compliance prevents unauthorized crawling
+
+### Browser Security
+- Chrome runs with `--no-sandbox` flag (required for containerized environments)
+- Browser process lifecycle managed to prevent resource leaks
+- Network idle timeout prevents infinite loops (max 20s wait)
+- Images/media blocked to reduce attack surface
 
 ## Common Development Tasks
 

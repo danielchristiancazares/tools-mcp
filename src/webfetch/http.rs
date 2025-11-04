@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{header, Client, StatusCode};
 use robotstxt::DefaultMatcher;
@@ -47,7 +47,13 @@ fn is_private_ip(ip: IpAddr) -> bool {
 }
 
 /// Validate URL for SSRF protection
-fn validate_url_ssrf(url: &str) -> Result<()> {
+// Perform conservative SSRF validation:
+// - allow only http/https schemes
+// - disallow localhost names and literal private IPs
+// - resolve DNS and block if any resolved IP is private/reserved
+// Note: DNS resolution uses Tokio's async resolver [tokio v1.x, lookup_host]
+// https://docs.rs/tokio/1/tokio/net/fn.lookup_host.html
+pub async fn validate_url_ssrf(url: &str) -> Result<()> {
     let parsed = Url::parse(url)?;
 
     // Only allow http and https schemes
@@ -78,6 +84,33 @@ fn validate_url_ssrf(url: &str) -> Result<()> {
         }
     } else {
         return Err(anyhow!("URL must have a valid host"));
+    }
+
+    // Resolve the host and ensure it does not map to a private/reserved IP
+    // Choose a sensible default port for resolution when none is present
+    let port = parsed.port().unwrap_or_else(|| match parsed.scheme() {
+        "https" => 443,
+        _ => 80,
+    });
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL must have a valid host"))?;
+    let mut any_private = false;
+    // Use Tokio DNS resolution [tokio v1.x]
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("DNS resolution failed for host '{}':", host))?;
+    for addr in addrs {
+        if is_private_ip(addr.ip()) {
+            any_private = true;
+            break;
+        }
+    }
+    if any_private {
+        return Err(anyhow!(
+            "Resolved host '{}' maps to a private/reserved IP; refusing to fetch",
+            host
+        ));
     }
 
     Ok(())
@@ -149,7 +182,7 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
 /// Fetch the remote document, applying cache-busting headers when requested.
 pub async fn fetch_document(client: &Client, req: &FetchRequest) -> Result<FetchedBody> {
     // Validate URL for SSRF protection first
-    validate_url_ssrf(&req.url)?;
+    validate_url_ssrf(&req.url).await?;
 
     // Check robots.txt
     if !is_allowed_by_robots(client, &req.url).await? {

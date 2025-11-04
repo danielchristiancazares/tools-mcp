@@ -11,6 +11,9 @@ pub struct FetchRequest {
     /// Force bypassing the cache when set to true.
     #[serde(default)]
     pub no_cache: bool,
+    /// Force using headless browser for rendering (bypasses HTTP-first heuristics).
+    #[serde(default)]
+    pub force_browser: bool,
 }
 
 /// A single document chunk with headings and normalized text.
@@ -32,6 +35,8 @@ pub struct FetchResponse {
     pub language: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chunks: Vec<FetchChunk>,
+    /// Rendering method used: "http" or "browser"
+    pub rendering_method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
