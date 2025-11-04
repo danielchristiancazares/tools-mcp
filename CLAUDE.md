@@ -39,7 +39,7 @@ This is a **Rust-based MCP (Model Context Protocol) server** that provides file 
      - Stealth configuration to avoid detection
      - Browser pool with automatic restart (every 100 requests or 1 hour)
      - 15s navigation timeout, 2s network idle wait
-     - Blocks images/media for performance
+     - Resource blocking for performance: images, web fonts, video/audio autoplay
    - Extracts `<body>` content only, converts to Markdown with `htmd` [htmd v0.3.2, https://docs.rs/htmd/]
    - Filters nav/footer/header/script/style tags to reduce duplication and noise
    - Produces inline links `[text](url)` for cleaner, more token-efficient output
@@ -227,7 +227,7 @@ WebFetch extracts content from untrusted external websites that may contain adve
 - Chrome runs with `--no-sandbox` flag (required for containerized environments)
 - Browser process lifecycle managed to prevent resource leaks
 - Network idle timeout prevents infinite loops (max 20s wait)
-- Images/media blocked to reduce attack surface
+- Resource blocking reduces attack surface: images, web fonts, video/audio autoplay
 
 ## Common Development Tasks
 

@@ -170,8 +170,10 @@ async fn spawn_browser() -> Result<Browser> {
             "--disable-setuid-sandbox".to_string(),
             // Memory limits to prevent leaks
             "--max-old-space-size=512".to_string(),
-            // Disable images and media for performance
+            // Block resource loading for performance and bandwidth
             "--blink-settings=imagesEnabled=false".to_string(),
+            "--disable-remote-fonts".to_string(), // Block web fonts, use system fallbacks
+            "--autoplay-policy=document-user-activation-required".to_string(), // Block video/audio autoplay
             // Stealth mode settings
             "--disable-blink-features=AutomationControlled".to_string(),
             // Additional privacy/performance settings
