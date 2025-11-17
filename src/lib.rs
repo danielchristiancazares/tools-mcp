@@ -180,7 +180,7 @@ impl ApiConfig {
     }
 }
 
-fn is_allowed_upload_ext(ext: &str) -> bool {
+pub fn is_allowed_upload_ext(ext: &str) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
         "c" | "cpp"
@@ -371,7 +371,8 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
             .error_for_status()?
             .bytes()
             .await?;
-        let name = path_or_url.split('/').last().unwrap_or("file");
+        // Use rsplit().next() to avoid iterating the entire iterator; satisfies clippy
+        let name = path_or_url.rsplit('/').next().unwrap_or("file");
         let eff = compute_upload_filename(name);
         let part = multipart::Part::bytes(bytes.to_vec()).file_name(eff.into_owned());
         multipart::Form::new()

@@ -105,7 +105,14 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     };
 
     // Build response from HTTP content
-    build_response(req.url, fetched_at, extracted, cache_hit, rendering_method.to_string(), req.max_chunk_tokens)
+    build_response(
+        req.url,
+        fetched_at,
+        extracted,
+        cache_hit,
+        rendering_method.to_string(),
+        req.max_chunk_tokens,
+    )
 }
 
 /// Attempt to render page using headless browser
@@ -124,9 +131,7 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
 
     // Get or create browser pool
     let pool = BROWSER_POOL
-        .get_or_init(|| async {
-            Arc::new(browser::BrowserPool::new())
-        })
+        .get_or_init(|| async { Arc::new(browser::BrowserPool::new()) })
         .await;
 
     // Render the page
@@ -151,7 +156,14 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
     let extracted = extract::extract(html.as_bytes(), Some("text/html"), &req.url)
         .context("extract browser-rendered content")?;
 
-    build_response(req.url.clone(), fetched_at, extracted, false, "browser".to_string(), req.max_chunk_tokens)
+    build_response(
+        req.url.clone(),
+        fetched_at,
+        extracted,
+        false,
+        "browser".to_string(),
+        req.max_chunk_tokens,
+    )
 }
 
 /// Build FetchResponse from extracted content
@@ -163,8 +175,8 @@ fn build_response(
     rendering_method: String,
     max_chunk_tokens: Option<usize>,
 ) -> Result<FetchResponse> {
-    let chunks_raw = chunker::chunk_markdown(&extracted.markdown, max_chunk_tokens)
-        .context("chunk text")?;
+    let chunks_raw =
+        chunker::chunk_markdown(&extracted.markdown, max_chunk_tokens).context("chunk text")?;
 
     let mut chunks: Vec<FetchChunk> = Vec::new();
     for (heading, text, tokens) in &chunks_raw {

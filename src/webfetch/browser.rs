@@ -2,9 +2,9 @@
 /// Uses chromiumoxide for async Chrome DevTools Protocol access
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::page::Page;
 use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
 use chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired;
+use chromiumoxide::page::Page;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,8 +49,8 @@ impl BrowserPool {
         // Check if restart needed
         let needs_restart = if let Some(instance) = &*guard {
             let age = instance.created_at.elapsed();
-            let should_restart = instance.request_count >= MAX_REQUESTS_BEFORE_RESTART
-                || age >= MAX_BROWSER_AGE;
+            let should_restart =
+                instance.request_count >= MAX_REQUESTS_BEFORE_RESTART || age >= MAX_BROWSER_AGE;
 
             if should_restart {
                 info!(
@@ -109,15 +109,16 @@ impl BrowserPool {
             .context("Failed to create new browser page")?;
 
         // Render with timeout
-        let result = tokio::time::timeout(
-            NAVIGATION_TIMEOUT,
-            render_page_internal(page, url)
-        ).await;
+        let result =
+            tokio::time::timeout(NAVIGATION_TIMEOUT, render_page_internal(page, url)).await;
 
         match result {
             Ok(Ok(html)) => Ok(html),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow!("Browser rendering timed out after {:?}", NAVIGATION_TIMEOUT)),
+            Err(_) => Err(anyhow!(
+                "Browser rendering timed out after {:?}",
+                NAVIGATION_TIMEOUT
+            )),
         }
     }
 
@@ -222,9 +223,7 @@ async fn render_page_internal(page: Page, url: &str) -> Result<String> {
     configure_stealth(&page).await?;
 
     // Navigate to URL
-    page.goto(url)
-        .await
-        .context("Failed to navigate to URL")?;
+    page.goto(url).await.context("Failed to navigate to URL")?;
 
     // Wait for load event
     debug!("Waiting for page load event");
@@ -237,7 +236,8 @@ async fn render_page_internal(page: Page, url: &str) -> Result<String> {
 
     // Extract HTML content
     debug!("Extracting HTML content");
-    let html = page.content()
+    let html = page
+        .content()
         .await
         .context("Failed to extract page content")?;
 
@@ -373,7 +373,10 @@ mod tests {
     #[ignore] // Requires Chrome/Chromium installation
     async fn test_browser_pool_creation() {
         let pool = BrowserPool::new();
-        assert!(pool.browser.lock().await.is_none(), "Browser should not be spawned until first use");
+        assert!(
+            pool.browser.lock().await.is_none(),
+            "Browser should not be spawned until first use"
+        );
     }
 
     #[tokio::test]
@@ -397,7 +400,10 @@ mod tests {
 
         match result {
             Ok(html) => {
-                assert!(html.contains("Example Domain"), "Should contain example.com content");
+                assert!(
+                    html.contains("Example Domain"),
+                    "Should contain example.com content"
+                );
                 assert!(html.len() > 100, "Should have substantial HTML content");
             }
             Err(e) => {

@@ -1,0 +1,56 @@
+
+# main-overview
+
+## Development Guidelines
+
+- Only modify code directly relevant to the specific request. Avoid changing unrelated functionality.
+- Never replace code with placeholders like `# ... rest of the processing ...`. Always include complete code.
+- Break problems into smaller steps. Think through each step separately before implementing.
+- Always provide a complete PLAN with REASONING based on evidence from code and logs before making changes.
+- Explain your OBSERVATIONS clearly, then provide REASONING to identify the exact issue. Add console logs when needed to gather more information.
+
+
+The project implements a hybrid code analysis system that combines machine learning with formal verification methods. The core architecture consists of five key business components:
+
+## Primary Business Components
+
+1. Neuro-Symbolic Analysis Pipeline (`src/rustverify/mod.rs`)
+- Hybrid system merging LLM code review with formal verification
+- Symbolic execution validates LLM-generated hypotheses
+- Verification categories: overflow, division-by-zero, logic errors, unsafe blocks
+- Z3 theorem prover integration
+Importance Score: 90
+
+2. Constraint System (`src/rustverify/constraints.rs`)
+- Transforms Rust AST into logical constraints for Z3
+- Maps language constructs to verification primitives
+- Control flow and dependency analysis
+Importance Score: 85
+
+3. Smart Line Ending System (`src/smart_file_edit/mod.rs`)
+- Preserves original line endings during code modifications
+- Canonical LF processing with original format retention
+- Mixed newline handling system
+Importance Score: 75
+
+4. JavaScript Content Analysis (`src/webfetch/heuristics.rs`)
+- Website JavaScript density analysis
+- Framework detection scoring
+- Dynamic rendering strategy selection
+Importance Score: 70
+
+5. Code Search Vector Management (`src/codequery/mod.rs`)
+- Semantic code search orchestration
+- Change-based reindexing system
+- Incremental update processing
+Importance Score: 65
+
+## Architecture Integration
+
+The system follows a two-phase verification approach:
+1. LLM generates initial code analysis hypotheses
+2. Formal verification confirms or rejects these hypotheses
+
+Core business value centers on the neuro-symbolic verification system that combines ML pattern recognition with mathematical verification methods.
+
+$END$

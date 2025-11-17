@@ -15,7 +15,7 @@ const MIN_CONTENT_RATIO: f64 = 0.1;
 #[derive(Debug, Clone)]
 pub struct JsHeuristicResult {
     pub is_js_heavy: bool,
-    pub confidence: f64,  // 0.0 to 1.0
+    pub confidence: f64, // 0.0 to 1.0
     pub reasons: Vec<String>,
 }
 
@@ -88,7 +88,11 @@ pub fn analyze_js_heavy(
 }
 
 /// Heuristic 1: Check for empty body with SPA mount point divs
-fn check_empty_spa_shell(html_body: &str, extracted_markdown: &str, result: &mut JsHeuristicResult) -> bool {
+fn check_empty_spa_shell(
+    html_body: &str,
+    extracted_markdown: &str,
+    result: &mut JsHeuristicResult,
+) -> bool {
     // Check if extracted content is minimal
     let content_is_minimal = extracted_markdown.trim().len() < MIN_CONTENT_CHARS;
 
@@ -120,10 +124,7 @@ fn check_empty_spa_shell(html_body: &str, extracted_markdown: &str, result: &mut
     if html_len > 0.0 {
         let ratio = content_len / html_len;
         if ratio < MIN_CONTENT_RATIO {
-            result.add_indicator(
-                0.2,
-                format!("Low content ratio: {:.2}%", ratio * 100.0)
-            );
+            result.add_indicator(0.2, format!("Low content ratio: {:.2}%", ratio * 100.0));
             return true;
         }
     }
@@ -169,7 +170,12 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
     let mut found_frameworks = Vec::new();
 
     // React signatures
-    let react_patterns = ["data-reactroot", "data-reactid", "__reactContainer", "__REACT"];
+    let react_patterns = [
+        "data-reactroot",
+        "data-reactid",
+        "__reactContainer",
+        "__REACT",
+    ];
     if react_patterns.iter().any(|p| html_body.contains(p)) {
         found_frameworks.push("React");
     }
@@ -199,7 +205,7 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
     if !found_frameworks.is_empty() {
         result.add_indicator(
             0.1,
-            format!("Framework detected: {}", found_frameworks.join(", "))
+            format!("Framework detected: {}", found_frameworks.join(", ")),
         );
         true
     } else {
@@ -264,7 +270,7 @@ mod tests {
             </body>
             </html>
         "#;
-        let markdown = "";  // Empty extracted content
+        let markdown = ""; // Empty extracted content
 
         let result = analyze_js_heavy(html, markdown, Some("text/html"), None);
         assert!(result.is_js_heavy, "Should detect empty SPA shell");
@@ -339,7 +345,10 @@ mod tests {
         let markdown = "Welcome to my blog\nThis is a long article with lots of content...\nMore content here, making this a substantial page.\nEven more content to ensure we exceed the minimum threshold.\nAdditional paragraphs to make this a realistic HTML page.\nThe content continues with more text and information.\nThis ensures the extracted markdown will be long enough.\nWe want to avoid false positives for normal static pages.\nSo we add plenty of content here to test the heuristics properly.";
 
         let result = analyze_js_heavy(html, markdown, Some("text/html"), None);
-        assert!(!result.is_js_heavy, "Should not detect normal HTML as JS-heavy");
+        assert!(
+            !result.is_js_heavy,
+            "Should not detect normal HTML as JS-heavy"
+        );
     }
 
     #[test]
@@ -348,6 +357,9 @@ mod tests {
         let markdown = "";
 
         let result = analyze_js_heavy(html, markdown, Some("text/html"), Some(2000));
-        assert!(result.confidence > 0.0, "Should consider small content length");
+        assert!(
+            result.confidence > 0.0,
+            "Should consider small content length"
+        );
     }
 }

@@ -9,7 +9,7 @@ fn setup() {
     INIT.call_once(|| {
         // Build the binary once before all tests
         let output = Command::new("cargo")
-            .args(&["build", "--release"])
+            .args(["build", "--release"])
             .output()
             .expect("Failed to build project");
 
@@ -24,7 +24,7 @@ fn send_mcp_message(message: Value) -> Result<Value, Box<dyn std::error::Error>>
     setup();
 
     let mut child = Command::new("cargo")
-        .args(&["run", "--release", "--quiet"])
+        .args(["run", "--release", "--quiet"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -81,7 +81,7 @@ fn send_mcp_message_with_headers(message: Value) -> Result<Value, Box<dyn std::e
     setup();
 
     let mut child = Command::new("cargo")
-        .args(&["run", "--release", "--quiet"])
+        .args(["run", "--release", "--quiet"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -187,7 +187,7 @@ fn test_tools_list() {
     assert_eq!(response["id"], 3);
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 3); // Simplified to 3 user-facing tools
+    assert_eq!(tools.len(), 6); // ping, WebFetch, CodeQuery, smart_file_edit, RustAst, RustCallGraph
 
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -195,6 +195,9 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"ping"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"CodeQuery"));
+    assert!(tool_names.contains(&"smart_file_edit"));
+    assert!(tool_names.contains(&"RustAst"));
+    assert!(tool_names.contains(&"RustCallGraph"));
 }
 
 #[test]
@@ -279,7 +282,7 @@ fn test_content_length_headers() {
 #[test]
 fn test_protocol_aliases() {
     // Test various protocol aliases
-    let aliases = vec![
+    let aliases = [
         "initialize",
         "server/initialize",
         "tools/list",
@@ -294,7 +297,8 @@ fn test_protocol_aliases() {
             "params": {}
         });
 
-        let response = send_mcp_message(request).expect(&format!("Failed with alias: {}", method));
+        let response =
+            send_mcp_message(request).unwrap_or_else(|_| panic!("Failed with alias: {}", method));
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response["result"].is_object() || response["error"].is_object());
     }
@@ -306,7 +310,7 @@ fn test_code_query_requires_api_key() {
 
     // Spawn process WITHOUT OPENAI_API_KEY in environment
     let mut child = Command::new("cargo")
-        .args(&["run", "--release", "--quiet"])
+        .args(["run", "--release", "--quiet"])
         .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -515,7 +519,8 @@ mod stress_tests {
                 "params": {}
             });
 
-            let response = send_mcp_message(request).expect(&format!("Failed request {}", i));
+            let response =
+                send_mcp_message(request).unwrap_or_else(|_| panic!("Failed request {}", i));
             assert_eq!(response["id"], 100 + i);
             assert_eq!(
                 response["result"]["content"][0]["text"].as_str(),

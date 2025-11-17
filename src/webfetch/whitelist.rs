@@ -12,27 +12,22 @@ const JS_HEAVY_DOMAINS: &[&str] = &[
     "angular.dev",
     "angular.io",
     "svelte.dev",
-
     // Content platforms
     "medium.com",
     "notion.so",
     "notion.site",
-
     // Developer tools/platforms
     "vercel.com",
     "netlify.app",
     "cloudflare.com",
-
     // Modern docs platforms
     "gitbook.io",
     "readme.io",
     "docusaurus.io",
-
     // Single-page applications
     "app.slack.com",
     "web.telegram.org",
     "discord.com/app",
-
     // Common SPA patterns
     "*.vercel.app",
     "*.netlify.app",
@@ -94,7 +89,9 @@ mod tests {
     fn test_no_match() {
         assert!(!is_whitelisted_js_heavy("https://example.com/"));
         assert!(!is_whitelisted_js_heavy("https://github.com/repo"));
-        assert!(!is_whitelisted_js_heavy("https://stackoverflow.com/questions"));
+        assert!(!is_whitelisted_js_heavy(
+            "https://stackoverflow.com/questions"
+        ));
     }
 
     #[test]
