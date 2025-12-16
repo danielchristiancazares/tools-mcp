@@ -964,7 +964,9 @@ struct HunkLine {
 struct UnifiedHunk {
     old_start: usize,
     old_len: usize,
+    #[allow(dead_code)] // Parsed from diff header but not currently used
     new_start: usize,
+    #[allow(dead_code)] // Parsed from diff header but not currently used
     new_len: usize,
     lines: Vec<HunkLine>,
 }

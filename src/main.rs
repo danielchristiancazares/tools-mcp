@@ -536,20 +536,34 @@ async fn handle_webfetch(id: Option<Value>, args: Value) -> RpcResponse<'static>
 
     match webfetch::run_fetch(request).await {
         Ok(response) => {
-            let json_value =
-                serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({}));
-            let json_text = serde_json::to_string(&json_value).unwrap_or_else(|_| "{}".to_string());
-            RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": json_text
-                    }],
-                    "isError": false
-                })),
-                error: None,
+            match serde_json::to_value(&response) {
+                Ok(json_value) => {
+                    let json_text =
+                        serde_json::to_string_pretty(&json_value).unwrap_or_else(|e| {
+                            format!("{{\"error\": \"serialization failed: {}\"}}", e)
+                        });
+                    RpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: Some(serde_json::json!({
+                            "content": [{
+                                "type": "text",
+                                "text": json_text
+                            }],
+                            "isError": false
+                        })),
+                        error: None,
+                    }
+                }
+                Err(e) => RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(err_text(&format!(
+                        "webfetch succeeded but response serialization failed: {}",
+                        e
+                    ))),
+                    error: None,
+                },
             }
         }
         Err(e) => RpcResponse {

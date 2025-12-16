@@ -118,7 +118,12 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 
 /// Attempt to render page using headless browser
 async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
-    // Check browser cache first (works even if Chrome isn't installed)
+    // Validate URL for SSRF BEFORE checking cache to prevent cache poisoning attacks
+    http::validate_url_ssrf(&req.url)
+        .await
+        .context("SSRF validation failed")?;
+
+    // Check browser cache (works even if Chrome isn't installed)
     let cache_key = format!("{}_browser", req.url);
     if !req.no_cache {
         if let Some(entry) = cache::read_cache(&cache_key).context("read browser cache")? {
@@ -142,11 +147,6 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
             "Chrome/Chromium not installed. Browser rendering disabled."
         ));
     }
-
-    // Validate URL for SSRF before browser render
-    http::validate_url_ssrf(&req.url)
-        .await
-        .context("SSRF validation failed")?;
 
     // Get or create browser pool
     let pool = BROWSER_POOL

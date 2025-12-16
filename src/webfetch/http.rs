@@ -4,8 +4,8 @@ use reqwest::{header, Client, StatusCode};
 use robotstxt::DefaultMatcher;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use url::Url;
 
 use crate::webfetch::types::FetchRequest;
@@ -14,8 +14,8 @@ const USER_AGENT: &str = "tools-mcp-webfetch/0.1";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: usize = 5;
 
-// Global cache for robots.txt content per domain (stored as String)
-static ROBOTS_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
+// Global cache for robots.txt content per domain (async-safe RwLock)
+static ROBOTS_CACHE: RwLock<Option<HashMap<String, Option<String>>>> = RwLock::const_new(None);
 
 /// Raw payload returned from the HTTP fetch layer.
 pub struct FetchedBody {
@@ -136,14 +136,13 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
     let parsed = Url::parse(url)?;
     let domain = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
 
-    // Check cache first
+    // Check cache first (read lock)
     {
-        let mut cache = ROBOTS_CACHE.lock().unwrap();
-        if cache.is_none() {
-            *cache = Some(HashMap::new());
-        }
-        if let Some(cached) = cache.as_ref().unwrap().get(&domain) {
-            return Ok(cached.clone());
+        let cache = ROBOTS_CACHE.read().await;
+        if let Some(ref map) = *cache {
+            if let Some(cached) = map.get(&domain) {
+                return Ok(cached.clone());
+            }
         }
     }
 
@@ -160,9 +159,12 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
         _ => None, // No robots.txt or error = allow all
     };
 
-    // Cache the result
+    // Cache the result (write lock)
     {
-        let mut cache = ROBOTS_CACHE.lock().unwrap();
+        let mut cache = ROBOTS_CACHE.write().await;
+        if cache.is_none() {
+            *cache = Some(HashMap::new());
+        }
         cache.as_mut().unwrap().insert(domain, content.clone());
     }
 
