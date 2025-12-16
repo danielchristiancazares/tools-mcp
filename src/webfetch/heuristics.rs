@@ -49,9 +49,9 @@ pub fn analyze_js_heavy(
 ) -> JsHeuristicResult {
     let mut result = JsHeuristicResult::new();
 
-    // Skip analysis for non-HTML content
+    // Skip analysis for non-HTML content (case-insensitive check)
     if let Some(ct) = content_type {
-        if !ct.contains("text/html") {
+        if !ct.to_ascii_lowercase().contains("text/html") {
             return result;
         }
     }

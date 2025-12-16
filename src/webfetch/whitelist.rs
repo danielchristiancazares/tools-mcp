@@ -27,7 +27,7 @@ const JS_HEAVY_DOMAINS: &[&str] = &[
     // Single-page applications
     "app.slack.com",
     "web.telegram.org",
-    "discord.com/app",
+    "discord.com",
     // Common SPA patterns
     "*.vercel.app",
     "*.netlify.app",
@@ -47,8 +47,8 @@ pub fn is_whitelisted_js_heavy(url: &str) -> bool {
 
     for pattern in JS_HEAVY_DOMAINS {
         if let Some(suffix) = pattern.strip_prefix("*.") {
-            // Wildcard pattern: *.vercel.app matches foo.vercel.app
-            if host.ends_with(suffix) {
+            // Wildcard pattern: *.vercel.app matches foo.vercel.app but not vercel.app itself
+            if host != suffix && host.ends_with(&format!(".{}", suffix)) {
                 return true;
             }
         } else if host == *pattern || host.ends_with(&format!(".{}", pattern)) {

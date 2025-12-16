@@ -71,8 +71,9 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     let extracted = extract::extract(&body, content_type.as_deref(), &req.url)
         .context("extract document content")?;
 
-    // Check if content appears JS-heavy (only if not from cache)
-    let rendering_method = if !cache_hit && !req.force_browser {
+    // Check if content appears JS-heavy (even when HTML came from cache,
+    // otherwise a JS-heavy page can get "stuck" returning cached shell HTML forever)
+    let rendering_method = if !req.force_browser {
         let html_str = String::from_utf8_lossy(&body);
         let analysis = heuristics::analyze_js_heavy(
             &html_str,
@@ -117,6 +118,24 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 
 /// Attempt to render page using headless browser
 async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
+    // Check browser cache first (works even if Chrome isn't installed)
+    let cache_key = format!("{}_browser", req.url);
+    if !req.no_cache {
+        if let Some(entry) = cache::read_cache(&cache_key).context("read browser cache")? {
+            let extracted = extract::extract(&entry.body, entry.content_type.as_deref(), &req.url)
+                .context("extract cached browser-rendered content")?;
+
+            return build_response(
+                req.url.clone(),
+                entry.fetched_at,
+                extracted,
+                true,
+                "browser".to_string(),
+                req.max_chunk_tokens,
+            );
+        }
+    }
+
     // Check if browser is available
     if !browser::BrowserPool::is_available().await {
         return Err(anyhow::anyhow!(
@@ -140,8 +159,7 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
         .await
         .context("Browser page rendering failed")?;
 
-    // Cache browser-rendered content
-    let cache_key = format!("{}_browser", req.url);
+    // Cache browser-rendered content (cache_key already defined above)
     let fetched_at = Utc::now();
     if !req.no_cache {
         let entry = cache::CachedFetch {

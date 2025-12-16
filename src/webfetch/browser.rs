@@ -67,13 +67,17 @@ impl BrowserPool {
         // Restart if needed
         if needs_restart {
             if let Some(mut instance) = guard.take() {
-                // Attempt graceful shutdown
-                if let Err(e) = Arc::get_mut(&mut instance.browser)
-                    .ok_or_else(|| anyhow!("Browser has multiple references"))?
-                    .close()
-                    .await
-                {
-                    warn!("Error closing browser during restart: {}", e);
+                // Attempt graceful shutdown (don't fail if there are multiple refs)
+                match Arc::get_mut(&mut instance.browser) {
+                    Some(browser) => {
+                        if let Err(e) = browser.close().await {
+                            warn!("Error closing browser during restart: {}", e);
+                        }
+                    }
+                    None => {
+                        // Don't fail the request - old browser will be dropped when refs go away
+                        warn!("Cannot gracefully close browser during restart: multiple references exist");
+                    }
                 }
             }
         }
@@ -219,34 +223,40 @@ async fn spawn_browser() -> Result<Browser> {
 async fn render_page_internal(page: Page, url: &str) -> Result<String> {
     debug!("Navigating to: {}", url);
 
-    // Configure stealth settings
-    configure_stealth(&page).await?;
+    // Inner block so we always close the page even on errors
+    let result: Result<String> = async {
+        // Configure stealth settings
+        configure_stealth(&page).await?;
 
-    // Navigate to URL
-    page.goto(url).await.context("Failed to navigate to URL")?;
+        // Navigate to URL
+        page.goto(url).await.context("Failed to navigate to URL")?;
 
-    // Wait for load event
-    debug!("Waiting for page load event");
-    let mut load_event = page.event_listener::<EventLoadEventFired>().await?;
-    let _ = tokio::time::timeout(Duration::from_secs(10), load_event.next()).await;
+        // Wait for load event
+        debug!("Waiting for page load event");
+        let mut load_event = page.event_listener::<EventLoadEventFired>().await?;
+        let _ = tokio::time::timeout(Duration::from_secs(10), load_event.next()).await;
 
-    // Wait for network idle (additional content loading)
-    debug!("Waiting for network idle");
-    wait_for_network_idle(&page).await?;
+        // Wait for network idle (additional content loading)
+        debug!("Waiting for network idle");
+        wait_for_network_idle(&page).await?;
 
-    // Extract HTML content
-    debug!("Extracting HTML content");
-    let html = page
-        .content()
-        .await
-        .context("Failed to extract page content")?;
+        // Extract HTML content
+        debug!("Extracting HTML content");
+        let html = page
+            .content()
+            .await
+            .context("Failed to extract page content")?;
 
-    // Close the page to free resources
+        Ok(html)
+    }
+    .await;
+
+    // Always close the page to free resources (even on errors)
     if let Err(e) = page.close().await {
         warn!("Error closing page: {}", e);
     }
 
-    Ok(html)
+    result
 }
 
 /// Configure stealth settings to avoid detection
@@ -326,19 +336,31 @@ async fn wait_for_network_idle(page: &Page) -> Result<()> {
 
 /// Find Chrome or Chromium binary on the system
 fn find_chrome_binary() -> Option<String> {
+    // Allow explicit override via environment variable
+    for var in ["CHROME_PATH", "CHROMIUM_PATH", "CHROME_EXECUTABLE"] {
+        if let Ok(p) = std::env::var(var) {
+            let p = p.trim();
+            if !p.is_empty() && std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+    }
+
     let candidates = [
         // Linux
         "/usr/bin/google-chrome",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/snap/bin/chromium",
+        "/usr/bin/microsoft-edge",
         // macOS
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        // Let chromiumoxide find it
-        "chrome",
-        "chromium",
-        "google-chrome",
+        // Windows (common install locations)
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     ];
 
     for path in &candidates {
@@ -347,18 +369,36 @@ fn find_chrome_binary() -> Option<String> {
         }
     }
 
-    // Try which/where command
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("google-chrome")
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(path) = String::from_utf8(output.stdout) {
-                let path = path.trim();
-                if !path.is_empty() {
-                    return Some(path.to_string());
-                }
-            }
+    // Try PATH lookup via which (Unix) or where (Windows)
+    fn find_in_path(bin: &str) -> Option<String> {
+        let cmd = if cfg!(target_os = "windows") {
+            "where"
+        } else {
+            "which"
+        };
+        let output = std::process::Command::new(cmd).arg(bin).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first = stdout.lines().next()?.trim();
+        if first.is_empty() {
+            None
+        } else {
+            Some(first.to_string())
+        }
+    }
+
+    for bin in [
+        "google-chrome",
+        "chrome",
+        "chromium",
+        "chromium-browser",
+        "msedge",
+        "microsoft-edge",
+    ] {
+        if let Some(p) = find_in_path(bin) {
+            return Some(p);
         }
     }
 

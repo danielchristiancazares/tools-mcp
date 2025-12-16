@@ -43,9 +43,6 @@ use tokio::io::{
 use tracing::{error, info};
 
 mod codequery;
-mod rust_ast;
-mod rust_callgraph;
-mod rustverify;
 mod smart_file_edit;
 mod webfetch;
 
@@ -323,36 +320,6 @@ async fn main() -> Result<()> {
                 "additionalProperties": true
             }),
         },
-        ToolDef {
-            name: "RustAst".into(),
-            description: "Inspect Rust source structure (functions and types) via syn AST.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "required":["file_path"],
-                "properties":{
-                    "file_path": {"type":"string", "description":"Path to Rust source file to inspect"}
-                }
-            }),
-        },
-        ToolDef {
-            name: "RustCallGraph".into(),
-            description: "Analyze Rust files and return a simple function-level call graph (offline).".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "file_paths": {
-                        "type":"array",
-                        "items": {"type":"string"},
-                        "description":"Rust source files to include in the call graph"
-                    },
-                    "root_dir": {
-                        "type":"string",
-                        "description":"Root directory to recursively scan for .rs files when file_paths is omitted"
-                    }
-                },
-                "additionalProperties": false
-            }),
-        },
     ];
 
     while let Some(line) = match read_mcp_message(&mut reader).await {
@@ -408,12 +375,23 @@ async fn main() -> Result<()> {
                     },
                     tools: tools.clone(),
                 };
+                let (result, error) = match serde_json::to_value(init) {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => (
+                        None,
+                        Some(RpcError {
+                            code: -32603,
+                            message: "Internal error: failed to serialize initialize payload".into(),
+                            data: Some(serde_json::json!({"details": e.to_string()})),
+                        }),
+                    ),
+                };
                 (
                     RpcResponse {
                         jsonrpc: "2.0",
                         id: req.id,
-                        result: Some(serde_json::to_value(init).unwrap()),
-                        error: None,
+                        result,
+                        error,
                     },
                     false,
                 )
@@ -471,12 +449,6 @@ async fn main() -> Result<()> {
                     }
                     "smart_file_edit" | "SmartFileEdit" => {
                         smart_file_edit::handle_smart_file_edit(req.id.clone(), args).await
-                    }
-                    "RustAst" | "rust_ast" | "rust-ast" => {
-                        rust_ast::handle_rust_ast(req.id.clone(), args).await
-                    }
-                    "RustCallGraph" | "rust_call_graph" | "rust-call-graph" => {
-                        rust_callgraph::handle_rust_callgraph(req.id.clone(), args).await
                     }
                     other => RpcResponse {
                         jsonrpc: "2.0",
@@ -714,98 +686,3 @@ async fn handle_bash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     }
 }
 
-async fn handle_rust_verify(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    use crate::rustverify::{analyze_rust_file, AnalysisType};
-    use serde::Deserialize;
-    use std::path::Path;
-
-    #[derive(Deserialize)]
-    struct RustVerifyRequest {
-        file_path: String,
-        #[serde(default)]
-        analysis_types: Option<Vec<AnalysisType>>,
-        #[serde(default = "default_timeout")]
-        timeout_ms: u64,
-    }
-
-    fn default_timeout() -> u64 {
-        30000
-    }
-
-    let req_result = serde_json::from_value::<RustVerifyRequest>(args);
-    let request = match req_result {
-        Ok(req) => req,
-        Err(e) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {}", e))),
-                error: None,
-            }
-        }
-    };
-
-    // Get API key from environment
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(key) => key,
-        Err(_) => return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text(
-                "ANTHROPIC_API_KEY environment variable not set. Please set it to use RustVerify.",
-            )),
-            error: None,
-        },
-    };
-
-    // Default analysis types if not specified
-    let analysis_types = request.analysis_types.unwrap_or_else(|| {
-        vec![
-            AnalysisType::DivisionByZero,
-            AnalysisType::Panic,
-            AnalysisType::Overflow,
-            AnalysisType::Logic,
-            AnalysisType::Unsafe,
-        ]
-    });
-
-    // Run the analysis
-    match analyze_rust_file(
-        Path::new(&request.file_path),
-        &analysis_types,
-        request.timeout_ms,
-        &api_key,
-    )
-    .await
-    {
-        Ok((findings, summary)) => {
-            let result = serde_json::json!({
-                "file": request.file_path,
-                "findings": findings,
-                "summary": summary
-            });
-
-            let json_text =
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-
-            RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": json_text
-                    }],
-                    "isError": false
-                })),
-                error: None,
-            }
-        }
-        Err(e) => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text(&format!("RustVerify error: {:#}", e))),
-            error: None,
-        },
-    }
-}

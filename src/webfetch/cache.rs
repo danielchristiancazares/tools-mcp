@@ -7,10 +7,15 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Root directory for WebFetch cache files.
-const CACHE_ROOT: &str = "/tmp/tools-mcp-webfetch";
+/// Uses platform temp directory for cross-platform compatibility.
+fn cache_root() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push("tools-mcp-webfetch");
+    dir
+}
 
 fn ensure_cache_dir() -> Result<PathBuf> {
-    let dir = PathBuf::from(CACHE_ROOT);
+    let dir = cache_root();
     if !dir.exists() {
         fs::create_dir_all(&dir).context("create webfetch cache dir")?;
     }

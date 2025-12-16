@@ -644,9 +644,25 @@ pub async fn wait_for_vector_file_ready(
             .await?
             .error_for_status()?;
         let list: VectorStoreFilesList = res.json().await?;
-        if list.data.iter().all(|f| f.status == "completed") && !list.data.is_empty() {
-            break;
+
+        if !list.data.is_empty() {
+            // Fail fast on terminal non-success states
+            if let Some(failed) = list
+                .data
+                .iter()
+                .find(|f| f.status == "failed" || f.status == "cancelled")
+            {
+                anyhow::bail!(
+                    "vector store file {} is in terminal status '{}'",
+                    failed.id,
+                    failed.status
+                );
+            }
+            if list.data.iter().all(|f| f.status == "completed") {
+                break;
+            }
         }
+
         if start.elapsed() > Duration::from_millis(timeout_ms) {
             anyhow::bail!("timeout waiting for indexing");
         }

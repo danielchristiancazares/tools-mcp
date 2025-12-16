@@ -12,6 +12,7 @@ use crate::webfetch::types::FetchRequest;
 
 const USER_AGENT: &str = "tools-mcp-webfetch/0.1";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_REDIRECTS: usize = 5;
 
 // Global cache for robots.txt content per domain (stored as String)
 static ROBOTS_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
@@ -38,6 +39,10 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0 == 0x40) // Carrier-grade NAT
         }
         IpAddr::V6(ipv6) => {
+            // Handle IPv4-mapped/compatible IPv6 addresses (e.g., ::ffff:127.0.0.1)
+            if let Some(v4) = ipv6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
                 || ((ipv6.segments()[0] & 0xfe00) == 0xfc00) // Unique local
@@ -180,57 +185,87 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
 }
 
 /// Fetch the remote document, applying cache-busting headers when requested.
+/// Manually follows redirects with SSRF validation on each hop to prevent redirect-based SSRF attacks.
 pub async fn fetch_document(client: &Client, req: &FetchRequest) -> Result<FetchedBody> {
-    // Validate URL for SSRF protection first
-    validate_url_ssrf(&req.url).await?;
+    let mut current_url = req.url.clone();
 
-    // Check robots.txt
-    if !is_allowed_by_robots(client, &req.url).await? {
-        return Err(anyhow!("URL disallowed by robots.txt: {}", req.url));
+    for _ in 0..=MAX_REDIRECTS {
+        // Validate URL for SSRF protection on every hop
+        validate_url_ssrf(&current_url).await?;
+
+        // Check robots.txt
+        if !is_allowed_by_robots(client, &current_url).await? {
+            return Err(anyhow!("URL disallowed by robots.txt: {}", current_url));
+        }
+
+        let mut builder = client
+            .get(&current_url)
+            .timeout(DEFAULT_TIMEOUT)
+            .header(header::USER_AGENT, USER_AGENT)
+            .header(
+                header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+            );
+
+        if req.no_cache {
+            builder = builder
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::PRAGMA, "no-cache");
+        }
+
+        let response = builder.send().await?;
+        let status = response.status();
+
+        // Handle redirects manually
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("redirect without Location header from {}", current_url))?;
+
+            let base = Url::parse(&current_url)?;
+            let next = base
+                .join(location)
+                .with_context(|| format!("invalid redirect Location '{}' from {}", location, current_url))?;
+            current_url = next.to_string();
+            continue;
+        }
+
+        if status == StatusCode::NOT_FOUND {
+            return Err(anyhow!("HTTP 404: resource not found"));
+        } else if !status.is_success() {
+            return Err(anyhow!("http error {} when fetching {}", status, current_url));
+        }
+
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let fetched_at = Utc::now();
+        let bytes = response.bytes().await?;
+        return Ok(FetchedBody {
+            body: bytes.to_vec(),
+            content_type,
+            fetched_at,
+        });
     }
-    let mut builder = client
-        .get(&req.url)
-        .timeout(DEFAULT_TIMEOUT)
-        .header(header::USER_AGENT, USER_AGENT)
-        .header(
-            header::ACCEPT,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
-        );
 
-    if req.no_cache {
-        builder = builder
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::PRAGMA, "no-cache");
-    }
-
-    let response = builder.send().await?;
-    let status = response.status();
-    if status == StatusCode::NOT_FOUND {
-        return Err(anyhow!("HTTP 404: resource not found"));
-    } else if !status.is_success() {
-        return Err(anyhow!("http error {} when fetching {}", status, req.url));
-    }
-
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let fetched_at = Utc::now();
-    let bytes = response.bytes().await?;
-    Ok(FetchedBody {
-        body: bytes.to_vec(),
-        content_type,
-        fetched_at,
-    })
+    Err(anyhow!(
+        "Too many redirects (>{}) when fetching {}",
+        MAX_REDIRECTS,
+        req.url
+    ))
 }
 
 /// Construct a shared HTTP client configured for MCP WebFetch usage.
+/// Redirects are disabled - they're followed manually in fetch_document for SSRF protection.
 pub fn build_http_client() -> Result<Client> {
     let client = Client::builder()
         .user_agent(USER_AGENT)
         .timeout(DEFAULT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none()) // Manual redirect for SSRF validation
         .brotli(true)
         .gzip(true)
         .deflate(true)
