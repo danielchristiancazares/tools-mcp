@@ -2,7 +2,6 @@ use crate::{RpcResponse, err_text};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
-use std::fs;
 use std::path::Path;
 
 /// Return file text (optionally a line range) for quick browsing without uploads.
@@ -41,7 +40,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
     }
 
     let path = Path::new(&req.path);
-    let data = match fs::read(path) {
+    let data = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(err) => {
             return RpcResponse {

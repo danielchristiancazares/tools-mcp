@@ -1006,7 +1006,7 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<UnifiedHunk>> {
             continue;
         }
 
-        let (old_start, old_len, new_start, _) = parse_hunk_header(line)?;
+        let (old_start, old_len, new_start, new_len) = parse_hunk_header(line)?;
         let mut hunk_lines: Vec<HunkLine> = Vec::new();
 
         while let Some(peek) = iter.peek() {
@@ -1052,6 +1052,8 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<UnifiedHunk>> {
         hunks.push(UnifiedHunk {
             old_start,
             old_len,
+            new_start,
+            new_len,
             lines: hunk_lines,
         });
     }

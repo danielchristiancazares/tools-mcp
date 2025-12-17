@@ -269,9 +269,35 @@ struct VectorStoreFileCreate {
     chunking_strategy: Option<serde_json::Value>,
 }
 
+/// Vector store with file_counts for efficient indexing status checks
+#[derive(Deserialize, Debug)]
+pub struct VectorStoreDetails {
+    pub id: String,
+    #[serde(default)]
+    pub file_counts: FileCounts,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct FileCounts {
+    #[serde(default)]
+    pub in_progress: u64,
+    #[serde(default)]
+    pub completed: u64,
+    #[serde(default)]
+    pub failed: u64,
+    #[serde(default)]
+    pub cancelled: u64,
+    #[serde(default)]
+    pub total: u64,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct VectorStoreFilesList {
     pub data: Vec<VectorStoreFileItem>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub last_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -580,6 +606,83 @@ pub async fn list_vector_stores(client: &Client, cfg: &ApiConfig) -> Result<Vec<
     Ok(list.data)
 }
 
+/// Fetches vector store details including file_counts for efficient status polling.
+pub async fn get_vector_store_details(
+    client: &Client,
+    cfg: &ApiConfig,
+    vs_id: &str,
+) -> Result<VectorStoreDetails> {
+    let url = format!("{}/vector_stores/{}", BASE_URL, vs_id);
+    let res = client
+        .get(&url)
+        .bearer_auth(&cfg.api_key)
+        .header("OpenAI-Beta", "assistants=v2")
+        .send()
+        .await?
+        .error_for_status()?;
+    let details: VectorStoreDetails = res.json().await?;
+    Ok(details)
+}
+
+/// Waits for all files in a vector store to finish processing using file_counts polling.
+///
+/// This is more efficient than polling individual files - it makes a single API call
+/// to check the aggregate counts instead of listing all files.
+///
+/// Returns early with an error if any files are in a terminal failure state.
+pub async fn wait_for_vector_store_ready(
+    client: &Client,
+    cfg: &ApiConfig,
+    vs_id: &str,
+    poll_ms: u64,
+    timeout_ms: u64,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let details = get_vector_store_details(client, cfg, vs_id).await?;
+        let counts = &details.file_counts;
+
+        // Fail fast on terminal failure states
+        if counts.failed > 0 || counts.cancelled > 0 {
+            anyhow::bail!(
+                "vector store has {} failed and {} cancelled files",
+                counts.failed,
+                counts.cancelled
+            );
+        }
+
+        // Check if all files are completed (no in_progress files)
+        if counts.in_progress == 0 && counts.total > 0 {
+            tracing::debug!(
+                "Vector store ready: {} files completed",
+                counts.completed
+            );
+            return Ok(());
+        }
+
+        // Also handle case where store is empty (total == 0)
+        if counts.total == 0 {
+            tracing::debug!("Vector store is empty, returning early");
+            return Ok(());
+        }
+
+        if start.elapsed() > Duration::from_millis(timeout_ms) {
+            anyhow::bail!(
+                "timeout waiting for indexing: {}/{} files still in progress",
+                counts.in_progress,
+                counts.total
+            );
+        }
+
+        tracing::debug!(
+            "Waiting for indexing: {}/{} in progress",
+            counts.in_progress,
+            counts.total
+        );
+        sleep(Duration::from_millis(poll_ms)).await;
+    }
+}
+
 pub async fn add_file_to_vector_store(
     client: &Client,
     cfg: &ApiConfig,
@@ -671,21 +774,49 @@ pub async fn wait_for_vector_file_ready(
     Ok(())
 }
 
+/// Lists all files in a vector store with automatic pagination.
+///
+/// Fetches all pages of results and returns them as a single list.
 pub async fn list_vector_store_files(
     client: &Client,
     cfg: &ApiConfig,
     vs_id: &str,
 ) -> Result<VectorStoreFilesList> {
-    let url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
-    let res = client
-        .get(&url)
-        .bearer_auth(&cfg.api_key)
-        .header("OpenAI-Beta", "assistants=v2")
-        .send()
-        .await?
-        .error_for_status()?;
-    let list: VectorStoreFilesList = res.json().await?;
-    Ok(list)
+    let base_url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
+    let mut all_files = Vec::new();
+    let mut after: Option<String> = None;
+
+    loop {
+        let mut url = base_url.clone();
+        if let Some(ref cursor) = after {
+            url = format!("{}?after={}", url, cursor);
+        }
+
+        let res = client
+            .get(&url)
+            .bearer_auth(&cfg.api_key)
+            .header("OpenAI-Beta", "assistants=v2")
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let page: VectorStoreFilesList = res.json().await?;
+        let has_more = page.has_more;
+
+        // Get last item ID for next page cursor
+        after = page.data.last().map(|f| f.id.clone());
+        all_files.extend(page.data);
+
+        if !has_more || after.is_none() {
+            break;
+        }
+    }
+
+    Ok(VectorStoreFilesList {
+        data: all_files,
+        has_more: false,
+        last_id: None,
+    })
 }
 
 pub async fn delete_vector_store_file(
@@ -833,8 +964,9 @@ pub async fn file_search_run(
 /// 1. Lists all files currently in the vector store
 /// 2. Computes hashes for local files
 /// 3. Compares hashes to detect changes
-/// 4. Uploads changed/new files
-/// 5. Deletes removed files
+/// 4. Deletes old versions of changed files
+/// 5. Uploads changed/new files
+/// 6. Deletes removed files
 ///
 /// # Arguments
 ///
@@ -861,44 +993,62 @@ pub async fn reindex_files(
     // Step 1: Get current files in vector store with their hashes
     let store_files_list = list_vector_store_files(client, cfg, vector_store_id).await?;
 
-    // Build map of filename -> (file_id, hash)
-    let mut store_file_map: HashMap<String, (String, Option<String>)> = HashMap::new();
+    // Build maps for path-based, hash-based, and filename-based lookups
+    // path_map: path -> (file_id, hash) - for files with path attribute
+    // hash_map: hash -> (path_or_filename, file_id) - for detecting moved files
+    // filename_map: filename -> (file_id, hash) - fallback for legacy files without path attribute
+    let mut path_map: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut hash_map: HashMap<String, (String, String)> = HashMap::new();
+    let mut filename_map: HashMap<String, (String, Option<String>)> = HashMap::new();
+
     for file in store_files_list.data {
+        // Extract path from attributes (full path)
+        let path_attr = file
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.get("path"))
+            .and_then(|p| p.as_str())
+            .map(String::from);
+
+        // Extract filename
         let filename = file
             .filename
             .clone()
             .or_else(|| file.file.as_ref().and_then(|f| f.filename.clone()));
 
-        if let Some(filename) = filename {
-            // Extract hash from attributes if present
-            let hash = file
-                .attributes
-                .as_ref()
-                .and_then(|attrs| attrs.get("hash"))
-                .and_then(|h| h.as_str())
-                .map(String::from);
-            store_file_map.insert(filename, (file.id, hash));
+        // Extract hash from attributes
+        let hash = file
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.get("hash"))
+            .and_then(|h| h.as_str())
+            .map(String::from);
+
+        // Primary key is path attribute if present
+        if let Some(ref p) = path_attr {
+            path_map.insert(p.clone(), (file.id.clone(), hash.clone()));
+        }
+
+        // Also track by filename for legacy file matching
+        if let Some(ref fname) = filename {
+            filename_map.insert(fname.clone(), (file.id.clone(), hash.clone()));
+        }
+
+        // Track by hash for detecting moved files
+        let key = path_attr.or(filename);
+        if let (Some(h), Some(k)) = (hash, key) {
+            hash_map.insert(h, (k, file.id));
         }
     }
 
     // Step 2: Process local files
     let mut to_upload = Vec::new();
     let mut to_skip = Vec::new();
+    let mut to_delete: HashMap<String, String> = HashMap::new(); // file_id -> reason
     let mut errors = Vec::new();
 
     // Check each local file
     for path in file_paths {
-        let filename = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        if filename.is_empty() {
-            errors.push((path.clone(), "Invalid filename".to_string()));
-            continue;
-        }
-
         // Compute hash of local file
         let local_hash = match compute_file_hash(path).await {
             Ok(h) => h,
@@ -908,24 +1058,74 @@ pub async fn reindex_files(
             }
         };
 
-        // Check if file exists in store and compare hash
-        if let Some((_file_id, store_hash)) = store_file_map.get(&filename) {
+        // Extract filename for fallback matching
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from);
+
+        // Check by path first (highest priority - exact match)
+        if let Some((file_id, store_hash)) = path_map.get(path).cloned() {
             if store_hash.as_ref() == Some(&local_hash) {
-                // Hash matches, skip upload
+                // Path and hash both match - skip upload
                 to_skip.push(path.clone());
-                store_file_map.remove(&filename); // Mark as processed
+                path_map.remove(path);
+                hash_map.remove(&local_hash);
+                if let Some(ref fname) = filename {
+                    filename_map.remove(fname);
+                }
             } else {
-                // Hash different or missing, need to upload
+                // Same path, different hash - content changed
+                to_delete.insert(file_id.clone(), format!("content changed: {}", path));
+                to_upload.push((path.clone(), local_hash.clone()));
+                path_map.remove(path);
+                if let Some(old_hash) = store_hash {
+                    hash_map.remove(&old_hash);
+                }
+                if let Some(ref fname) = filename {
+                    filename_map.remove(fname);
+                }
+            }
+        } else if let Some((old_key, file_id)) = hash_map.get(&local_hash).cloned() {
+            // Same hash at different location - file was moved
+            to_delete.insert(file_id.clone(), format!("moved from {} to {}", old_key, path));
+            to_upload.push((path.clone(), local_hash.clone()));
+            path_map.remove(&old_key);
+            hash_map.remove(&local_hash);
+            if let Some(ref fname) = filename {
+                filename_map.remove(fname);
+            }
+        } else if let Some(ref fname) = filename {
+            // Check by filename as fallback for legacy files
+            if let Some((file_id, store_hash)) = filename_map.get(fname).cloned() {
+                if store_hash.as_ref() == Some(&local_hash) {
+                    // Filename and hash match - skip (legacy file still current)
+                    to_skip.push(path.clone());
+                } else {
+                    // Filename matches but hash differs - content changed
+                    to_delete.insert(file_id.clone(), format!("content changed (legacy): {}", fname));
+                    to_upload.push((path.clone(), local_hash.clone()));
+                }
+                filename_map.remove(fname);
+            } else {
+                // Completely new file
                 to_upload.push((path.clone(), local_hash));
-                store_file_map.remove(&filename); // Mark as processed
             }
         } else {
-            // New file, need to upload
+            // Completely new file
             to_upload.push((path.clone(), local_hash));
         }
     }
 
-    // Step 3: Upload changed/new files with hash in attributes
+    // Step 3: Delete old versions of changed/moved files
+    for (file_id, reason) in &to_delete {
+        tracing::debug!("Deleting file {}: {}", file_id, reason);
+        if let Err(e) = delete_vector_store_file(client, cfg, vector_store_id, file_id).await {
+            tracing::warn!("Failed to delete {}: {}", file_id, e);
+        }
+    }
+
+    // Step 4: Upload changed/new files with path, hash in attributes
     let mut uploaded = Vec::new();
     let mut upload_errors = Vec::new();
 
@@ -942,8 +1142,9 @@ pub async fn reindex_files(
                     Err(e) => return Err((path.clone(), format!("Upload failed: {}", e))),
                 };
 
-                // Create attributes with hash
+                // Create attributes with path, hash, and timestamp for future reindexing
                 let mut attributes = serde_json::Map::new();
+                attributes.insert("path".to_string(), serde_json::Value::String(path.clone()));
                 attributes.insert("hash".to_string(), serde_json::Value::String(hash.clone()));
                 attributes.insert(
                     "indexed_at".to_string(),
@@ -1005,18 +1206,32 @@ pub async fn reindex_files(
         }
     }
 
-    // Step 4: Delete files that no longer exist locally
+    // Step 5: Delete orphan files that no longer exist locally
     let mut deleted = Vec::new();
     let mut delete_errors = Vec::new();
 
-    for (filename, (file_id, _)) in store_file_map {
+    // Collect orphan file_ids from both maps, deduplicating by file_id
+    let mut orphan_files: HashMap<String, String> = HashMap::new(); // file_id -> path/filename
+
+    // Remaining entries in path_map are files not in file_paths (orphans)
+    for (path, (file_id, _)) in path_map {
+        orphan_files.insert(file_id, path);
+    }
+
+    // Also check filename_map for legacy orphans not in path_map
+    for (filename, (file_id, _)) in filename_map {
+        orphan_files.entry(file_id).or_insert(filename);
+    }
+
+    // Delete all orphan files
+    for (file_id, key) in orphan_files {
         match delete_vector_store_file(client, cfg, vector_store_id, &file_id).await {
             Ok(_) => deleted.push(serde_json::json!({
-                "filename": filename,
+                "path": key,
                 "file_id": file_id,
                 "action": "deleted"
             })),
-            Err(e) => delete_errors.push((filename, e.to_string())),
+            Err(e) => delete_errors.push((key, e.to_string())),
         }
     }
 
@@ -1028,12 +1243,15 @@ pub async fn reindex_files(
         .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
         .collect();
 
+    // Total deletions = changed/moved files + orphan files
+    let total_deleted = to_delete.len() + deleted.len();
+
     Ok(serde_json::json!({
         "summary": {
             "total_files": file_paths.len(),
             "uploaded": uploaded.len(),
             "skipped": to_skip.len(),
-            "deleted": deleted.len(),
+            "deleted": total_deleted,
             "errors": all_errors.len()
         },
         "uploaded": uploaded,
@@ -1226,7 +1444,8 @@ pub async fn code_query(
         )
         .await
         .map_err(|e| anyhow!("code_query reindex failed: {}", e))?;
-        wait_for_vector_file_ready(client, cfg, vector_store_id, 1000, timeout_ms).await?;
+        // Use file_counts polling instead of per-file status checks
+        wait_for_vector_store_ready(client, cfg, vector_store_id, 1000, timeout_ms).await?;
         reindex_summary = Some(summary);
     }
 

@@ -37,10 +37,22 @@ use anyhow::{Context, Result};
 use file_search_core as core;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::OnceLock;
 use tokio::io::{
     self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tracing::{error, info};
+
+/// Cached value of MCP_SKIP_HEADERS env var (read once at first use)
+static SKIP_HEADERS: OnceLock<bool> = OnceLock::new();
+
+fn should_skip_headers() -> bool {
+    *SKIP_HEADERS.get_or_init(|| {
+        std::env::var("MCP_SKIP_HEADERS")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("true")
+    })
+}
 
 mod codequery;
 mod read_file;
@@ -190,12 +202,7 @@ where
     let payload_len = payload.len();
 
     // Check if we should skip Content-Length headers (for Codex compatibility)
-    let skip_headers = std::env::var("MCP_SKIP_HEADERS")
-        .unwrap_or_default()
-        .to_lowercase()
-        == "true";
-
-    if !skip_headers {
+    if !should_skip_headers() {
         let header = format!("Content-Length: {}\r\n\r\n", payload_len);
         writer
             .write_all(header.as_bytes())
