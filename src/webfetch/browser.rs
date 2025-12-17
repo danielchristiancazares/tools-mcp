@@ -1,6 +1,6 @@
 /// Headless browser pool for rendering JavaScript-heavy websites
 /// Uses chromiumoxide for async Chrome DevTools Protocol access
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
 use chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired;

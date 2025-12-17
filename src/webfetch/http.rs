@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use reqwest::{header, Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 use robotstxt::DefaultMatcher;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -68,7 +68,7 @@ pub async fn validate_url_ssrf(url: &str) -> Result<()> {
             return Err(anyhow!(
                 "URL scheme '{}' not allowed (only http/https permitted)",
                 scheme
-            ))
+            ));
         }
     }
 

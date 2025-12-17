@@ -31,13 +31,13 @@
 //! }
 //! ```
 
-use anyhow::{anyhow, Context, Result};
-use reqwest::{multipart, Client, StatusCode};
+use anyhow::{Context, Result, anyhow};
+use reqwest::{Client, StatusCode, multipart};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 pub const BASE_URL: &str = "https://api.openai.com/v1";
 

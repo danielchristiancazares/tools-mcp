@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo test:*)",
+      "Bash(where:*)",
+      "Bash(oh-my-posh:*)",
+      "Bash(powershell -NoLogo -Command '$env:POSH_THEMES_PATH')",
+      "Bash(powershell -NoLogo -Command \"Get-ChildItem $env:POSH_THEMES_PATH -Name | Select-String ''powerlevel10k''\")",
+      "Bash(powershell -NoLogo -Command:*)",
+      "Bash(pwsh:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

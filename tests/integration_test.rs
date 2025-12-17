@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Once;
@@ -187,17 +187,18 @@ fn test_tools_list() {
     assert_eq!(response["id"], 3);
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6); // ping, WebFetch, CodeQuery, smart_file_edit, RustAst, RustCallGraph
+    assert_eq!(tools.len(), 7); // ping, WebFetch, Bash, RipGrep, CodeQuery, ReadFile, SmartFileEdit
 
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     assert!(tool_names.contains(&"ping"));
     assert!(tool_names.contains(&"WebFetch"));
+    assert!(tool_names.contains(&"Bash"));
+    assert!(tool_names.contains(&"RipGrep"));
     assert!(tool_names.contains(&"CodeQuery"));
-    assert!(tool_names.contains(&"smart_file_edit"));
-    assert!(tool_names.contains(&"RustAst"));
-    assert!(tool_names.contains(&"RustCallGraph"));
+    assert!(tool_names.contains(&"ReadFile"));
+    assert!(tool_names.contains(&"SmartFileEdit"));
 }
 
 #[test]
@@ -224,6 +225,89 @@ fn test_ping_tool_call() {
 }
 
 #[test]
+fn test_read_file_is_line_numbered() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "ReadFile",
+            "arguments": {
+                "path": "src/read_file.rs",
+                "start_line": 1,
+                "end_line": 1
+            }
+        }
+    });
+
+    let response = send_mcp_message(request).expect("Failed to call ReadFile tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 40);
+    assert_eq!(response["result"]["isError"], false);
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing ReadFile content text");
+    assert!(text.starts_with("1\t"), "expected line number prefix");
+    assert!(
+        text.contains("use crate"),
+        "expected ReadFile source content"
+    );
+    assert_eq!(response["result"]["start_line"], 1);
+    assert_eq!(response["result"]["end_line"], 1);
+    assert!(response["result"]["total_lines"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn test_ripgrep_tool_call_if_rg_installed() {
+    let rg_bin = if cfg!(target_os = "windows") {
+        "rg.exe"
+    } else {
+        "rg"
+    };
+
+    let rg_available = Command::new(rg_bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !rg_available {
+        eprintln!("Skipping RipGrep test: {rg_bin} not found on PATH");
+        return;
+    }
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "RipGrep",
+            "arguments": {
+                "pattern": "handle_read_file",
+                "path": "src/read_file.rs",
+                "fixed_strings": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(request).expect("Failed to call RipGrep tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 41);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["pattern"], "handle_read_file");
+    assert_eq!(response["result"]["path"], "src/read_file.rs");
+    assert!(response["result"]["count"].as_u64().unwrap_or(0) >= 1);
+    assert!(response["result"]["matches"].is_array());
+}
+
+#[test]
 fn test_error_handling_unknown_method() {
     let request = json!({
         "jsonrpc": "2.0",
@@ -237,10 +321,12 @@ fn test_error_handling_unknown_method() {
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 5);
     assert!(response["error"]["code"].is_i64());
-    assert!(response["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Method not found"));
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Method not found")
+    );
 }
 
 #[test]
@@ -409,10 +495,12 @@ mod api_tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["result"]["isError"], false);
-        assert!(response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains(&store_name));
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&store_name)
+        );
     }
 
     #[test]

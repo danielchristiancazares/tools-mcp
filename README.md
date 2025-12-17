@@ -3,17 +3,19 @@
 Rust-based Model Context Protocol (MCP) server that bundles code search, web scraping, and newline-safe file editing. It is designed as a toolbox for LLM agents, speaking JSON-RPC 2.0 over stdin/stdout.
 
 ## Highlights
-- **CodeQuery** – One-shot helper that optionally auto-discovers and reindexes local files, then runs a semantic search query against an OpenAI vector store.
-- **WebFetch** – HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
-- **Smart File Edit** – Canonical LF view + byte-precise patch tool (including unified diffs) that preserves original newline bytes and whitespace when editing files via MCP.
-- **RustAst** – Offline Rust AST inspector for listing functions and types in a file.
- - **RustCallGraph** – Offline Rust call graph builder for function-level call relationships across files.
-- **Ping** – Lightweight health check for MCP clients.
+- **CodeQuery** - One-shot helper that optionally auto-discovers and reindexes local files, then runs a semantic search query against an OpenAI vector store.
+- **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
+- **RipGrep** - Fast local regex search via ripgrep (`rg`) with both line-oriented output and structured match records.
+- **ReadFile** - Line-numbered file reader (optionally a line range) for quick inspection.
+- **SmartFileEdit** - Canonical LF view + byte-precise patch tool (including unified diffs) that preserves original newline bytes and whitespace when editing files via MCP.
+- **Bash** - Run shell commands via bash with timeout and stdout/stderr capture.
+- **Ping** - Lightweight health check for MCP clients.
 - JSON-RPC 2.0 transport over stdin/stdout with optional `Content-Length` framing for Codex-compatible MCP clients.
 
 ## Requirements
 - Rust toolchain (edition 2021; tested with latest stable).
 - Cargo in PATH (for running the MCP binary).
+- `rg` (ripgrep) in PATH (required for `RipGrep`).
 - **OpenAI**
   - `OPENAI_API_KEY` with access to the Assistants / Vector Store APIs (required for `CodeQuery` and other OpenAI calls).
 - **WebFetch browser support** (optional)
@@ -31,6 +33,7 @@ cargo build --release
 # Run the MCP server (OpenAI only)
 export OPENAI_API_KEY="sk-..."
 cargo run --release
+```
 
 When running under an MCP client, the server reads JSON-RPC messages from stdin and writes responses to stdout. Set `MCP_SKIP_HEADERS=true` to omit `Content-Length` headers if your client expects raw JSON lines.
 
@@ -102,14 +105,42 @@ Fetch and normalize external web content with caching and JS-aware rendering.
   - `rendering_method` – `"http"` or `"browser"`.
   - `note` – optional string such as `"cache_hit"`, `"rendered_with_browser"`, or a combination.
 
-### smart_file_edit
+### RipGrep
+
+Fast local regex search using ripgrep (`rg`).
+
+- **Tool name**: `RipGrep` (aliases accepted: `ripgrep`, `rg`)
+- **Required**:
+  - `pattern` - ripgrep pattern (regex by default).
+- **Optional**:
+  - `path` - file or directory root (default: current working directory).
+  - `case` - `"smart"` (default), `"sensitive"`, or `"insensitive"`.
+  - `fixed_strings`, `word_regexp`, `glob`, `hidden`, `follow`, `no_ignore`, `context`, `max_results`, `timeout_ms`.
+- **Notes**:
+  - Requires `rg` to be installed and discoverable on PATH on the machine running the MCP server.
+  - Uses `rg --json` and returns both a readable `content[0].text` and structured `matches`.
+
+### ReadFile
+
+Read a local file (optionally a line range) for quick inspection without uploads.
+
+- **Tool name**: `ReadFile`
+- **Required**:
+  - `path` - filesystem path to read.
+- **Optional**:
+  - `start_line`, `end_line` (1-based, inclusive).
+- **Response**:
+  - `content[0].text` is line-numbered (similar to `nl -ba` / `cat -n`).
+  - Includes `start_line`, `end_line`, and `total_lines`.
+
+### SmartFileEdit
 
 Edit files while preserving original newline bytes and whitespace.
 
-- **Tool name**: `smart_file_edit`
+- **Tool name**: `SmartFileEdit` (alias accepted: `smart_file_edit`)
 - **Required base fields**:
-  - `action` – one of `"get_region"`, `"apply_snippet_edit"`, `"apply_unified_diff"`.
-  - `path` – filesystem path to inspect or edit.
+  - `action` - one of `"get_region"`, `"apply_snippet_edit"`, `"apply_unified_diff"`.
+  - `path` - filesystem path to inspect or edit.
 
 #### Actions
 
@@ -155,6 +186,19 @@ Edit files while preserving original newline bytes and whitespace.
     - On failure:
       - `status: "no_match"` or `"stale_file"`, plus `failed_hunk` and detailed payload from the underlying snippet edit.
 
+### Bash
+
+Run shell commands via bash with timeout and stdout/stderr capture.
+
+- **Tool name**: `Bash` (alias accepted: `bash`)
+- **Required**:
+  - `command` - shell command to run (executed as: `bash -lc "<command>"`).
+- **Optional**:
+  - `timeout_ms` - timeout in milliseconds (default 30000).
+  - `working_dir` - optional working directory for the command.
+- **Response**:
+  - Returns a pretty-printed JSON summary (including `stdout`, `stderr`, `exit_code`) in `content[0].text`.
+
 ### ping
 
 Simple health check for MCP clients.
@@ -163,44 +207,6 @@ Simple health check for MCP clients.
 - **Behavior**:
   - Always returns `pong` in a JSON `content` array.
 - Useful for MCP client connectivity tests or keepalive pings.
-
-### RustAst
-
-Inspect Rust source structure (functions and types) using the syn AST parser.
-
-- **Tool name**: `RustAst`
-- **Required**:
-  - `file_path` – path to the Rust source file to inspect.
-- **Behavior**:
-  - Parses the file using `syn`.
-  - Extracts all top-level functions and classifies them with:
-    - `name`, `visibility` (`"pub"` or `"private"`), `signature` (as a token string), and boolean flags for `async`, `const`, and `unsafe`.
-  - Extracts top-level type definitions:
-    - `struct`, `enum`, and `trait` names.
-- **Response**:
-  - Returns a JSON object (serialized as pretty text in `content[0].text`) with:
-    - `file` – analyzed file path.
-    - `functions` – array of function summaries.
-    - `types` – array of type summaries.
-
-### RustCallGraph
-
-Build a simple, offline call graph between Rust functions.
-
-- **Tool name**: `RustCallGraph`
-- **Inputs**:
-  - `file_paths` (optional, string[]) – explicit list of Rust source files to include.
-  - `root_dir` (optional, string) – directory to recursively scan for `.rs` files when `file_paths` is omitted. If both are omitted, the current working directory is scanned.
-- **Behavior**:
-  - Parses each Rust file using `syn`.
-  - Collects all top-level functions and assigns each a stable ID of the form `"<file_path>::<fn_name>"`.
-  - Walks function bodies to find simple function calls where the callee is a path like `foo()` and resolves them by name:
-    - If a callee name matches exactly one known function, an edge is created.
-    - Calls that cannot be resolved uniquely are skipped.
-- **Response**:
-  - Returns a JSON object (serialized as pretty text in `content[0].text`) with:
-    - `nodes` – array of `{ "id", "name", "file" }`.
-    - `edges` – array of `{ "from", "to", "call" }`, where `from`/`to` are node IDs and `call` is the syntactic callee name.
 
 ## MCP Client Configuration Example
 ```toml
@@ -219,8 +225,8 @@ env = {
 - Code search orchestration is in `src/codequery/`.
 - Web content fetching, parsing, and heuristics live in `src/webfetch/` (`browser`, `http`, `cache`, `chunker`, etc.).
 - Newline-aware file editing (including unified diff support) is implemented in `src/smart_file_edit/mod.rs`.
-- Rust AST parsing and summarization lives in `src/rust_ast.rs` (reusing `src/rustverify/parser.rs`).
-- Rust call graph analysis lives in `src/rust_callgraph.rs`.
+- RipGrep tool implementation lives in `src/ripgrep.rs`.
+- Raw file reader lives in `src/read_file.rs`.
 - Cached WebFetch responses live under `/tmp/tools-mcp-webfetch/`.
 
 ## Testing

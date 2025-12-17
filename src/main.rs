@@ -43,6 +43,8 @@ use tokio::io::{
 use tracing::{error, info};
 
 mod codequery;
+mod read_file;
+mod ripgrep;
 mod smart_file_edit;
 mod webfetch;
 
@@ -271,6 +273,28 @@ async fn main() -> Result<()> {
             }),
         },
         ToolDef {
+            name: "RipGrep".into(),
+            description: "Fast regex search via ripgrep (rg). Returns line-numbered output and structured match records.".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "pattern":{"type":"string","description":"ripgrep pattern (regex by default)"},
+                    "path":{"type":"string","description":"File or directory to search (default: current working directory)"},
+                    "case":{"type":"string","enum":["smart","sensitive","insensitive"],"default":"smart","description":"Case handling mode"},
+                    "fixed_strings":{"type":"boolean","default":false,"description":"Treat pattern as a literal string (rg -F)"},
+                    "word_regexp":{"type":"boolean","default":false,"description":"Match on word boundaries only (rg -w)"},
+                    "glob":{"type":"array","items":{"type":"string"},"description":"Optional glob filters (repeats rg --glob)"},
+                    "hidden":{"type":"boolean","default":false,"description":"Search hidden files/directories (rg --hidden)"},
+                    "follow":{"type":"boolean","default":false,"description":"Follow symlinks (rg --follow)"},
+                    "no_ignore":{"type":"boolean","default":false,"description":"Do not respect ignore files like .gitignore (rg --no-ignore)"},
+                    "context":{"type":"integer","minimum":0,"default":0,"description":"Lines of context on both sides (rg -C)"},
+                    "max_results":{"type":"integer","minimum":1,"maximum":10000,"default":200,"description":"Maximum match/context events to return"},
+                    "timeout_ms":{"type":"integer","minimum":100,"default":20000,"description":"Overall timeout in milliseconds"}
+                },
+                "required":["pattern"]
+            }),
+        },
+        ToolDef {
             name: "CodeQuery".into(),
             description: "Index codebase files and run semantic search in one operation. Automatically syncs changed files (if file_paths provided) and queries the vector store.".into(),
             input_schema: serde_json::json!({
@@ -290,7 +314,20 @@ async fn main() -> Result<()> {
             }),
         },
         ToolDef {
-            name: "smart_file_edit".into(),
+            name: "ReadFile".into(),
+            description: "Read a file (optionally a line range) for quick inspection without uploading. Output is line-numbered.".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"Filesystem path to read"},
+                    "start_line":{"type":"integer","minimum":1,"description":"Optional 1-based start line"},
+                    "end_line":{"type":"integer","minimum":1,"description":"Optional 1-based end line (inclusive)"}
+                },
+                "required":["path"]
+            }),
+        },
+        ToolDef {
+            name: "SmartFileEdit".into(),
             description: "Read and edit files via a canonical LF view while preserving original newline bytes and whitespace.".into(),
             input_schema: serde_json::json!({
                 "type":"object",
@@ -443,9 +480,17 @@ async fn main() -> Result<()> {
                     },
                     // Bash wrapper
                     "Bash" | "bash" => handle_bash(req.id.clone(), args).await,
+                    // ripgrep search
+                    "RipGrep" | "ripgrep" | "rg" => {
+                        ripgrep::handle_ripgrep(req.id.clone(), args).await
+                    }
                     // code query
                     "CodeQuery" | "code_query" | "code-query" => {
                         handle_code_query(req.id.clone(), args).await
+                    }
+                    // read file
+                    "ReadFile" | "read_file" | "read-file" => {
+                        read_file::handle_read_file(req.id.clone(), args).await
                     }
                     "smart_file_edit" | "SmartFileEdit" => {
                         smart_file_edit::handle_smart_file_edit(req.id.clone(), args).await
@@ -530,7 +575,7 @@ async fn handle_webfetch(id: Option<Value>, args: Value) -> RpcResponse<'static>
                 id,
                 result: Some(err_text(&format!("invalid arguments: {}", e))),
                 error: None,
-            }
+            };
         }
     };
 
@@ -603,7 +648,7 @@ async fn handle_bash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
                 id,
                 result: Some(err_text(&format!("invalid arguments: {}", e))),
                 error: None,
-            }
+            };
         }
     };
 
@@ -637,10 +682,7 @@ async fn handle_bash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
             let success = output.status.success();
 
             if !success {
-                error!(
-                    "Bash tool: command failed (exit_code={:?})",
-                    exit_code
-                );
+                error!("Bash tool: command failed (exit_code={:?})", exit_code);
             }
 
             let result = serde_json::json!({
@@ -678,15 +720,15 @@ async fn handle_bash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
             RpcResponse {
                 jsonrpc: "2.0",
                 id,
-                result: Some(err_text(&format!("Failed to spawn {}: {}", shell_binary, e))),
+                result: Some(err_text(&format!(
+                    "Failed to spawn {}: {}",
+                    shell_binary, e
+                ))),
                 error: None,
             }
         }
         Err(_) => {
-            error!(
-                "Bash tool: command timed out after {} ms",
-                timeout_ms
-            );
+            error!("Bash tool: command timed out after {} ms", timeout_ms);
             RpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -699,4 +741,3 @@ async fn handle_bash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         }
     }
 }
-

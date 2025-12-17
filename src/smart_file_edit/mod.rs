@@ -1,8 +1,8 @@
 //! Smart, newline-aware file editing helper for MCP.
-use crate::{err_text, RpcResponse};
-use anyhow::{anyhow, Context, Result};
+use crate::{RpcResponse, err_text};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1006,7 +1006,7 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<UnifiedHunk>> {
             continue;
         }
 
-        let (old_start, old_len, new_start, new_len) = parse_hunk_header(line)?;
+        let (old_start, old_len, new_start, _) = parse_hunk_header(line)?;
         let mut hunk_lines: Vec<HunkLine> = Vec::new();
 
         while let Some(peek) = iter.peek() {
@@ -1052,8 +1052,6 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<UnifiedHunk>> {
         hunks.push(UnifiedHunk {
             old_start,
             old_len,
-            new_start,
-            new_len,
             lines: hunk_lines,
         });
     }
@@ -1167,7 +1165,6 @@ mod tests {
         let hunk = &hunks[0];
         assert_eq!(hunk.old_start, 1);
         assert_eq!(hunk.old_len, 2);
-        assert_eq!(hunk.new_len, 3);
         assert_eq!(hunk.old_snippet(), "line1\nline2\n");
         assert_eq!(hunk.new_snippet(), "line1\nline2\nline3\n");
     }
@@ -1193,10 +1190,7 @@ mod tests {
         };
 
         let response = handle_apply_unified_diff(&req).expect("diff apply");
-        assert_eq!(
-            response.get("status").and_then(|v| v.as_str()),
-            Some("ok")
-        );
+        assert_eq!(response.get("status").and_then(|v| v.as_str()), Some("ok"));
         let contents = std::fs::read_to_string(&path).expect("read file");
         assert_eq!(contents, "alpha\nbeta\ngamma\n");
     }
