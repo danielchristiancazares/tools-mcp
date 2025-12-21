@@ -55,6 +55,7 @@ fn should_skip_headers() -> bool {
 }
 
 mod codequery;
+mod git_tools;
 mod read_file;
 mod ripgrep;
 mod smart_file_edit;
@@ -364,6 +365,54 @@ async fn main() -> Result<()> {
                 "additionalProperties": true
             }),
         },
+        ToolDef {
+            name: "GitStatus".into(),
+            description: "Run `git status` (porcelain by default) with structured output.".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "working_dir": {"type":"string","description":"Optional working directory for the git command"},
+                    "timeout_ms": {"type":"integer","minimum":100,"default":30000,"description":"Timeout in milliseconds before the command is aborted"},
+                    "porcelain": {"type":"boolean","default":true,"description":"Use porcelain output (`--porcelain=1`) when true"},
+                    "branch": {"type":"boolean","default":true,"description":"Include branch info (`-b`) in porcelain mode"},
+                    "untracked": {"type":"boolean","default":true,"description":"Include untracked files in porcelain mode (when false, uses `-uno`)"}
+                },
+                "required":[]
+            }),
+        },
+        ToolDef {
+            name: "GitDiff".into(),
+            description: "Run `git diff` (optionally `--stat`, `--name-only`, `--cached`, and path-limited) with output truncation.".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "working_dir": {"type":"string","description":"Optional working directory for the git command"},
+                    "timeout_ms": {"type":"integer","minimum":100,"default":30000,"description":"Timeout in milliseconds before the command is aborted"},
+                    "cached": {"type":"boolean","default":false,"description":"Diff staged changes (`--cached`)"},
+                    "stat": {"type":"boolean","default":false,"description":"Show diffstat only (`--stat`)"},
+                    "name_only": {"type":"boolean","default":false,"description":"Show only changed file names (`--name-only`)"},
+                    "unified": {"type":"integer","minimum":0,"description":"Number of context lines (`-U<N>`)"},
+                    "paths": {"type":"array","items":{"type":"string"},"description":"Optional path list to diff (passed after `--`)"},
+                    "max_bytes": {"type":"integer","minimum":1,"maximum":5000000,"default":200000,"description":"Maximum bytes captured from stdout before truncation"}
+                },
+                "required":[]
+            }),
+        },
+        ToolDef {
+            name: "GitRestore".into(),
+            description: "Run `git restore` on specific paths (worktree and/or staged). WARNING: discards changes in the selected paths.".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "paths": {"type":"array","items":{"type":"string"},"description":"Paths to restore (passed after `--`)"},
+                    "working_dir": {"type":"string","description":"Optional working directory for the git command"},
+                    "timeout_ms": {"type":"integer","minimum":100,"default":30000,"description":"Timeout in milliseconds before the command is aborted"},
+                    "staged": {"type":"boolean","default":false,"description":"Restore the index/staging area (`--staged`)"},
+                    "worktree": {"type":"boolean","default":true,"description":"Restore the working tree (`--worktree`) (default true)"}
+                },
+                "required":["paths"]
+            }),
+        },
     ];
 
     while let Some(line) = match read_mcp_message(&mut reader).await {
@@ -425,7 +474,8 @@ async fn main() -> Result<()> {
                         None,
                         Some(RpcError {
                             code: -32603,
-                            message: "Internal error: failed to serialize initialize payload".into(),
+                            message: "Internal error: failed to serialize initialize payload"
+                                .into(),
                             data: Some(serde_json::json!({"details": e.to_string()})),
                         }),
                     ),
@@ -501,6 +551,15 @@ async fn main() -> Result<()> {
                     }
                     "smart_file_edit" | "SmartFileEdit" => {
                         smart_file_edit::handle_smart_file_edit(req.id.clone(), args).await
+                    }
+                    "GitStatus" | "git_status" | "git-status" => {
+                        git_tools::handle_git_status(req.id.clone(), args).await
+                    }
+                    "GitDiff" | "git_diff" | "git-diff" => {
+                        git_tools::handle_git_diff(req.id.clone(), args).await
+                    }
+                    "GitRestore" | "git_restore" | "git-restore" => {
+                        git_tools::handle_git_restore(req.id.clone(), args).await
                     }
                     other => RpcResponse {
                         jsonrpc: "2.0",
@@ -587,37 +646,33 @@ async fn handle_webfetch(id: Option<Value>, args: Value) -> RpcResponse<'static>
     };
 
     match webfetch::run_fetch(request).await {
-        Ok(response) => {
-            match serde_json::to_value(&response) {
-                Ok(json_value) => {
-                    let json_text =
-                        serde_json::to_string_pretty(&json_value).unwrap_or_else(|e| {
-                            format!("{{\"error\": \"serialization failed: {}\"}}", e)
-                        });
-                    RpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: Some(serde_json::json!({
-                            "content": [{
-                                "type": "text",
-                                "text": json_text
-                            }],
-                            "isError": false
-                        })),
-                        error: None,
-                    }
-                }
-                Err(e) => RpcResponse {
+        Ok(response) => match serde_json::to_value(&response) {
+            Ok(json_value) => {
+                let json_text = serde_json::to_string_pretty(&json_value)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+                RpcResponse {
                     jsonrpc: "2.0",
                     id,
-                    result: Some(err_text(&format!(
-                        "webfetch succeeded but response serialization failed: {}",
-                        e
-                    ))),
+                    result: Some(serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": json_text
+                        }],
+                        "isError": false
+                    })),
                     error: None,
-                },
+                }
             }
-        }
+            Err(e) => RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(err_text(&format!(
+                    "webfetch succeeded but response serialization failed: {}",
+                    e
+                ))),
+                error: None,
+            },
+        },
         Err(e) => RpcResponse {
             jsonrpc: "2.0",
             id,

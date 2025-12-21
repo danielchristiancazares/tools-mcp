@@ -227,9 +227,12 @@ pub async fn fetch_document(client: &Client, req: &FetchRequest) -> Result<Fetch
                 .ok_or_else(|| anyhow!("redirect without Location header from {}", current_url))?;
 
             let base = Url::parse(&current_url)?;
-            let next = base
-                .join(location)
-                .with_context(|| format!("invalid redirect Location '{}' from {}", location, current_url))?;
+            let next = base.join(location).with_context(|| {
+                format!(
+                    "invalid redirect Location '{}' from {}",
+                    location, current_url
+                )
+            })?;
             current_url = next.to_string();
             continue;
         }
@@ -237,7 +240,11 @@ pub async fn fetch_document(client: &Client, req: &FetchRequest) -> Result<Fetch
         if status == StatusCode::NOT_FOUND {
             return Err(anyhow!("HTTP 404: resource not found"));
         } else if !status.is_success() {
-            return Err(anyhow!("http error {} when fetching {}", status, current_url));
+            return Err(anyhow!(
+                "http error {} when fetching {}",
+                status,
+                current_url
+            ));
         }
 
         let content_type = response

@@ -76,7 +76,9 @@ impl BrowserPool {
                     }
                     None => {
                         // Don't fail the request - old browser will be dropped when refs go away
-                        warn!("Cannot gracefully close browser during restart: multiple references exist");
+                        warn!(
+                            "Cannot gracefully close browser during restart: multiple references exist"
+                        );
                     }
                 }
             }

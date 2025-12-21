@@ -9,6 +9,7 @@ Rust-based Model Context Protocol (MCP) server that bundles code search, web scr
 - **ReadFile** - Line-numbered file reader (optionally a line range) for quick inspection.
 - **SmartFileEdit** - Canonical LF view + byte-precise patch tool (including unified diffs) that preserves original newline bytes and whitespace when editing files via MCP.
 - **Bash** - Run shell commands via bash with timeout and stdout/stderr capture.
+- **GitStatus / GitDiff / GitRestore** - Local Git status/diff/restore helpers with timeout and output truncation.
 - **Ping** - Lightweight health check for MCP clients.
 - JSON-RPC 2.0 transport over stdin/stdout with optional `Content-Length` framing for Codex-compatible MCP clients.
 
@@ -16,6 +17,7 @@ Rust-based Model Context Protocol (MCP) server that bundles code search, web scr
 - Rust toolchain (edition 2021; tested with latest stable).
 - Cargo in PATH (for running the MCP binary).
 - `rg` (ripgrep) in PATH (required for `RipGrep`).
+- Git in PATH (required for `GitStatus`, `GitDiff`, and `GitRestore`).
 - **OpenAI**
   - `OPENAI_API_KEY` with access to the Assistants / Vector Store APIs (required for `CodeQuery` and other OpenAI calls).
 - **WebFetch browser support** (optional)
@@ -207,6 +209,55 @@ Simple health check for MCP clients.
 - **Behavior**:
   - Always returns `pong` in a JSON `content` array.
 - Useful for MCP client connectivity tests or keepalive pings.
+
+### GitStatus
+
+Run `git status` (porcelain by default).
+
+- **Tool name**: `GitStatus` (aliases accepted: `git_status`, `git-status`)
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `porcelain` (boolean, default `true`) - when true, uses `--porcelain=1`.
+  - `branch` (boolean, default `true`) - include branch header (`-b`) in porcelain mode.
+  - `untracked` (boolean, default `true`) - include untracked files in porcelain mode (when false, uses `-uno`).
+- **Response**:
+  - `content[0].text` - porcelain output (or `clean` if there are no changes).
+  - Includes `stdout`, `stderr`, `exit_code`, `timed_out`, `clean`, and the executed `args`.
+
+### GitDiff
+
+Run `git diff` with optional flags and output truncation.
+
+- **Tool name**: `GitDiff` (aliases accepted: `git_diff`, `git-diff`)
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `cached` (boolean, default `false`) - staged diff (`--cached`).
+  - `stat` (boolean, default `false`) - diffstat only (`--stat`).
+  - `name_only` (boolean, default `false`) - file names only (`--name-only`).
+  - `unified` (integer, >= 0) - context lines (`-U<N>`).
+  - `paths` (string[]) - limit diff to these paths (passed after `--`).
+  - `max_bytes` (integer, default 200000) - maximum bytes captured from stdout before truncation.
+- **Response**:
+  - `content[0].text` - diff output (or `no diff`).
+  - Includes `stdout`, `stderr`, `exit_code`, `timed_out`, `truncated_stdout`, and the executed `args`.
+
+### GitRestore
+
+Run `git restore` on explicit paths.
+
+- **Tool name**: `GitRestore` (aliases accepted: `git_restore`, `git-restore`)
+- **Required**:
+  - `paths` (string[]) - paths to restore (passed after `--`).
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `staged` (boolean, default `false`) - restore the index (`--staged`).
+  - `worktree` (boolean, default `true`) - restore the working tree (`--worktree`).
+- **Response**:
+  - `content[0].text` - `ok` on success (or stderr on failure).
+  - Includes `stdout`, `stderr`, `exit_code`, `timed_out`, and the executed `args`.
 
 ## MCP Client Configuration Example
 ```toml

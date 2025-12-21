@@ -187,7 +187,7 @@ fn test_tools_list() {
     assert_eq!(response["id"], 3);
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7); // ping, WebFetch, Bash, RipGrep, CodeQuery, ReadFile, SmartFileEdit
+    assert_eq!(tools.len(), 10); // ping, WebFetch, Bash, RipGrep, CodeQuery, ReadFile, SmartFileEdit, GitStatus, GitDiff, GitRestore
 
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -199,6 +199,9 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"CodeQuery"));
     assert!(tool_names.contains(&"ReadFile"));
     assert!(tool_names.contains(&"SmartFileEdit"));
+    assert!(tool_names.contains(&"GitStatus"));
+    assert!(tool_names.contains(&"GitDiff"));
+    assert!(tool_names.contains(&"GitRestore"));
 }
 
 #[test]
@@ -305,6 +308,65 @@ fn test_ripgrep_tool_call_if_rg_installed() {
     assert_eq!(response["result"]["path"], "src/read_file.rs");
     assert!(response["result"]["count"].as_u64().unwrap_or(0) >= 1);
     assert!(response["result"]["matches"].is_array());
+}
+
+#[test]
+fn test_git_status_tool_call_if_git_installed() {
+    let git_bin = if cfg!(target_os = "windows") {
+        "git.exe"
+    } else {
+        "git"
+    };
+
+    let git_available = Command::new(git_bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !git_available {
+        eprintln!("Skipping GitStatus test: {git_bin} not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+
+    // Initialize a small repo and create an untracked file so porcelain output is non-empty.
+    let init_status = Command::new(git_bin)
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .expect("failed to run git init");
+    assert!(init_status.success(), "git init failed");
+
+    std::fs::write(dir.path().join("foo.txt"), "hello\n").expect("write file failed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "GitStatus",
+            "arguments": {
+                "working_dir": dir.path().to_string_lossy().to_string()
+            }
+        }
+    });
+
+    let response = send_mcp_message(request).expect("Failed to call GitStatus tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 42);
+    assert_eq!(response["result"]["isError"], false);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing GitStatus content text");
+    assert!(
+        text.contains("foo.txt"),
+        "expected porcelain output to mention foo.txt, got: {text}"
+    );
 }
 
 #[test]
