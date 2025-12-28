@@ -3,9 +3,10 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, header};
 use robotstxt::DefaultMatcher;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::sync::RwLock;
+use url::Host;
 use url::Url;
 
 use crate::webfetch::types::FetchRequest;
@@ -13,6 +14,7 @@ use crate::webfetch::types::FetchRequest;
 const USER_AGENT: &str = "tools-mcp-webfetch/0.1";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: usize = 5;
+const ROBOTS_CACHE_MAX_ENTRIES: usize = 1024;
 
 // Global cache for robots.txt content per domain (async-safe RwLock)
 static ROBOTS_CACHE: RwLock<Option<HashMap<String, Option<String>>>> = RwLock::const_new(None);
@@ -59,6 +61,15 @@ fn is_private_ip(ip: IpAddr) -> bool {
 // Note: DNS resolution uses Tokio's async resolver [tokio v1.x, lookup_host]
 // https://docs.rs/tokio/1/tokio/net/fn.lookup_host.html
 pub async fn validate_url_ssrf(url: &str) -> Result<()> {
+    let _ = validate_url_ssrf_and_resolve(url).await?;
+    Ok(())
+}
+
+/// Validate URL for SSRF and (when the host is a domain) pick a public-resolved address to pin.
+///
+/// This is a best-effort mitigation for DNS rebinding: the returned SocketAddr can be used with
+/// reqwest's `ClientBuilder::resolve()` so the subsequent HTTP request uses the validated address.
+async fn validate_url_ssrf_and_resolve(url: &str) -> Result<Option<(String, SocketAddr)>> {
     let parsed = Url::parse(url)?;
 
     // Only allow http and https schemes
@@ -72,69 +83,78 @@ pub async fn validate_url_ssrf(url: &str) -> Result<()> {
         }
     }
 
-    // Check hostname
-    if let Some(host) = parsed.host_str() {
-        // Reject localhost variations
-        if host.eq_ignore_ascii_case("localhost")
-            || host.eq_ignore_ascii_case("localhost.localdomain")
-        {
-            return Err(anyhow!("Cannot fetch from localhost"));
-        }
-
-        // If hostname is an IP address, check if it's private
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if is_private_ip(ip) {
-                return Err(anyhow!("Cannot fetch from private IP address: {}", ip));
-            }
-        }
-    } else {
-        return Err(anyhow!("URL must have a valid host"));
-    }
-
-    // Resolve the host and ensure it does not map to a private/reserved IP
-    // Choose a sensible default port for resolution when none is present
-    let port = parsed.port().unwrap_or_else(|| match parsed.scheme() {
-        "https" => 443,
-        _ => 80,
-    });
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("URL must have a valid host"))?;
-    let mut any_private = false;
-    // Use Tokio DNS resolution [tokio v1.x]
+
+    // Reject localhost variations
+    if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        return Err(anyhow!("Cannot fetch from localhost"));
+    }
+
+    // If hostname is an IP address, check if it's private and skip DNS pinning.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(anyhow!("Cannot fetch from private IP address: {}", ip));
+        }
+        return Ok(None);
+    }
+
+    // Resolve the host and ensure it does not map to a private/reserved IP.
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("unknown default port"))?;
+
     let addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("DNS resolution failed for host '{}':", host))?;
+
+    let mut chosen: Option<SocketAddr> = None;
     for addr in addrs {
         if is_private_ip(addr.ip()) {
-            any_private = true;
-            break;
+            return Err(anyhow!(
+                "Resolved host '{}' maps to a private/reserved IP; refusing to fetch",
+                host
+            ));
+        }
+        if chosen.is_none() {
+            chosen = Some(addr);
         }
     }
-    if any_private {
-        return Err(anyhow!(
-            "Resolved host '{}' maps to a private/reserved IP; refusing to fetch",
-            host
-        ));
-    }
 
-    Ok(())
+    let chosen = chosen.ok_or_else(|| anyhow!("DNS resolution returned no addresses"))?;
+    Ok(Some((host.to_string(), chosen)))
 }
 
 /// Get the base domain from a URL for robots.txt lookup
 fn get_robots_url(url: &str) -> Result<String> {
     let parsed = Url::parse(url)?;
     let scheme = parsed.scheme();
-    let host = parsed.host_str().ok_or_else(|| anyhow!("no host in URL"))?;
+    let host = parsed.host().ok_or_else(|| anyhow!("no host in URL"))?;
+    let host_str = match host {
+        Host::Domain(d) => d.to_string(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => format!("[{}]", ip),
+    };
     let port = parsed.port().map(|p| format!(":{}", p)).unwrap_or_default();
-    Ok(format!("{}://{}{}/robots.txt", scheme, host, port))
+    Ok(format!("{}://{}{}/robots.txt", scheme, host_str, port))
 }
 
 /// Fetch robots.txt content for a domain, with caching
 async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>> {
     let robots_url = get_robots_url(url)?;
     let parsed = Url::parse(url)?;
-    let domain = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+    let host = parsed.host().ok_or_else(|| anyhow!("no host in URL"))?;
+    let host_str = match host {
+        Host::Domain(d) => d.to_string(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => format!("[{}]", ip),
+    };
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("unknown default port for scheme"))?;
+    let domain = format!("{}://{}:{}", parsed.scheme(), host_str, port);
 
     // Check cache first (read lock)
     {
@@ -165,7 +185,13 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
         if cache.is_none() {
             *cache = Some(HashMap::new());
         }
-        cache.as_mut().unwrap().insert(domain, content.clone());
+        if let Some(map) = cache.as_mut() {
+            if map.len() >= ROBOTS_CACHE_MAX_ENTRIES && !map.contains_key(&domain) {
+                // Coarse eviction: clear to prevent unbounded growth.
+                map.clear();
+            }
+            map.insert(domain, content.clone());
+        }
     }
 
     Ok(content)
@@ -188,19 +214,20 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
 
 /// Fetch the remote document, applying cache-busting headers when requested.
 /// Manually follows redirects with SSRF validation on each hop to prevent redirect-based SSRF attacks.
-pub async fn fetch_document(client: &Client, req: &FetchRequest) -> Result<FetchedBody> {
+pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
     let mut current_url = req.url.clone();
 
     for _ in 0..=MAX_REDIRECTS {
-        // Validate URL for SSRF protection on every hop
-        validate_url_ssrf(&current_url).await?;
+        // Validate URL for SSRF protection on every hop, and pin a validated address when possible.
+        let resolve = validate_url_ssrf_and_resolve(&current_url).await?;
+        let pinned_client = build_http_client_with_resolve(resolve.as_ref())?;
 
         // Check robots.txt
-        if !is_allowed_by_robots(client, &current_url).await? {
+        if !is_allowed_by_robots(&pinned_client, &current_url).await? {
             return Err(anyhow!("URL disallowed by robots.txt: {}", current_url));
         }
 
-        let mut builder = client
+        let mut builder = pinned_client
             .get(&current_url)
             .timeout(DEFAULT_TIMEOUT)
             .header(header::USER_AGENT, USER_AGENT)
@@ -270,14 +297,21 @@ pub async fn fetch_document(client: &Client, req: &FetchRequest) -> Result<Fetch
 
 /// Construct a shared HTTP client configured for MCP WebFetch usage.
 /// Redirects are disabled - they're followed manually in fetch_document for SSRF protection.
+#[allow(dead_code)]
 pub fn build_http_client() -> Result<Client> {
-    let client = Client::builder()
+    build_http_client_with_resolve(None)
+}
+
+fn build_http_client_with_resolve(resolve: Option<&(String, SocketAddr)>) -> Result<Client> {
+    let mut builder = Client::builder()
         .user_agent(USER_AGENT)
         .timeout(DEFAULT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none()) // Manual redirect for SSRF validation
         .brotli(true)
         .gzip(true)
-        .deflate(true)
-        .build()?;
-    Ok(client)
+        .deflate(true);
+    if let Some((host, addr)) = resolve {
+        builder = builder.resolve(host, *addr);
+    }
+    Ok(builder.build()?)
 }

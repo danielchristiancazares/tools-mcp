@@ -36,8 +36,6 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     }
 
     // HTTP-first path (with JS-heavy detection)
-    let client = http::build_http_client().context("construct http client")?;
-
     // Check cache with method-specific key
     let cache_key = format!("{}_http", req.url);
     let cached = if req.no_cache {
@@ -49,7 +47,7 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     let (body, content_type, fetched_at, cache_hit) = match cached {
         Some(entry) => (entry.body, entry.content_type, entry.fetched_at, true),
         None => {
-            let fetched = http::fetch_document(&client, &req)
+            let fetched = http::fetch_document(&req)
                 .await
                 .context("fetch remote document")?;
             let entry = cache::CachedFetch {
@@ -244,4 +242,36 @@ fn build_response(
 
 fn format_timestamp(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// MCP tool handler for WebFetch
+pub async fn handle_webfetch(
+    id: Option<serde_json::Value>,
+    args: serde_json::Value,
+) -> crate::RpcResponse<'static> {
+    let request = match crate::RpcResponse::parse::<FetchRequest>(id.clone(), args) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    match run_fetch(request).await {
+        Ok(response) => match serde_json::to_value(&response) {
+            Ok(json_value) => {
+                let json_text = serde_json::to_string_pretty(&json_value)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+                crate::RpcResponse::ok(
+                    id,
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": json_text}],
+                        "isError": false
+                    }),
+                )
+            }
+            Err(e) => crate::RpcResponse::err(
+                id,
+                format!("webfetch succeeded but response serialization failed: {}", e),
+            ),
+        },
+        Err(e) => crate::RpcResponse::err(id, format!("webfetch error: {:#}", e)),
+    }
 }

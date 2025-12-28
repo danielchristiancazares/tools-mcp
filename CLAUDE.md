@@ -3,6 +3,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Tool Preferences
+
+When tools-mcp is available, prefer its dedicated tools over Bash equivalents:
+
+- Prefer `Read` over `cat`, `head`, `tail` for reading files
+- Prefer `Search` over `grep`, `rg` for searching file contents
+- Prefer `Glob` over `find`, `ls` for finding files by pattern
+- Prefer `Edit` over `sed`, `awk` for modifying files
+- Prefer `Write` over `echo >` or heredocs for creating new files
+- Prefer `WebFetch` over `curl` for fetching URLs
+- Prefer `GitStatus`, `GitDiff`, `GitRestore`, `GitAdd`, `GitCommit` over raw `git` commands
+- Use `CodeQuery` for semantic/architectural questions ("how does X work?")
+- Use `Search` for exact pattern matching ("find all calls to foo()")
+- Avoid `Bash` when a dedicated tool exists for the operation
+
 ## Project Overview
 
 This is a **Rust-based MCP (Model Context Protocol) server** that provides file search functionality using OpenAI's vector stores API and a token-aware web content fetcher for Codex-style agents.

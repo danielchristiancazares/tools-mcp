@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
+use ignore::{DirEntry, WalkBuilder};
 use reqwest::Client;
 use serde_json::Value;
 use std::path::Path;
-use walkdir::{DirEntry, WalkDir};
 
 // The CodeQuery module centralizes all vector-store orchestration so `main.rs` stays focused on
 // MCP protocol wiring. Keeping this logic together avoids mixing transport concerns with OpenAI
@@ -15,12 +15,7 @@ pub use cache::{cache_store_id, load_store_id_from_cache};
 pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResponse<'static> {
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        return crate::RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(crate::err_text("OPENAI_API_KEY not set")),
-            error: None,
-        };
+        return crate::RpcResponse::err(id, "OPENAI_API_KEY not set");
     }
 
     let vector_store_id_arg = args
@@ -38,12 +33,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
     if query.trim().is_empty() {
-        return crate::RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(crate::err_text("query is required for CodeQuery")),
-            error: None,
-        };
+        return crate::RpcResponse::err(id, "query is required for CodeQuery");
     }
 
     if vector_store_id_arg.is_none() && vector_store_name.is_none() {
@@ -52,14 +42,10 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         // advanced callers override via vector_store_name when needed.
         vector_store_name = default_vector_store_name();
         if vector_store_name.is_none() {
-            return crate::RpcResponse {
-                jsonrpc: "2.0",
+            return crate::RpcResponse::err(
                 id,
-                result: Some(crate::err_text(
-                    "CodeQuery could not infer a vector store name. Provide vector_store_name explicitly.",
-                )),
-                error: None,
-            };
+                "CodeQuery could not infer a vector store name. Provide vector_store_name explicitly.",
+            );
         }
     }
 
@@ -85,12 +71,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
             Err(err) => {
                 let message = format!("CodeQuery could not discover local files: {}", err);
                 tracing::error!(error = %message);
-                return crate::RpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(crate::err_text(&message)),
-                    error: None,
-                };
+                return crate::RpcResponse::err(id, message);
             }
         }
     }
@@ -100,12 +81,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .and_then(|v| v.as_u64())
         .unwrap_or(5) as usize;
     if !(1..=20).contains(&concurrent_limit) {
-        return crate::RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(crate::err_text("concurrent_limit must be between 1 and 20")),
-            error: None,
-        };
+        return crate::RpcResponse::err(id, "concurrent_limit must be between 1 and 20");
     }
 
     let timeout_ms = args
@@ -113,14 +89,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .and_then(|v| v.as_u64())
         .unwrap_or(60_000);
     if timeout_ms < 1_000 {
-        return crate::RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(crate::err_text(
-                "timeout_ms must be at least 1000 milliseconds",
-            )),
-            error: None,
-        };
+        return crate::RpcResponse::err(id, "timeout_ms must be at least 1000 milliseconds");
     }
 
     let include_results = args
@@ -143,28 +112,19 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         Some(id) => id,
         None => {
             let Some(name) = vector_store_name.as_deref() else {
-                return crate::RpcResponse {
-                    jsonrpc: "2.0",
+                return crate::RpcResponse::err(
                     id,
-                    result: Some(crate::err_text(
-                        "CodeQuery could not determine a vector store name.",
-                    )),
-                    error: None,
-                };
+                    "CodeQuery could not determine a vector store name.",
+                );
             };
 
             match resolve_vector_store_id(&client, &cfg, name).await {
                 Ok(id) => id,
                 Err(e) => {
-                    return crate::RpcResponse {
-                        jsonrpc: "2.0",
+                    return crate::RpcResponse::err(
                         id,
-                        result: Some(crate::err_text(&format!(
-                            "failed to resolve vector store name '{}': {}",
-                            name, e
-                        ))),
-                        error: None,
-                    };
+                        format!("failed to resolve vector store name '{}': {}", name, e),
+                    );
                 }
             }
         }
@@ -201,15 +161,10 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
                 }));
             }
 
-            crate::RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(serde_json::json!({
-                    "content": content,
-                    "isError": false
-                })),
-                error: None,
-            }
+            crate::RpcResponse::ok(id, serde_json::json!({
+                "content": content,
+                "isError": false
+            }))
         }
         Err(e) => {
             let error_message = e.to_string();
@@ -230,12 +185,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
 
             tracing::error!(%log_message);
 
-            crate::RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(crate::err_text(&client_message)),
-                error: None,
-            }
+            crate::RpcResponse::err(id, client_message)
         }
     }
 }
@@ -292,33 +242,31 @@ const SKIP_DIRS: &[&str] = &[
     "tmp",
 ];
 
-const EXTRA_ALLOWED_EXTS: &[&str] = &[
-    "rs", "toml", "lock", "yaml", "yml", "ini", "cfg", "conf", "sh", "bash", "zsh", "c", "cpp",
-    "h", "hpp", "tsx", "jsx", "ts", "js", "css", "scss", "less", "xml", "sql", "proto", "env",
-    "gradle", "swift", "kt", "kts",
-];
-
-const ALWAYS_INCLUDE_FILENAMES: &[&str] = &[
-    "makefile",
-    "dockerfile",
-    "justfile",
-    "cargo.toml",
-    "cargo.lock",
-    "license",
-    "readme",
-];
-
 fn discover_default_file_paths() -> Result<Vec<String>> {
     let root = std::env::current_dir()?;
     let mut results = Vec::new();
 
-    for entry in WalkDir::new(&root)
+    // Use `ignore`'s walker so `.gitignore` (plus global/exclude rules) are respected by default.
+    // We keep our existing skip rules layered on top via `should_visit`/`should_index_file`.
+    for entry in WalkBuilder::new(&root)
         .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| should_visit(entry))
+        // We apply our own "dotfile/dotdir" policy rather than `ignore`'s hidden-file default.
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        // Treat `.gitignore` as authoritative even when the checkout isn't a full git repo
+        // (e.g. vendored source tree, exported zip, CI artifact).
+        .require_git(false)
+        .parents(true)
+        .filter_entry(should_visit)
+        .build()
     {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
             continue;
         }
         let path = entry.path();
@@ -340,15 +288,17 @@ fn should_visit(entry: &DirEntry) -> bool {
         return true;
     }
 
-    if let Some(name) = entry.file_name().to_str() {
-        if entry.file_type().is_dir() {
-            let lower = name.to_ascii_lowercase();
-            if SKIP_DIRS.contains(&lower.as_str()) {
-                return false;
-            }
-            if lower.starts_with('.') {
-                return false;
-            }
+    if let Some(name) = entry.file_name().to_str()
+        && entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+    {
+        let lower = name.to_ascii_lowercase();
+        if SKIP_DIRS.contains(&lower.as_str()) {
+            return false;
+        }
+        if lower.starts_with('.') {
+            return false;
         }
     }
 
@@ -356,29 +306,35 @@ fn should_visit(entry: &DirEntry) -> bool {
 }
 
 fn should_index_file(path: &Path) -> bool {
-    let file_name = match path.file_name().and_then(|s| s.to_str()) {
-        Some(name) => name,
-        None => return false,
-    };
+    crate::core::is_codequery_indexable_path(path)
+}
 
-    if file_name.starts_with('.') && !file_name.eq_ignore_ascii_case(".env") {
-        return false;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
 
-    if ALWAYS_INCLUDE_FILENAMES
-        .iter()
-        .any(|candidate| file_name.eq_ignore_ascii_case(candidate))
-    {
-        return true;
-    }
+    #[test]
+    fn discover_default_file_paths_respects_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        fs::write(temp.path().join("ignored.rs"), b"fn ignored() {}\n").unwrap();
+        fs::write(temp.path().join("kept.rs"), b"fn kept() {}\n").unwrap();
+        fs::write(temp.path().join("README.md"), b"# docs\n").unwrap();
+        fs::write(temp.path().join("logo.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(temp.path().join(".gitignore"), b"ignored.rs\n").unwrap();
 
-    let extension = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
 
-    match extension.as_deref() {
-        Some(ext) => crate::core::is_allowed_upload_ext(ext) || EXTRA_ALLOWED_EXTS.contains(&ext),
-        None => false,
+        let discovered = discover_default_file_paths().unwrap();
+
+        std::env::set_current_dir(original).unwrap();
+
+        let discovered_joined = discovered.join("\n");
+        assert!(discovered_joined.contains("kept.rs"));
+        assert!(!discovered_joined.contains("ignored.rs"));
+        assert!(!discovered_joined.contains("README.md"));
+        assert!(!discovered_joined.contains("logo.png"));
     }
 }

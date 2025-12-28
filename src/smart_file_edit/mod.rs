@@ -1,5 +1,5 @@
 //! Smart, newline-aware file editing helper for MCP.
-use crate::{RpcResponse, err_text};
+use crate::RpcResponse;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,85 +17,32 @@ pub async fn handle_smart_file_edit(id: Option<Value>, args: Value) -> RpcRespon
         .unwrap_or_default();
 
     if action.is_empty() {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("smart_file_edit requires an 'action' field")),
-            error: None,
-        };
+        return RpcResponse::err(id, "smart_file_edit requires an 'action' field");
     }
 
     match action.as_str() {
         "get_region" => match serde_json::from_value::<GetRegionRequest>(args) {
             Ok(req) => match handle_get_region(&req) {
                 Ok(payload) => ok_json(id, payload),
-                Err(err) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(err_text(&format!(
-                        "smart_file_edit get_region error: {err}"
-                    ))),
-                    error: None,
-                },
+                Err(err) => RpcResponse::err(id, format!("smart_file_edit get_region error: {err}")),
             },
-            Err(err) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid get_region arguments: {err}"))),
-                error: None,
-            },
+            Err(err) => RpcResponse::err(id, format!("invalid get_region arguments: {err}")),
         },
         "apply_snippet_edit" => match serde_json::from_value::<ApplySnippetEditRequest>(args) {
             Ok(req) => match handle_apply_snippet_edit(&req) {
                 Ok(payload) => ok_json(id, payload),
-                Err(err) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(err_text(&format!(
-                        "smart_file_edit apply_snippet_edit error: {err}"
-                    ))),
-                    error: None,
-                },
+                Err(err) => RpcResponse::err(id, format!("smart_file_edit apply_snippet_edit error: {err}")),
             },
-            Err(err) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!(
-                    "invalid apply_snippet_edit arguments: {err}"
-                ))),
-                error: None,
-            },
+            Err(err) => RpcResponse::err(id, format!("invalid apply_snippet_edit arguments: {err}")),
         },
         "apply_unified_diff" => match serde_json::from_value::<ApplyUnifiedDiffRequest>(args) {
             Ok(req) => match handle_apply_unified_diff(&req) {
                 Ok(payload) => ok_json(id, payload),
-                Err(err) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(err_text(&format!(
-                        "smart_file_edit apply_unified_diff error: {err}"
-                    ))),
-                    error: None,
-                },
+                Err(err) => RpcResponse::err(id, format!("smart_file_edit apply_unified_diff error: {err}")),
             },
-            Err(err) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!(
-                    "invalid apply_unified_diff arguments: {err}"
-                ))),
-                error: None,
-            },
+            Err(err) => RpcResponse::err(id, format!("invalid apply_unified_diff arguments: {err}")),
         },
-        other => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text(&format!(
-                "smart_file_edit does not support action '{}'",
-                other
-            ))),
-            error: None,
-        },
+        other => RpcResponse::err(id, format!("smart_file_edit does not support action '{}'", other)),
     }
 }
 
@@ -422,18 +369,13 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
 }
 
 fn ok_json(id: Option<Value>, payload: Value) -> RpcResponse<'static> {
-    RpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(json!({
-            "content": [{
-                "type": "json",
-                "json": payload
-            }],
-            "isError": false
-        })),
-        error: None,
-    }
+    RpcResponse::ok(id, json!({
+        "content": [{
+            "type": "json",
+            "json": payload
+        }],
+        "isError": false
+    }))
 }
 
 fn compute_match_range(

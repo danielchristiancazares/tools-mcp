@@ -46,6 +46,10 @@ use tracing::{error, info};
 /// Cached value of MCP_SKIP_HEADERS env var (read once at first use)
 static SKIP_HEADERS: OnceLock<bool> = OnceLock::new();
 
+/// Hard cap for inbound MCP message bodies (Content-Length framing) and headerless JSON lines.
+/// Prevents unbounded allocations / memory DoS.
+const MAX_MCP_MESSAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
 fn should_skip_headers() -> bool {
     *SKIP_HEADERS.get_or_init(|| {
         std::env::var("MCP_SKIP_HEADERS")
@@ -55,13 +59,41 @@ fn should_skip_headers() -> bool {
 }
 
 mod codequery;
+mod config;
 mod git_tools;
+mod process_utils;
 mod read_file;
 mod ripgrep;
+mod script_runner;
 mod smart_file_edit;
+mod tool_registry;
+mod tools;
 mod webfetch;
 
-use crate::codequery::handle_code_query;
+use crate::tool_registry::{ToolDef, ToolRegistry};
+
+fn build_tool_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register::<tools::PingTool>();
+    registry.register::<tools::WebFetchTool>();
+    registry.register::<tools::SearchTool>();
+    registry.register::<tools::CodeQueryTool>();
+    registry.register::<tools::ReadTool>();
+    registry.register::<tools::EditTool>();
+    registry.register::<tools::WriteTool>();
+    registry.register::<tools::DeleteTool>();
+    registry.register::<tools::GlobTool>();
+    registry.register::<tools::BuildTool>();
+    registry.register::<tools::TestTool>();
+    registry.register::<tools::OutlineTool>();
+    registry.register::<tools::PwshTool>();
+    registry.register::<tools::GitStatusTool>();
+    registry.register::<tools::GitDiffTool>();
+    registry.register::<tools::GitRestoreTool>();
+    registry.register::<tools::GitAddTool>();
+    registry.register::<tools::GitCommitTool>();
+    registry
+}
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -92,6 +124,83 @@ pub(crate) struct RpcError {
     pub(crate) data: Option<Value>,
 }
 
+impl RpcResponse<'static> {
+    /// Success response with a result payload
+    pub fn ok(id: Option<Value>, result: Value) -> RpcResponse<'static> {
+        RpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// Error response using MCP content format (result with isError: true)
+    pub fn err(id: Option<Value>, msg: impl std::fmt::Display) -> RpcResponse<'static> {
+        RpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(serde_json::json!({"content":[{"type":"text","text": msg.to_string()}], "isError": true})),
+            error: None,
+        }
+    }
+
+    /// Success response with text content and additional metadata fields
+    pub fn ok_text_with(
+        id: Option<Value>,
+        text: impl Into<String>,
+        extra: impl IntoIterator<Item = (&'static str, Value)>,
+    ) -> RpcResponse<'static> {
+        let mut payload = serde_json::json!({
+            "content": [{"type": "text", "text": text.into()}],
+            "isError": false
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            for (k, v) in extra {
+                obj.insert(k.to_string(), v);
+            }
+        }
+        RpcResponse::ok(id, payload)
+    }
+
+    /// Success response with pretty-printed JSON as text content
+    pub fn ok_json_content(id: Option<Value>, json_value: Value, is_error: bool) -> RpcResponse<'static> {
+        let json_text = serde_json::to_string_pretty(&json_value).unwrap_or_else(|e| {
+            format!("{{\"error\": \"serialization failed: {}\"}}", e)
+        });
+        RpcResponse::ok(
+            id,
+            serde_json::json!({
+                "content": [{"type": "text", "text": json_text}],
+                "isError": is_error
+            }),
+        )
+    }
+
+    /// Parse request arguments, returning error response on failure
+    pub fn parse<T: serde::de::DeserializeOwned>(
+        id: Option<Value>,
+        args: Value,
+    ) -> Result<T, RpcResponse<'static>> {
+        serde_json::from_value::<T>(args)
+            .map_err(|e| RpcResponse::err(id, format!("invalid arguments: {e}")))
+    }
+
+    /// JSON-RPC protocol error (uses error field, not result)
+    pub fn protocol_error(id: Option<Value>, code: i64, msg: impl Into<String>) -> RpcResponse<'static> {
+        RpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(RpcError {
+                code,
+                message: msg.into(),
+                data: None,
+            }),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct InitializeResult {
     #[serde(rename = "protocolVersion")]
@@ -119,14 +228,6 @@ struct ServerInfo {
     version: String,
 }
 
-#[derive(Serialize, Clone)]
-struct ToolDef {
-    name: String,
-    description: String,
-    #[serde(rename = "inputSchema")]
-    input_schema: Value,
-}
-
 async fn read_mcp_message<R>(reader: &mut R) -> io::Result<Option<String>>
 where
     R: AsyncBufRead + Unpin,
@@ -146,6 +247,12 @@ where
                 ));
             }
             return Ok(None);
+        }
+        if line.len() > MAX_MCP_MESSAGE_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "message line exceeds maximum allowed size",
+            ));
         }
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
         if trimmed.is_empty() {
@@ -167,6 +274,12 @@ where
                 let len = value.trim().parse::<usize>().map_err(|_| {
                     io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header")
                 })?;
+                if len > MAX_MCP_MESSAGE_BYTES {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "Content-Length exceeds maximum allowed size",
+                    ));
+                }
                 content_length = Some(len);
             }
         }
@@ -237,183 +350,8 @@ async fn main() -> Result<()> {
     let reader = BufReader::new(stdin);
     let mut reader = reader;
 
-    let tools = vec![
-        ToolDef {
-            name: "WebFetch".into(),
-            description: "Fetch and summarize external web content with caching".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "url": {"type":"string", "description":"Absolute URL to fetch"},
-                    "max_chunk_tokens": {"type":"integer","minimum":200,"description":"Approximate token budget per chunk"},
-                    "no_cache": {"type":"boolean","description":"Bypass on-disk cache if true"}
-                },
-                "required":["url"]
-            }),
-        },
-        ToolDef {
-            name: "ping".into(),
-            description: "Health check tool: responds with pong".into(),
-            input_schema: serde_json::json!({ "type":"object", "properties":{}, "required":[] }),
-        },
-        ToolDef {
-            name: "Bash".into(),
-            description: "Run shell commands via bash.exe on Windows (or bash on Unix) with timeout and stdout/stderr capture.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "command": {
-                        "type":"string",
-                        "description":"Shell command to run inside bash.exe / bash (executed as: bash -lc \"<command>\")"
-                    },
-                    "timeout_ms": {
-                        "type":"integer",
-                        "minimum":100,
-                        "default":30000,
-                        "description":"Timeout in milliseconds before the command is aborted"
-                    },
-                    "working_dir": {
-                        "type":"string",
-                        "description":"Optional working directory for the command"
-                    }
-                },
-                "required":["command"]
-            }),
-        },
-        ToolDef {
-            name: "RipGrep".into(),
-            description: "Fast regex search via ripgrep (rg). Returns line-numbered output and structured match records.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "pattern":{"type":"string","description":"ripgrep pattern (regex by default)"},
-                    "path":{"type":"string","description":"File or directory to search (default: current working directory)"},
-                    "case":{"type":"string","enum":["smart","sensitive","insensitive"],"default":"smart","description":"Case handling mode"},
-                    "fixed_strings":{"type":"boolean","default":false,"description":"Treat pattern as a literal string (rg -F)"},
-                    "word_regexp":{"type":"boolean","default":false,"description":"Match on word boundaries only (rg -w)"},
-                    "glob":{"type":"array","items":{"type":"string"},"description":"Optional glob filters (repeats rg --glob)"},
-                    "hidden":{"type":"boolean","default":false,"description":"Search hidden files/directories (rg --hidden)"},
-                    "follow":{"type":"boolean","default":false,"description":"Follow symlinks (rg --follow)"},
-                    "no_ignore":{"type":"boolean","default":false,"description":"Do not respect ignore files like .gitignore (rg --no-ignore)"},
-                    "context":{"type":"integer","minimum":0,"default":0,"description":"Lines of context on both sides (rg -C)"},
-                    "max_results":{"type":"integer","minimum":1,"maximum":10000,"default":200,"description":"Maximum match/context events to return"},
-                    "timeout_ms":{"type":"integer","minimum":100,"default":20000,"description":"Overall timeout in milliseconds"}
-                },
-                "required":["pattern"]
-            }),
-        },
-        ToolDef {
-            name: "CodeQuery".into(),
-            description: "Index codebase files and run semantic search in one operation. Automatically syncs changed files (if file_paths provided) and queries the vector store.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "vector_store_id": {"type":"string", "description":"Target vector store ID"},
-                    "vector_store_name": {"type":"string", "description":"Target vector store name"},
-                    "query": {"type":"string", "description":"Natural language code question"},
-                    "file_paths": {"type":"array", "items":{"type":"string"}, "description":"Optional local file paths to sync before querying"},
-                    "concurrent_limit": {"type":"integer", "minimum":1, "maximum":20, "default":5, "description":"Max concurrent operations (default: 5)"},
-                    "timeout_ms": {"type":"integer", "minimum":1000, "default":60000, "description":"Overall indexing wait timeout in milliseconds"},
-                    "model": {"type":"string", "description":"Override model (defaults to ApiConfig default)"},
-                    "max_num_results": {"type":"integer", "minimum":1, "description":"Limit vector search matches"},
-                    "include_results": {"type":"boolean", "default":false, "description":"Include retrieved snippets in the response payload"}
-                },
-                "required":["query"]
-            }),
-        },
-        ToolDef {
-            name: "ReadFile".into(),
-            description: "Read a file (optionally a line range) for quick inspection without uploading. Output is line-numbered.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "path":{"type":"string","description":"Filesystem path to read"},
-                    "start_line":{"type":"integer","minimum":1,"description":"Optional 1-based start line"},
-                    "end_line":{"type":"integer","minimum":1,"description":"Optional 1-based end line (inclusive)"}
-                },
-                "required":["path"]
-            }),
-        },
-        ToolDef {
-            name: "SmartFileEdit".into(),
-            description: "Read and edit files via a canonical LF view while preserving original newline bytes and whitespace.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "required":["action","path"],
-                "properties":{
-                    "action":{
-                        "type":"string",
-                        "enum":["get_region","apply_snippet_edit","apply_unified_diff"],
-                        "description":"Operation to perform"
-                    },
-                    "path":{"type":"string","description":"Filesystem path to inspect or edit"},
-                    "start_line":{"type":"integer","minimum":1,"description":"Start line for get_region"},
-                    "end_line":{"type":"integer","minimum":1,"description":"End line for get_region"},
-                    "old_snippet":{"type":"string","description":"Existing canonical snippet to replace"},
-                    "new_snippet":{"type":"string","description":"Replacement snippet using LF newlines"},
-                    "file_hash":{"type":"string","description":"sha256 hash returned by get_region to detect stale files"},
-                    "region_id":{"type":"string","description":"Region identifier returned by get_region"},
-                    "match_hint":{
-                        "type":"object",
-                        "properties":{
-                            "start_line":{"type":"integer","minimum":1},
-                            "end_line":{"type":"integer","minimum":1}
-                        },
-                        "additionalProperties": false
-                    }
-                },
-                "additionalProperties": true
-            }),
-        },
-        ToolDef {
-            name: "GitStatus".into(),
-            description: "Run `git status` (porcelain by default) with structured output.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "working_dir": {"type":"string","description":"Optional working directory for the git command"},
-                    "timeout_ms": {"type":"integer","minimum":100,"default":30000,"description":"Timeout in milliseconds before the command is aborted"},
-                    "porcelain": {"type":"boolean","default":true,"description":"Use porcelain output (`--porcelain=1`) when true"},
-                    "branch": {"type":"boolean","default":true,"description":"Include branch info (`-b`) in porcelain mode"},
-                    "untracked": {"type":"boolean","default":true,"description":"Include untracked files in porcelain mode (when false, uses `-uno`)"}
-                },
-                "required":[]
-            }),
-        },
-        ToolDef {
-            name: "GitDiff".into(),
-            description: "Run `git diff` (optionally `--stat`, `--name-only`, `--cached`, and path-limited) with output truncation.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "working_dir": {"type":"string","description":"Optional working directory for the git command"},
-                    "timeout_ms": {"type":"integer","minimum":100,"default":30000,"description":"Timeout in milliseconds before the command is aborted"},
-                    "cached": {"type":"boolean","default":false,"description":"Diff staged changes (`--cached`)"},
-                    "stat": {"type":"boolean","default":false,"description":"Show diffstat only (`--stat`)"},
-                    "name_only": {"type":"boolean","default":false,"description":"Show only changed file names (`--name-only`)"},
-                    "unified": {"type":"integer","minimum":0,"description":"Number of context lines (`-U<N>`)"},
-                    "paths": {"type":"array","items":{"type":"string"},"description":"Optional path list to diff (passed after `--`)"},
-                    "max_bytes": {"type":"integer","minimum":1,"maximum":5000000,"default":200000,"description":"Maximum bytes captured from stdout before truncation"}
-                },
-                "required":[]
-            }),
-        },
-        ToolDef {
-            name: "GitRestore".into(),
-            description: "Run `git restore` on specific paths (worktree and/or staged). WARNING: discards changes in the selected paths.".into(),
-            input_schema: serde_json::json!({
-                "type":"object",
-                "properties":{
-                    "paths": {"type":"array","items":{"type":"string"},"description":"Paths to restore (passed after `--`)"},
-                    "working_dir": {"type":"string","description":"Optional working directory for the git command"},
-                    "timeout_ms": {"type":"integer","minimum":100,"default":30000,"description":"Timeout in milliseconds before the command is aborted"},
-                    "staged": {"type":"boolean","default":false,"description":"Restore the index/staging area (`--staged`)"},
-                    "worktree": {"type":"boolean","default":true,"description":"Restore the working tree (`--worktree`) (default true)"}
-                },
-                "required":["paths"]
-            }),
-        },
-    ];
+    let registry = build_tool_registry();
+    let tools = registry.list();
 
     while let Some(line) = match read_mcp_message(&mut reader).await {
         Ok(v) => v,
@@ -452,6 +390,14 @@ async fn main() -> Result<()> {
         }
 
         let (resp, should_exit): (RpcResponse, bool) = match req.method.as_str() {
+            // Simple ping (JSON-RPC method)
+            "ping" | "mcp/ping" => (
+                RpcResponse::ok(req.id, serde_json::json!({
+                    "content": [{"type": "text", "text": "pong"}],
+                    "isError": false
+                })),
+                false,
+            ),
             // Initialization aliases (Codex-compatible)
             "mcp/initialize" | "initialize" | "server/initialize" => {
                 let init = InitializeResult {
@@ -493,12 +439,7 @@ async fn main() -> Result<()> {
             // Tools listing
             "mcp/tools/list" | "tools/list" | "server/tools/list" | "mcp/capabilities"
             | "capabilities" => (
-                RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({"tools": tools})),
-                    error: None,
-                },
+                RpcResponse::ok(req.id, serde_json::json!({"tools": tools})),
                 false,
             ),
             // Tool call
@@ -523,93 +464,22 @@ async fn main() -> Result<()> {
                     .or_else(|| params.get("call").and_then(|c| c.get("arguments")).cloned())
                     .unwrap_or(Value::Object(Default::default()));
 
-                let resp = match name {
-                    // webfetch tool
-                    "WebFetch" => handle_webfetch(req.id.clone(), args).await,
-                    // ping
-                    "ping" => RpcResponse {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(serde_json::json!({
-                            "content": [ { "type": "text", "text": "pong" } ], "isError": false
-                        })),
-                        error: None,
-                    },
-                    // Bash wrapper
-                    "Bash" | "bash" => handle_bash(req.id.clone(), args).await,
-                    // ripgrep search
-                    "RipGrep" | "ripgrep" | "rg" => {
-                        ripgrep::handle_ripgrep(req.id.clone(), args).await
-                    }
-                    // code query
-                    "CodeQuery" | "code_query" | "code-query" => {
-                        handle_code_query(req.id.clone(), args).await
-                    }
-                    // read file
-                    "ReadFile" | "read_file" | "read-file" => {
-                        read_file::handle_read_file(req.id.clone(), args).await
-                    }
-                    "smart_file_edit" | "SmartFileEdit" => {
-                        smart_file_edit::handle_smart_file_edit(req.id.clone(), args).await
-                    }
-                    "GitStatus" | "git_status" | "git-status" => {
-                        git_tools::handle_git_status(req.id.clone(), args).await
-                    }
-                    "GitDiff" | "git_diff" | "git-diff" => {
-                        git_tools::handle_git_diff(req.id.clone(), args).await
-                    }
-                    "GitRestore" | "git_restore" | "git-restore" => {
-                        git_tools::handle_git_restore(req.id.clone(), args).await
-                    }
-                    other => RpcResponse {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: None,
-                        error: Some(RpcError {
-                            code: -32601,
-                            message: format!("Unknown tool: {}", other),
-                            data: None,
-                        }),
-                    },
+                let resp = if let Some(result) = registry.call(name, req.id.clone(), args).await {
+                    result
+                } else {
+                    RpcResponse::protocol_error(req.id, -32601, format!("Unknown tool: {}", name))
                 };
                 (resp, false)
             }
             // Shutdown aliases
             "mcp/shutdown" | "shutdown" | "server/shutdown" => {
-                let resp = RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({"ok": true})),
-                    error: None,
-                };
-                (resp, true)
+                (RpcResponse::ok(req.id, serde_json::json!({"ok": true})), true)
             }
-            // Top-level ping/health
-            "ping" | "health" | "mcp/health" => (
-                RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({
-                        "content": [ { "type": "text", "text": "pong" } ], "isError": false
-                    })),
-                    error: None,
-                },
-                false,
-            ),
             _ => {
                 // Log unknown method for debugging
                 error!("Unknown method: {}", req.method);
                 (
-                    RpcResponse {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: None,
-                        error: Some(RpcError {
-                            code: -32601,
-                            message: format!("Method not found: {}", req.method),
-                            data: None,
-                        }),
-                    },
+                    RpcResponse::protocol_error(req.id, -32601, format!("Method not found: {}", req.method)),
                     false,
                 )
             }
@@ -631,175 +501,4 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_webfetch(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req_result = serde_json::from_value::<webfetch::FetchRequest>(args);
-    let request = match req_result {
-        Ok(req) => req,
-        Err(e) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {}", e))),
-                error: None,
-            };
-        }
-    };
 
-    match webfetch::run_fetch(request).await {
-        Ok(response) => match serde_json::to_value(&response) {
-            Ok(json_value) => {
-                let json_text = serde_json::to_string_pretty(&json_value)
-                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-                RpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(serde_json::json!({
-                        "content": [{
-                            "type": "text",
-                            "text": json_text
-                        }],
-                        "isError": false
-                    })),
-                    error: None,
-                }
-            }
-            Err(e) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!(
-                    "webfetch succeeded but response serialization failed: {}",
-                    e
-                ))),
-                error: None,
-            },
-        },
-        Err(e) => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text(&format!("webfetch error: {:#}", e))),
-            error: None,
-        },
-    }
-}
-
-pub(crate) fn err_text(msg: &str) -> Value {
-    serde_json::json!({"content":[{"type":"text","text": msg}], "isError": true})
-}
-
-async fn handle_bash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    use serde::Deserialize;
-    use std::time::Duration;
-    use tokio::process::Command;
-    use tokio::time;
-
-    #[derive(Deserialize)]
-    struct BashRequest {
-        command: String,
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-        #[serde(default)]
-        working_dir: Option<String>,
-    }
-
-    let req_result = serde_json::from_value::<BashRequest>(args);
-    let request = match req_result {
-        Ok(req) => req,
-        Err(e) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {}", e))),
-                error: None,
-            };
-        }
-    };
-
-    let shell_binary = if cfg!(target_os = "windows") {
-        "bash.exe"
-    } else {
-        "bash"
-    };
-
-    info!(
-        "Bash tool: running command via {}: {}",
-        shell_binary, request.command
-    );
-
-    let timeout_ms = request.timeout_ms.unwrap_or(30_000);
-
-    let mut cmd = Command::new(shell_binary);
-    cmd.arg("-lc").arg(&request.command);
-
-    if let Some(dir) = &request.working_dir {
-        cmd.current_dir(dir);
-    }
-
-    let output_result = time::timeout(Duration::from_millis(timeout_ms), cmd.output()).await;
-
-    match output_result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let exit_code = output.status.code();
-            let success = output.status.success();
-
-            if !success {
-                error!("Bash tool: command failed (exit_code={:?})", exit_code);
-            }
-
-            let result = serde_json::json!({
-                "command": request.command,
-                "shell": shell_binary,
-                "timeout_ms": timeout_ms,
-                "exit_code": exit_code,
-                "success": success,
-                "stdout": stdout.clone(),
-                "stderr": stderr.clone(),
-            });
-
-            let json_text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| {
-                format!(
-                    "success: {}\nexit_code: {:?}\n\nstdout:\n{}\n\nstderr:\n{}",
-                    success, exit_code, stdout, stderr
-                )
-            });
-
-            RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": json_text
-                    }],
-                    "isError": !success
-                })),
-                error: None,
-            }
-        }
-        Ok(Err(e)) => {
-            error!("Bash tool: failed to spawn {}: {}", shell_binary, e);
-            RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!(
-                    "Failed to spawn {}: {}",
-                    shell_binary, e
-                ))),
-                error: None,
-            }
-        }
-        Err(_) => {
-            error!("Bash tool: command timed out after {} ms", timeout_ms);
-            RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!(
-                    "Bash command timed out after {} ms",
-                    timeout_ms
-                ))),
-                error: None,
-            }
-        }
-    }
-}

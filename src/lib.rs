@@ -108,56 +108,47 @@ impl ResponseObject {
             }
         });
 
-        if let Some(msg) = message {
-            // Extract text from the first content item
-            if let Some(content) = msg.content.first() {
-                if let Some(text) = &content.text {
-                    let mut result = text.clone();
+        if let Some(msg) = message
+            && let Some(content) = msg.content.first()
+            && let Some(text) = &content.text
+        {
+            let mut result = text.clone();
 
-                    // Optionally append search results
-                    if include_results {
-                        if let Some(file_search) = self.output.iter().find_map(|item| {
-                            if let OutputItem::FileSearchCall(fs) = item {
-                                Some(fs)
-                            } else {
-                                None
-                            }
-                        }) {
-                            if let Some(results) = &file_search.results {
-                                result.push_str("\n\n---\n### Search Results:\n");
-                                for (i, r) in results.iter().take(5).enumerate() {
-                                    if let (Some(filename), Some(score)) = (
-                                        r.get("filename").and_then(|v| v.as_str()),
-                                        r.get("score").and_then(|v| v.as_f64()),
-                                    ) {
-                                        result.push_str(&format!(
-                                            "\n{}. **{}** (score: {:.2})",
-                                            i + 1,
-                                            filename,
-                                            score
-                                        ));
-                                        if let Some(text_snippet) =
-                                            r.get("text").and_then(|v| v.as_str())
-                                        {
-                                            let preview = text_snippet
-                                                .lines()
-                                                .take(2)
-                                                .collect::<Vec<_>>()
-                                                .join("\n   ");
-                                            if !preview.is_empty() {
-                                                result
-                                                    .push_str(&format!("\n   {}", preview.trim()));
-                                            }
-                                        }
-                                    }
-                                }
+            // Optionally append search results.
+            if include_results
+                && let Some(file_search) = self.output.iter().find_map(|item| match item {
+                    OutputItem::FileSearchCall(fs) => Some(fs),
+                    _ => None,
+                })
+                && let Some(results) = &file_search.results
+            {
+                result.push_str("\n\n---\n### Search Results:\n");
+                for (i, r) in results.iter().take(5).enumerate() {
+                    if let (Some(filename), Some(score)) = (
+                        r.get("filename").and_then(|v| v.as_str()),
+                        r.get("score").and_then(|v| v.as_f64()),
+                    ) {
+                        result.push_str(&format!(
+                            "\n{}. **{}** (score: {:.2})",
+                            i + 1,
+                            filename,
+                            score
+                        ));
+                        if let Some(text_snippet) = r.get("text").and_then(|v| v.as_str()) {
+                            let preview = text_snippet
+                                .lines()
+                                .take(2)
+                                .collect::<Vec<_>>()
+                                .join("\n   ");
+                            if !preview.is_empty() {
+                                result.push_str(&format!("\n   {}", preview.trim()));
                             }
                         }
                     }
-
-                    return result;
                 }
             }
+
+            return result;
         }
 
         // Fallback to empty string if no text found
@@ -213,6 +204,93 @@ pub fn is_allowed_upload_ext(ext: &str) -> bool {
             | "xml"
             | "zip"
     )
+}
+
+/// Returns true if a file extension is considered "binary/non-text" for CodeQuery indexing.
+///
+/// CodeQuery is optimized for code/config/text search. Even if OpenAI's Files API accepts a
+/// broader set of formats, uploading binary blobs (especially images/media/archives) is usually
+/// noise for semantic code search and can waste tokens/bytes.
+pub fn is_codequery_binary_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        // Images.
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" | "svg" | "heic"
+            | "avif"
+            // Audio/video.
+            | "mp3" | "wav" | "flac" | "m4a" | "ogg" | "mp4" | "mov" | "mkv" | "webm"
+            // Archives/bundles.
+            | "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar"
+            // Common executables/artifacts.
+            | "exe" | "dll" | "so" | "dylib" | "a" | "lib" | "o" | "obj" | "class" | "jar"
+            | "wasm"
+            // Common binary data formats that are unlikely to be helpful for code search.
+            | "pkl" | "db" | "sqlite" | "sqlite3"
+            // Office/PDF docs are typically binary; keep CodeQuery focused on text sources by default.
+            | "pdf" | "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx"
+    )
+}
+
+pub fn is_codequery_indexable_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        // Only actual source-code files. Keep this conservative to avoid indexing config/docs.
+        "rs" | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "go"
+            | "java"
+            | "kt"
+            | "kts"
+            | "swift"
+            | "py"
+            | "rb"
+            | "php"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+    )
+}
+
+pub fn is_codequery_indexable_filename(_file_name: &str) -> bool {
+    // Intentionally empty: CodeQuery should only index explicit code/config-by-extension files.
+    // (No special-casing for extensionless files.)
+    false
+}
+
+pub fn is_codequery_indexable_path(path: &std::path::Path) -> bool {
+    let file_name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    // Keep CodeQuery focused on code/config; skip dotfiles by default.
+    if file_name.starts_with('.') {
+        return false;
+    }
+
+    if is_codequery_indexable_filename(file_name) {
+        return true;
+    }
+
+    let ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(ext) => ext,
+        None => return false,
+    };
+
+    // Keep Markdown/docs out of the code index.
+    if ext.eq_ignore_ascii_case("md") {
+        return false;
+    }
+
+    // Hard block binary/media formats.
+    if is_codequery_binary_ext(ext) {
+        return false;
+    }
+
+    is_codequery_indexable_ext(ext)
 }
 
 /// Computes the appropriate filename for upload to OpenAI.
@@ -360,6 +438,21 @@ pub async fn compute_file_hash(path: &str) -> Result<String> {
     }
 
     Ok(hex::encode(hasher.finalize()))
+}
+
+async fn looks_binary_by_content(path: &str) -> Result<bool> {
+    use tokio::fs::File;
+    use tokio::io::AsyncReadExt;
+
+    // Read a small prefix and look for NUL bytes, which is a strong signal of binary data.
+    // This intentionally errs on the side of skipping to avoid uploading blobs into CodeQuery.
+    let mut file = File::open(path)
+        .await
+        .with_context(|| format!("Failed to open file: {}", path))?;
+
+    let mut buf = vec![0u8; 8192];
+    let n = file.read(&mut buf).await?;
+    Ok(buf[..n].contains(&0))
 }
 
 /// Computes SHA256 hash of bytes
@@ -653,10 +746,7 @@ pub async fn wait_for_vector_store_ready(
 
         // Check if all files are completed (no in_progress files)
         if counts.in_progress == 0 && counts.total > 0 {
-            tracing::debug!(
-                "Vector store ready: {} files completed",
-                counts.completed
-            );
+            tracing::debug!("Vector store ready: {} files completed", counts.completed);
             return Ok(());
         }
 
@@ -1088,7 +1178,10 @@ pub async fn reindex_files(
             }
         } else if let Some((old_key, file_id)) = hash_map.get(&local_hash).cloned() {
             // Same hash at different location - file was moved
-            to_delete.insert(file_id.clone(), format!("moved from {} to {}", old_key, path));
+            to_delete.insert(
+                file_id.clone(),
+                format!("moved from {} to {}", old_key, path),
+            );
             to_upload.push((path.clone(), local_hash.clone()));
             path_map.remove(&old_key);
             hash_map.remove(&local_hash);
@@ -1103,7 +1196,10 @@ pub async fn reindex_files(
                     to_skip.push(path.clone());
                 } else {
                     // Filename matches but hash differs - content changed
-                    to_delete.insert(file_id.clone(), format!("content changed (legacy): {}", fname));
+                    to_delete.insert(
+                        file_id.clone(),
+                        format!("content changed (legacy): {}", fname),
+                    );
                     to_upload.push((path.clone(), local_hash.clone()));
                 }
                 filename_map.remove(fname);
@@ -1134,10 +1230,11 @@ pub async fn reindex_files(
         .map(|c| c.to_vec())
         .collect();
     for chunk in chunks {
-        let results: Vec<_> = stream::iter(chunk.iter())
+        let chunk_len = chunk.len();
+        let results: Vec<_> = stream::iter(chunk.into_iter())
             .map(|(path, hash)| async move {
                 // Upload file
-                let file_id = match upload_file(client, cfg, path).await {
+                let file_id = match upload_file(client, cfg, &path).await {
                     Ok(id) => id,
                     Err(e) => return Err((path.clone(), format!("Upload failed: {}", e))),
                 };
@@ -1163,8 +1260,8 @@ pub async fn reindex_files(
                 .await
                 {
                     Ok(_) => {
-                        if !skip_per_file_wait {
-                            if let Err(e) = wait_for_vector_file_ready(
+                        if !skip_per_file_wait
+                            && let Err(e) = wait_for_vector_file_ready(
                                 client,
                                 cfg,
                                 vector_store_id,
@@ -1172,15 +1269,14 @@ pub async fn reindex_files(
                                 30000,
                             )
                             .await
-                            {
-                                tracing::warn!(
-                                    "File {} uploaded but processing incomplete: {}",
-                                    path,
-                                    e
-                                );
-                            }
+                        {
+                            tracing::warn!(
+                                "File {} uploaded but processing incomplete: {}",
+                                path,
+                                e
+                            );
                         }
-                        Ok((path.clone(), file_id, hash.clone()))
+                        Ok((path, file_id, hash))
                     }
                     Err(e) => Err((path.clone(), format!("Attach failed: {}", e))),
                 }
@@ -1201,7 +1297,7 @@ pub async fn reindex_files(
             }
         }
 
-        if !chunk.is_empty() {
+        if chunk_len > 0 {
             sleep(Duration::from_millis(500)).await;
         }
     }
@@ -1419,7 +1515,7 @@ pub async fn code_query(
         return Err(anyhow!("query must not be empty"));
     }
 
-    // Validate local paths before attempting uploads to avoid partial runs.
+    // Validate that inputs are local file paths before attempting uploads to avoid partial runs.
     for path in file_paths {
         if path.starts_with("http://") || path.starts_with("https://") {
             return Err(anyhow!(
@@ -1427,23 +1523,85 @@ pub async fn code_query(
                 path
             ));
         }
-        tokio::fs::metadata(path)
-            .await
-            .with_context(|| format!("Failed to access file path: {}", path))?;
     }
 
     let mut reindex_summary: Option<serde_json::Value> = None;
     if !file_paths.is_empty() {
+        // Filter out known-binary extensions and content that looks binary. We do this at the
+        // orchestration layer so those paths are treated as "absent locally", which causes any
+        // previously-indexed binary blobs to be deleted as orphans.
+        let mut filtered_paths: Vec<String> = Vec::new();
+        let mut filtered_out: Vec<serde_json::Value> = Vec::new();
+
+        for path in file_paths {
+            let meta = tokio::fs::metadata(path)
+                .await
+                .with_context(|| format!("Failed to access file path: {}", path))?;
+            if !meta.is_file() {
+                filtered_out.push(serde_json::json!({
+                    "path": path,
+                    "reason": "not a regular file"
+                }));
+                continue;
+            }
+
+            if !is_codequery_indexable_path(std::path::Path::new(path)) {
+                filtered_out.push(serde_json::json!({
+                    "path": path,
+                    "reason": "not an indexable code/config file"
+                }));
+                continue;
+            }
+
+            if looks_binary_by_content(path).await? {
+                filtered_out.push(serde_json::json!({
+                    "path": path,
+                    "reason": "binary content (NUL byte detected)"
+                }));
+                continue;
+            }
+
+            filtered_paths.push(path.clone());
+        }
+
+        if filtered_paths.is_empty() {
+            return Err(anyhow!(
+                "No indexable files provided for CodeQuery after filtering non-code files"
+            ));
+        }
+
         let summary = reindex_with_retry(
             client,
             cfg,
             vector_store_id,
-            file_paths,
+            &filtered_paths,
             concurrent_limit,
             true,
         )
         .await
         .map_err(|e| anyhow!("code_query reindex failed: {}", e))?;
+
+        // Attach filter diagnostics for transparency. This is additive to the existing summary.
+        let mut summary = summary;
+        if let Some(root) = summary.as_object_mut() {
+            if !filtered_out.is_empty() {
+                root.insert(
+                    "filtered_out".to_string(),
+                    serde_json::Value::Array(filtered_out),
+                );
+            }
+            if let Some(obj) = root.get_mut("summary").and_then(|v| v.as_object_mut()) {
+                obj.insert(
+                    "requested_files".to_string(),
+                    serde_json::json!(file_paths.len()),
+                );
+                obj.insert(
+                    "indexed_files".to_string(),
+                    serde_json::json!(filtered_paths.len()),
+                );
+            }
+        }
+
         // Use file_counts polling instead of per-file status checks
         wait_for_vector_store_ready(client, cfg, vector_store_id, 1000, timeout_ms).await?;
         reindex_summary = Some(summary);
@@ -1494,6 +1652,57 @@ mod tests {
         assert!(!is_allowed_upload_ext("exe"));
         assert!(!is_allowed_upload_ext("bin"));
         assert!(!is_allowed_upload_ext("unknown"));
+    }
+
+    #[test]
+    fn test_codequery_binary_ext() {
+        assert!(is_codequery_binary_ext("png"));
+        assert!(is_codequery_binary_ext("JPG"));
+        assert!(is_codequery_binary_ext("zip"));
+        assert!(is_codequery_binary_ext("exe"));
+        assert!(!is_codequery_binary_ext("rs"));
+        assert!(!is_codequery_binary_ext("toml"));
+    }
+
+    #[test]
+    fn test_codequery_indexable_path() {
+        assert!(is_codequery_indexable_path(std::path::Path::new(
+            "src/main.rs"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "Cargo.toml"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "Makefile"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "Dockerfile"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "Justfile"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(".env")));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "README.md"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "config.yaml"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "config.yml"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "data.json"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "logo.png"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            "archive.zip"
+        )));
+        assert!(!is_codequery_indexable_path(std::path::Path::new(
+            ".gitignore"
+        )));
     }
 
     #[test]

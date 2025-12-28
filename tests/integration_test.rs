@@ -187,21 +187,28 @@ fn test_tools_list() {
     assert_eq!(response["id"], 3);
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10); // ping, WebFetch, Bash, RipGrep, CodeQuery, ReadFile, SmartFileEdit, GitStatus, GitDiff, GitRestore
+    assert_eq!(tools.len(), 17); // ping, WebFetch, Search, CodeQuery, Read, Edit, GitStatus, GitDiff, GitRestore, GitAdd, GitCommit, Write, Delete, Glob, Build, Test, Outline
 
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     assert!(tool_names.contains(&"ping"));
     assert!(tool_names.contains(&"WebFetch"));
-    assert!(tool_names.contains(&"Bash"));
-    assert!(tool_names.contains(&"RipGrep"));
+    assert!(tool_names.contains(&"Search"));
     assert!(tool_names.contains(&"CodeQuery"));
-    assert!(tool_names.contains(&"ReadFile"));
-    assert!(tool_names.contains(&"SmartFileEdit"));
+    assert!(tool_names.contains(&"Read"));
+    assert!(tool_names.contains(&"Edit"));
     assert!(tool_names.contains(&"GitStatus"));
     assert!(tool_names.contains(&"GitDiff"));
     assert!(tool_names.contains(&"GitRestore"));
+    assert!(tool_names.contains(&"GitAdd"));
+    assert!(tool_names.contains(&"GitCommit"));
+    assert!(tool_names.contains(&"Write"));
+    assert!(tool_names.contains(&"Delete"));
+    assert!(tool_names.contains(&"Glob"));
+    assert!(tool_names.contains(&"Build"));
+    assert!(tool_names.contains(&"Test"));
+    assert!(tool_names.contains(&"Outline"));
 }
 
 #[test]
@@ -228,10 +235,49 @@ fn test_ping_tool_call() {
 }
 
 #[test]
-fn test_read_file_is_line_numbered() {
+fn test_read_file_with_line_numbers() {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 40,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "ReadFile",
+            "arguments": {
+                "path": "src/read_file.rs",
+                "start_line": 1,
+                "end_line": 1,
+                "show_line_numbers": true
+            }
+        }
+    });
+
+    let response = send_mcp_message(request).expect("Failed to call ReadFile tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 40);
+    assert_eq!(response["result"]["isError"], false);
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing ReadFile content text");
+    assert!(
+        text.starts_with("1\t"),
+        "expected line number prefix when show_line_numbers is true"
+    );
+    assert!(
+        text.contains("use crate"),
+        "expected ReadFile source content"
+    );
+    assert_eq!(response["result"]["start_line"], 1);
+    assert_eq!(response["result"]["end_line"], 1);
+    assert!(response["result"]["total_lines"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn test_read_file_no_line_numbers_by_default() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
         "method": "mcp/tools/call",
         "params": {
             "name": "ReadFile",
@@ -246,16 +292,19 @@ fn test_read_file_is_line_numbered() {
     let response = send_mcp_message(request).expect("Failed to call ReadFile tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
-    assert_eq!(response["id"], 40);
+    assert_eq!(response["id"], 41);
     assert_eq!(response["result"]["isError"], false);
 
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .expect("missing ReadFile content text");
-    assert!(text.starts_with("1\t"), "expected line number prefix");
     assert!(
-        text.contains("use crate"),
-        "expected ReadFile source content"
+        !text.starts_with("1\t"),
+        "should not have line number prefix by default"
+    );
+    assert!(
+        text.starts_with("use crate"),
+        "expected raw file content without line numbers"
     );
     assert_eq!(response["result"]["start_line"], 1);
     assert_eq!(response["result"]["end_line"], 1);

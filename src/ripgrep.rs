@@ -1,11 +1,47 @@
-use crate::{RpcResponse, err_text};
+use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::time;
+use tokio::time::{self, Instant};
+
+/// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
+/// Returns (path, line_number, text, is_match)
+fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
+    // Try match format first: "path:123:text"
+    // Need to handle paths with colons (e.g., C:\foo on Windows)
+
+    // Find the pattern ":digits:" which separates path from line number from text
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b':' || bytes[i] == b'-' {
+            let sep = bytes[i];
+            let is_match = sep == b':';
+
+            // Check if followed by digits then another separator
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            // Must have at least one digit and be followed by the same separator
+            if j > i + 1 && j < bytes.len() && bytes[j] == sep {
+                let path = &line[..i];
+                let line_no: u64 = line[i + 1..j].parse().unwrap_or(0);
+                let text = &line[j + 1..];
+                return (path.to_string(), line_no, text.to_string(), is_match);
+            }
+        }
+        i += 1;
+    }
+
+    // Couldn't parse, return empty
+    (String::new(), 0, String::new(), true)
+}
 
 /// Run ripgrep (`rg`) and return both a readable summary and structured matches.
 ///
@@ -51,52 +87,59 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         /// Kill the search if it runs longer than this (ms). Defaults to 20_000.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// Fuzzy match tolerance (1-4 edits). Uses ugrep backend.
+        #[serde(default)]
+        fuzzy: Option<u8>,
     }
 
-    let req = match serde_json::from_value::<RgRequest>(args) {
+    let req = match RpcResponse::parse::<RgRequest>(id.clone(), args) {
         Ok(req) => req,
-        Err(err) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {err}"))),
-                error: None,
-            };
-        }
+        Err(resp) => return resp,
     };
 
     if req.pattern.trim().is_empty() {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("pattern is required")),
-            error: None,
-        };
+        return RpcResponse::err(id, "pattern is required");
     }
 
     let root = req.path.as_deref().unwrap_or(".");
     if root.trim().is_empty() {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("path must be non-empty")),
-            error: None,
-        };
+        return RpcResponse::err(id, "path must be non-empty");
     }
 
     let max_results = req.max_results.unwrap_or(200).clamp(1, 10_000);
     let timeout_ms = req.timeout_ms.unwrap_or(20_000).clamp(100, 300_000);
+    let fuzzy_distance = req.fuzzy.map(|f| f.clamp(1, 4));
+    let use_ugrep = fuzzy_distance.is_some();
 
-    let rg_bin = if cfg!(target_os = "windows") {
-        "rg.exe"
+    let bin = if use_ugrep {
+        if cfg!(target_os = "windows") {
+            "ugrep.exe"
+        } else {
+            "ugrep"
+        }
     } else {
-        "rg"
+        if cfg!(target_os = "windows") {
+            "rg.exe"
+        } else {
+            "rg"
+        }
     };
 
     let run = async {
-        // Build `rg` command.
-        let mut cmd = Command::new(rg_bin);
-        cmd.arg("--json").arg("--line-number").arg("--no-messages");
+        let mut cmd = Command::new(bin);
+
+        if use_ugrep {
+            // ugrep: use text output with -n -H for simpler parsing
+            cmd.arg("-r").arg("-n").arg("-H");
+
+            // Fuzzy flag
+            if let Some(dist) = fuzzy_distance {
+                cmd.arg(format!("-Z{}", dist));
+            }
+        } else {
+            // ripgrep: use JSON output
+            cmd.arg("--json").arg("--line-number").arg("--no-messages");
+        }
 
         if req.fixed_strings.unwrap_or(false) {
             cmd.arg("-F");
@@ -105,7 +148,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
             cmd.arg("-w");
         }
 
-        // Case mode
+        // Case mode (flag differs: rg uses -S, ugrep uses -j for smart-case)
         match req
             .case
             .as_deref()
@@ -119,9 +162,8 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
             "insensitive" | "ignore" | "ignore-case" | "ignore_case" => {
                 cmd.arg("-i");
             }
-            // ripgrep's smart-case mode
             _ => {
-                cmd.arg("-S");
+                cmd.arg(if use_ugrep { "-j" } else { "-S" });
             }
         }
 
@@ -129,10 +171,20 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
             cmd.arg("--hidden");
         }
         if req.follow.unwrap_or(false) {
-            cmd.arg("--follow");
+            if use_ugrep {
+                // ugrep: -R does recursive + follow (we already have -r, so add -S for symlinks)
+                // Actually, ugrep's --dereference or just rely on -R instead of -r
+                cmd.arg("--dereference");
+            } else {
+                cmd.arg("--follow");
+            }
         }
         if req.no_ignore.unwrap_or(false) {
-            cmd.arg("--no-ignore");
+            cmd.arg(if use_ugrep {
+                "--no-ignore-files"
+            } else {
+                "--no-ignore"
+            });
         }
         if let Some(c) = req.context {
             if c > 0 {
@@ -142,18 +194,22 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         if let Some(globs) = &req.glob {
             for g in globs {
                 if !g.trim().is_empty() {
-                    cmd.arg("--glob").arg(g);
+                    cmd.arg(if use_ugrep { "-g" } else { "--glob" }).arg(g);
                 }
             }
         }
 
-        // Pattern and root path. (No shell - arguments passed verbatim.)
+        // Pattern and root path
         cmd.arg(&req.pattern).arg(root);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("failed to spawn {rg_bin}. Is ripgrep installed and on PATH error: {e}")
+            if use_ugrep {
+                anyhow::anyhow!("failed to spawn ugrep (required for fuzzy search). Install: winget install ugrep / brew install ugrep / apt install ugrep. Error: {e}")
+            } else {
+                anyhow::anyhow!("failed to spawn rg. Is ripgrep installed and on PATH? Error: {e}")
+            }
         })?;
 
         let stdout = child
@@ -176,66 +232,113 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         let mut matches: Vec<Value> = Vec::new();
         let mut rendered_lines: Vec<String> = Vec::new();
         let mut truncated = false;
+        let mut timed_out = false;
 
         let mut reader = BufReader::new(stdout).lines();
-        while let Some(line) = reader.next_line().await? {
-            // Each line is a JSON object.
-            let v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            tokio::select! {
+                maybe_line = reader.next_line() => {
+                    let Some(line) = maybe_line? else { break; };
 
-            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if ty != "match" && ty != "context" {
-                continue;
-            }
+                    if use_ugrep {
+                        // ugrep text output: "path:line:text" or "path-line-text" for context.
+                        let (path, line_no, text, is_match) = parse_grep_line(&line);
+                        if path.is_empty() {
+                            continue;
+                        }
 
-            // Extract essentials for a helpful text view.
-            if let Some(data) = v.get("data") {
-                let path = data
-                    .get("path")
-                    .and_then(|p| p.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                let line_no = data
-                    .get("line_number")
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0);
-                let text = data
-                    .get("lines")
-                    .and_then(|l| l.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                        let sep = if is_match { ":" } else { "-" };
+                        rendered_lines.push(format!("{path}{sep}{line_no}{sep}{text}"));
 
-                // Match lines typically end with a newline; trim for one-line rendering.
-                let one_line = text.trim_end_matches(&['\r', '\n'][..]);
+                        // Build a match object compatible with rg JSON structure.
+                        let match_obj = json!({
+                            "type": if is_match { "match" } else { "context" },
+                            "data": {
+                                "path": {"text": path},
+                                "line_number": line_no,
+                                "lines": {"text": text}
+                            }
+                        });
+                        matches.push(match_obj);
+                    } else {
+                        // ripgrep JSON output.
+                        let v: Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
 
-                // Mirror rg's convention: ':' for matches, '-' for context.
-                let sep = if ty == "match" { ":" } else { "-" };
-                rendered_lines.push(format!("{path}{sep}{line_no}{sep}{one_line}"));
-            }
+                        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if ty != "match" && ty != "context" {
+                            continue;
+                        }
 
-            matches.push(v);
+                        if let Some(data) = v.get("data") {
+                            let path = data
+                                .get("path")
+                                .and_then(|p| p.get("text"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            let line_no = data
+                                .get("line_number")
+                                .and_then(|n| n.as_u64())
+                                .unwrap_or(0);
+                            let text = data
+                                .get("lines")
+                                .and_then(|l| l.get("text"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
 
-            if matches.len() >= max_results {
-                truncated = true;
-                let _ = child.kill().await;
-                break;
+                            let one_line = text.trim_end_matches(&['\r', '\n'][..]);
+                            let sep = if ty == "match" { ":" } else { "-" };
+                            rendered_lines.push(format!("{path}{sep}{line_no}{sep}{one_line}"));
+                        }
+
+                        matches.push(v);
+                    }
+
+                    if matches.len() >= max_results {
+                        truncated = true;
+                        let _ = child.kill().await;
+                        break;
+                    }
+                }
+                _ = time::sleep_until(deadline) => {
+                    timed_out = true;
+                    let _ = child.kill().await;
+                    break;
+                }
             }
         }
 
         // Wait for process to exit (even if killed).
-        let status = child.wait().await?;
-        let exit_code = status.code();
+        let status = match time::timeout(Duration::from_millis(2_000), child.wait()).await {
+            Ok(res) => Some(res?),
+            Err(_) => {
+                timed_out = true;
+                let _ = child.kill().await;
+                None
+            }
+        };
+        let exit_code = status.as_ref().and_then(|s| s.code());
 
-        let stderr_text = stderr_task
-            .await
-            .unwrap_or_else(|_| String::new())
-            .trim()
-            .to_string();
+        let mut stderr_task = stderr_task;
+        let stderr_text = match time::timeout(Duration::from_millis(2_000), &mut stderr_task).await
+        {
+            Ok(joined) => joined.unwrap_or_else(|_| String::new()),
+            Err(_) => {
+                stderr_task.abort();
+                String::new()
+            }
+        }
+        .trim()
+        .to_string();
 
         // ripgrep: 0 = matches, 1 = no matches, 2 = error
-        let success = status.success() || exit_code == Some(1) || truncated;
+        let success = status
+            .as_ref()
+            .is_some_and(|s| s.success() || exit_code == Some(1) || truncated)
+            && !timed_out;
 
         Ok::<_, anyhow::Error>((
             matches,
@@ -244,11 +347,12 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
             exit_code,
             stderr_text,
             success,
+            timed_out,
         ))
     };
 
-    let result = match time::timeout(Duration::from_millis(timeout_ms), run).await {
-        Ok(Ok((matches, rendered_lines, truncated, exit_code, stderr_text, success))) => {
+    match run.await {
+        Ok((matches, rendered_lines, truncated, exit_code, stderr_text, success, timed_out)) => {
             let text_view = if rendered_lines.is_empty() {
                 String::new()
             } else {
@@ -262,6 +366,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
                 "path": root,
                 "exit_code": exit_code,
                 "truncated": truncated,
+                "timed_out": timed_out,
                 "count": matches.len(),
                 "matches": matches,
             });
@@ -272,16 +377,8 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
                 }
             }
 
-            payload
+            RpcResponse::ok(id, payload)
         }
-        Ok(Err(e)) => err_text(&format!("ripgrep error: {e:#}")),
-        Err(_) => err_text(&format!("ripgrep timed out after {} ms", timeout_ms)),
-    };
-
-    RpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(result),
-        error: None,
+        Err(e) => RpcResponse::err(id, format!("ripgrep error: {e:#}")),
     }
 }

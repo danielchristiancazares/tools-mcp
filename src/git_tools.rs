@@ -1,18 +1,15 @@
-use crate::{RpcResponse, err_text};
+use crate::config::{
+    DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS,
+    MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
+};
+use crate::process_utils::read_to_end_limited;
+use crate::RpcResponse;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time;
-
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const MAX_TIMEOUT_MS: u64 = 300_000;
-
-const DEFAULT_MAX_STDOUT_BYTES: usize = 200_000;
-const DEFAULT_MAX_STDERR_BYTES: usize = 100_000;
-const MAX_MAX_OUTPUT_BYTES: usize = 5_000_000;
 
 struct GitExecResult {
     git_bin: String,
@@ -27,35 +24,6 @@ struct GitExecResult {
     timed_out: bool,
 }
 
-async fn read_to_end_limited<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut out: Vec<u8> = Vec::new();
-    let mut truncated = false;
-
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-
-        if out.len() < limit {
-            let remaining = limit - out.len();
-            let take = remaining.min(n);
-            out.extend_from_slice(&buf[..take]);
-            if take < n {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
-    }
-
-    Ok((out, truncated))
-}
-
 async fn run_git(
     working_dir: Option<String>,
     subcommand_args: Vec<String>,
@@ -63,9 +31,9 @@ async fn run_git(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<GitExecResult, anyhow::Error> {
-    let timeout_ms = timeout_ms.clamp(100, MAX_TIMEOUT_MS);
-    let max_stdout_bytes = max_stdout_bytes.clamp(1, MAX_MAX_OUTPUT_BYTES);
-    let max_stderr_bytes = max_stderr_bytes.clamp(1, MAX_MAX_OUTPUT_BYTES);
+    let timeout_ms = timeout_ms.clamp(100, MAX_GIT_TIMEOUT_MS);
+    let max_stdout_bytes = max_stdout_bytes.clamp(1, MAX_OUTPUT_BYTES);
+    let max_stderr_bytes = max_stderr_bytes.clamp(1, MAX_OUTPUT_BYTES);
 
     let git_bin = if cfg!(target_os = "windows") {
         "git.exe".to_string()
@@ -109,7 +77,15 @@ async fn run_git(
         Err(_) => {
             timed_out = true;
             let _ = child.kill().await;
-            child.wait().await?
+            match time::timeout(Duration::from_millis(2_000), child.wait()).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "git command timed out after {} ms and did not terminate",
+                        timeout_ms
+                    ));
+                }
+            }
         }
     };
 
@@ -154,19 +130,12 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
         untracked: Option<bool>,
     }
 
-    let req = match serde_json::from_value::<GitStatusRequest>(args) {
+    let req = match RpcResponse::parse::<GitStatusRequest>(id.clone(), args) {
         Ok(req) => req,
-        Err(err) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {err}"))),
-                error: None,
-            };
-        }
+        Err(resp) => return resp,
     };
 
-    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
 
     let porcelain = req.porcelain.unwrap_or(true);
     let branch = req.branch.unwrap_or(true);
@@ -187,20 +156,13 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
         req.working_dir.clone(),
         cmd_args,
         timeout_ms,
-        DEFAULT_MAX_STDOUT_BYTES,
-        DEFAULT_MAX_STDERR_BYTES,
+        DEFAULT_GIT_STDOUT_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
     )
     .await
     {
         Ok(r) => r,
-        Err(e) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("git error: {e:#}"))),
-                error: None,
-            };
-        }
+        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
     };
 
     let clean = exec.success && exec.stdout.trim().is_empty();
@@ -231,12 +193,7 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
         "stderr": exec.stderr,
     });
 
-    RpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(payload),
-        error: None,
-    }
+    RpcResponse::ok(id, payload)
 }
 
 pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'static> {
@@ -260,23 +217,16 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
         max_bytes: Option<usize>,
     }
 
-    let req = match serde_json::from_value::<GitDiffRequest>(args) {
+    let req = match RpcResponse::parse::<GitDiffRequest>(id.clone(), args) {
         Ok(req) => req,
-        Err(err) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {err}"))),
-                error: None,
-            };
-        }
+        Err(resp) => return resp,
     };
 
-    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
     let max_bytes = req
         .max_bytes
-        .unwrap_or(DEFAULT_MAX_STDOUT_BYTES)
-        .clamp(1, MAX_MAX_OUTPUT_BYTES);
+        .unwrap_or(DEFAULT_GIT_STDOUT_BYTES)
+        .clamp(1, MAX_OUTPUT_BYTES);
 
     let mut cmd_args: Vec<String> = vec!["diff".into()];
 
@@ -311,19 +261,12 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
         cmd_args,
         timeout_ms,
         max_bytes,
-        DEFAULT_MAX_STDERR_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
     )
     .await
     {
         Ok(r) => r,
-        Err(e) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("git error: {e:#}"))),
-                error: None,
-            };
-        }
+        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -353,12 +296,7 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
         "stderr": exec.stderr,
     });
 
-    RpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(payload),
-        error: None,
-    }
+    RpcResponse::ok(id, payload)
 }
 
 pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'static> {
@@ -375,40 +313,23 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
         worktree: Option<bool>,
     }
 
-    let req = match serde_json::from_value::<GitRestoreRequest>(args) {
+    let req = match RpcResponse::parse::<GitRestoreRequest>(id.clone(), args) {
         Ok(req) => req,
-        Err(err) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {err}"))),
-                error: None,
-            };
-        }
+        Err(resp) => return resp,
     };
 
     if req.paths.is_empty() {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("paths must be non-empty")),
-            error: None,
-        };
+        return RpcResponse::err(id, "paths must be non-empty");
     }
 
     let staged = req.staged.unwrap_or(false);
     let worktree = req.worktree.unwrap_or(true);
 
     if !staged && !worktree {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("at least one of staged/worktree must be true")),
-            error: None,
-        };
+        return RpcResponse::err(id, "at least one of staged/worktree must be true");
     }
 
-    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
 
     let mut cmd_args: Vec<String> = vec!["restore".into()];
     if staged {
@@ -429,20 +350,13 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
         req.working_dir.clone(),
         cmd_args,
         timeout_ms,
-        DEFAULT_MAX_STDOUT_BYTES,
-        DEFAULT_MAX_STDERR_BYTES,
+        DEFAULT_GIT_STDOUT_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
     )
     .await
     {
         Ok(r) => r,
-        Err(e) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("git error: {e:#}"))),
-                error: None,
-            };
-        }
+        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -473,10 +387,177 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
         "stderr": exec.stderr,
     });
 
-    RpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(payload),
-        error: None,
+    RpcResponse::ok(id, payload)
+}
+
+pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+    #[derive(Deserialize)]
+    struct GitAddRequest {
+        #[serde(default)]
+        paths: Option<Vec<String>>,
+        #[serde(default)]
+        working_dir: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        all: Option<bool>,
+        #[serde(default)]
+        update: Option<bool>,
     }
+
+    let req = match RpcResponse::parse::<GitAddRequest>(id.clone(), args) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    let use_all = req.all.unwrap_or(false);
+    let use_update = req.update.unwrap_or(false);
+    let paths = req.paths.unwrap_or_default();
+
+    if !use_all && !use_update && paths.is_empty() {
+        return RpcResponse::err(id, "paths required unless 'all' or 'update' is true");
+    }
+
+    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
+
+    let mut cmd_args: Vec<String> = vec!["add".into()];
+
+    if use_all {
+        cmd_args.push("-A".into());
+    } else if use_update {
+        cmd_args.push("-u".into());
+    }
+
+    if !paths.is_empty() {
+        cmd_args.push("--".into());
+        for p in &paths {
+            if !p.trim().is_empty() {
+                cmd_args.push(p.clone());
+            }
+        }
+    }
+
+    let exec = match run_git(
+        req.working_dir.clone(),
+        cmd_args,
+        timeout_ms,
+        DEFAULT_GIT_STDOUT_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+    };
+
+    let text = if exec.success {
+        "ok".to_string()
+    } else if !exec.stderr.trim().is_empty() {
+        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
+    } else {
+        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
+    };
+
+    let payload = json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": !exec.success,
+        "git_bin": exec.git_bin,
+        "args": exec.args,
+        "working_dir": exec.working_dir,
+        "exit_code": exec.exit_code,
+        "timed_out": exec.timed_out,
+        "stdout": exec.stdout,
+        "stderr": exec.stderr,
+    });
+
+    RpcResponse::ok(id, payload)
+}
+
+pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+    #[derive(Deserialize)]
+    struct GitCommitRequest {
+        #[serde(rename = "type")]
+        commit_type: String,
+        #[serde(default)]
+        scope: Option<String>,
+        message: String,
+        #[serde(default)]
+        working_dir: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    }
+
+    let req = match RpcResponse::parse::<GitCommitRequest>(id.clone(), args) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    if req.commit_type.trim().is_empty() {
+        return RpcResponse::err(id, "type is required");
+    }
+
+    if req.message.trim().is_empty() {
+        return RpcResponse::err(id, "message is required");
+    }
+
+    // Build conventional commit message: type(scope): message
+    let commit_msg = match &req.scope {
+        Some(scope) if !scope.trim().is_empty() => {
+            format!(
+                "{}({}): {}",
+                req.commit_type.trim(),
+                scope.trim(),
+                req.message.trim()
+            )
+        }
+        _ => format!("{}: {}", req.commit_type.trim(), req.message.trim()),
+    };
+
+    let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
+
+    let cmd_args: Vec<String> = vec!["commit".into(), "-m".into(), commit_msg.clone()];
+
+    let exec = match run_git(
+        req.working_dir.clone(),
+        cmd_args,
+        timeout_ms,
+        DEFAULT_GIT_STDOUT_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+    };
+
+    // Try to extract commit hash from stdout (e.g., "[main abc1234] message")
+    let commit_hash = exec
+        .stdout
+        .split_whitespace()
+        .find(|s| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit() || c == ']'))
+        .map(|s| s.trim_end_matches(']').to_string());
+
+    let text = if exec.success {
+        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
+    } else if !exec.stderr.trim().is_empty() {
+        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
+    } else {
+        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
+    };
+
+    let payload = json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": !exec.success,
+        "git_bin": exec.git_bin,
+        "args": exec.args,
+        "working_dir": exec.working_dir,
+        "exit_code": exec.exit_code,
+        "timed_out": exec.timed_out,
+        "commit_message": commit_msg,
+        "commit_hash": commit_hash,
+        "stdout": exec.stdout,
+        "stderr": exec.stderr,
+    });
+
+    RpcResponse::ok(id, payload)
 }

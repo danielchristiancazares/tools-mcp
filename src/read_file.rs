@@ -1,4 +1,4 @@
-use crate::{RpcResponse, err_text};
+use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -6,8 +6,8 @@ use std::path::Path;
 
 /// Return file text (optionally a line range) for quick browsing without uploads.
 ///
-/// Output is line-numbered (similar to `nl -ba` / `cat -n`) so callers can easily
-/// reference exact lines.
+/// When `show_line_numbers` is true, output is line-numbered (similar to `nl -ba` / `cat -n`)
+/// so callers can easily reference exact lines. By default, raw content is returned.
 pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
     struct ReadRequest {
@@ -16,42 +16,24 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
         start_line: Option<usize>,
         #[serde(default)]
         end_line: Option<usize>,
+        #[serde(default)]
+        show_line_numbers: Option<bool>,
     }
 
-    let req = match serde_json::from_value::<ReadRequest>(args) {
+    let req = match RpcResponse::parse::<ReadRequest>(id.clone(), args) {
         Ok(req) => req,
-        Err(err) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!("invalid arguments: {err}"))),
-                error: None,
-            };
-        }
+        Err(resp) => return resp,
     };
 
     if req.path.trim().is_empty() {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("path is required")),
-            error: None,
-        };
+        return RpcResponse::err(id, "path is required");
     }
 
     let path = Path::new(&req.path);
     let data = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(err_text(&format!(
-                    "failed to read {}: {err}",
-                    path.display()
-                ))),
-                error: None,
-            };
+            return RpcResponse::err(id, format!("failed to read {}: {err}", path.display()));
         }
     };
 
@@ -67,12 +49,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
             "end_line": 0,
             "total_lines": 0
         });
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(payload),
-            error: None,
-        };
+        return RpcResponse::ok(id, payload);
     }
 
     let line_count = text.split_inclusive('\n').count();
@@ -81,45 +58,27 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
     let end = req.end_line.unwrap_or(line_count);
 
     if start == 0 {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("start_line must be >= 1")),
-            error: None,
-        };
+        return RpcResponse::err(id, "start_line must be >= 1");
     }
 
     if end == 0 {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("end_line must be >= 1")),
-            error: None,
-        };
+        return RpcResponse::err(id, "end_line must be >= 1");
     }
 
     if start > end {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(err_text("start_line cannot be greater than end_line")),
-            error: None,
-        };
+        return RpcResponse::err(id, "start_line cannot be greater than end_line");
     }
 
     if start > line_count {
-        return RpcResponse {
-            jsonrpc: "2.0",
+        return RpcResponse::err(
             id,
-            result: Some(err_text(&format!(
-                "start_line {start} exceeds file line count {line_count}"
-            ))),
-            error: None,
-        };
+            format!("start_line {start} exceeds file line count {line_count}"),
+        );
     }
 
     let resolved_end = end.min(line_count);
     let width = resolved_end.max(1).to_string().len();
+    let show_line_numbers = req.show_line_numbers.unwrap_or(false);
 
     let mut body = String::new();
     for (idx, line) in text.split_inclusive('\n').enumerate() {
@@ -132,7 +91,11 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
         }
 
         // Keep the file's original line endings (split_inclusive keeps the trailing '\n').
-        let _ = write!(body, "{:>width$}\t{}", line_no, line, width = width);
+        if show_line_numbers {
+            let _ = write!(body, "{:>width$}\t{}", line_no, line, width = width);
+        } else {
+            body.push_str(line);
+        }
     }
 
     let payload = json!({
@@ -144,10 +107,5 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
         "total_lines": line_count
     });
 
-    RpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(payload),
-        error: None,
-    }
+    RpcResponse::ok(id, payload)
 }
