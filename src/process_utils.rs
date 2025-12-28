@@ -769,3 +769,56 @@ pub async fn capture_process_output(
         truncated_stderr,
     })
 }
+
+/// Build a standard MCP-compatible process result response payload.
+///
+/// This consolidates the repeated pattern of building JSON responses from
+/// ProcessResult structs across tools/pwsh.rs and script_runner.rs. It handles
+/// the common fields (exit_code, success, timed_out, truncated flags, stdout, stderr)
+/// and allows optional extra fields to be added per-tool.
+///
+/// # Arguments
+///
+/// * `result` - The ProcessResult from process execution
+/// * `extra_fields` - Optional HashMap of additional fields to include
+///
+/// # Returns
+///
+/// A serde_json::Value containing the complete response payload
+///
+/// # Example
+///
+/// ```ignore
+/// use serde_json::json;
+/// use std::collections::HashMap;
+///
+/// let result = run_pwsh_command(...).await?;
+/// let mut extra = HashMap::new();
+/// extra.insert("command", json!("Get-Process"));
+/// let payload = build_process_result_response(&result, Some(extra));
+/// ```
+pub fn build_process_result_response(
+    result: &ProcessResult,
+    extra_fields: Option<std::collections::HashMap<&str, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "exit_code": result.exit_code,
+        "success": result.success,
+        "timed_out": result.timed_out,
+        "truncated_stdout": result.truncated_stdout,
+        "truncated_stderr": result.truncated_stderr,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    });
+
+    // Add any extra fields provided by the caller
+    if let Some(extra) = extra_fields {
+        if let Some(obj) = payload.as_object_mut() {
+            for (key, value) in extra {
+                obj.insert(key.to_string(), value);
+            }
+        }
+    }
+
+    payload
+}
