@@ -96,6 +96,8 @@ use reqwest::Client;
 use serde_json::Value;
 use std::path::Path;
 
+use crate::validation;
+
 pub mod cache;
 
 pub use cache::{cache_store_id, load_store_id_from_cache};
@@ -174,8 +176,8 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .map(|s| s.to_string());
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
-    if query.trim().is_empty() {
-        return crate::RpcResponse::err(id, "query is required for CodeQuery");
+    if let Err(resp) = validation::validate_non_empty(query, "query", id.clone()) {
+        return resp;
     }
 
     if vector_store_id_arg.is_none() && vector_store_name.is_none() {

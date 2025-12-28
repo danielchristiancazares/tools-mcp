@@ -1,5 +1,6 @@
 use crate::config::{DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT};
 use crate::tool_registry::McpTool;
+use crate::validation;
 use crate::RpcResponse;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
@@ -28,8 +29,8 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         Err(resp) => return resp,
     };
 
-    if req.pattern.trim().is_empty() {
-        return RpcResponse::err(id, "pattern is required");
+    if let Err(resp) = validation::validate_non_empty(&req.pattern, "pattern", id.clone()) {
+        return resp;
     }
 
     let base_path = req.path.as_deref().unwrap_or(".");

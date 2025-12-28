@@ -155,6 +155,7 @@ mod script_runner;
 mod smart_file_edit;
 mod tool_registry;
 mod tools;
+mod validation;
 mod webfetch;
 
 use crate::tool_registry::{ToolDef, ToolRegistry};

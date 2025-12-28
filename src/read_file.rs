@@ -1,4 +1,5 @@
 use crate::RpcResponse;
+use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -25,8 +26,8 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
         Err(resp) => return resp,
     };
 
-    if req.path.trim().is_empty() {
-        return RpcResponse::err(id, "path is required");
+    if let Err(resp) = validation::validate_non_empty(&req.path, "path", id.clone()) {
+        return resp;
     }
 
     let path = Path::new(&req.path);

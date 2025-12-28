@@ -1,4 +1,5 @@
 use crate::RpcResponse;
+use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::process::Stdio;
@@ -97,13 +98,13 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         Err(resp) => return resp,
     };
 
-    if req.pattern.trim().is_empty() {
-        return RpcResponse::err(id, "pattern is required");
+    if let Err(resp) = validation::validate_non_empty(&req.pattern, "pattern", id.clone()) {
+        return resp;
     }
 
     let root = req.path.as_deref().unwrap_or(".");
-    if root.trim().is_empty() {
-        return RpcResponse::err(id, "path must be non-empty");
+    if let Err(resp) = validation::validate_non_empty(root, "path", id.clone()) {
+        return resp;
     }
 
     let max_results = req.max_results.unwrap_or(200).clamp(1, 10_000);

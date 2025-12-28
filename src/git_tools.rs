@@ -61,6 +61,7 @@ use crate::config::{
     MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 };
 use crate::process_utils::read_to_end_limited;
+use crate::validation;
 use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -973,12 +974,11 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
         Err(resp) => return resp,
     };
 
-    if req.commit_type.trim().is_empty() {
-        return RpcResponse::err(id, "type is required");
+    if let Err(resp) = validation::validate_non_empty(&req.commit_type, "type", id.clone()) {
+        return resp;
     }
-
-    if req.message.trim().is_empty() {
-        return RpcResponse::err(id, "message is required");
+    if let Err(resp) = validation::validate_non_empty(&req.message, "message", id.clone()) {
+        return resp;
     }
 
     // Build conventional commit message: type(scope): message
