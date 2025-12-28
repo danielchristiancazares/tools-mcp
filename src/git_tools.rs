@@ -60,43 +60,17 @@ use crate::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS,
     MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 };
+use crate::git_utils::{GitExecResult, build_git_response, extract_git_output_text};
 use crate::process_utils::read_to_end_limited;
 use crate::validation;
 use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time;
-
-/// Result of executing a Git command via [`run_git`].
-///
-/// Captures all information needed to construct an MCP response, including
-/// the exact command executed, output streams, and execution metadata.
-///
-/// # Fields
-///
-/// - `git_bin`: The Git executable name (`git` on Unix, `git.exe` on Windows)
-/// - `args`: Complete argument vector including `--no-pager` and color config
-/// - `working_dir`: The working directory if one was specified
-/// - `exit_code`: Process exit code, or `None` if terminated by signal
-/// - `success`: `true` if exit code is 0 and no timeout occurred
-/// - `stdout`/`stderr`: Captured output as UTF-8 strings (lossy conversion)
-/// - `truncated_stdout`/`truncated_stderr`: Whether output exceeded byte limits
-/// - `timed_out`: Whether the command was killed due to timeout
-struct GitExecResult {
-    git_bin: String,
-    args: Vec<String>,
-    working_dir: Option<String>,
-    exit_code: Option<i32>,
-    success: bool,
-    stdout: String,
-    stderr: String,
-    truncated_stdout: bool,
-    truncated_stderr: bool,
-    timed_out: bool,
-}
 
 /// Execute a Git command with timeout and output capture.
 ///
@@ -388,20 +362,10 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": !exec.success,
-        "git_bin": exec.git_bin,
-        "args": exec.args,
-        "working_dir": exec.working_dir,
-        "exit_code": exec.exit_code,
-        "timed_out": exec.timed_out,
-        "truncated_stdout": exec.truncated_stdout,
-        "truncated_stderr": exec.truncated_stderr,
-        "clean": clean,
-        "stdout": exec.stdout,
-        "stderr": exec.stderr,
-    });
+    let mut extra_fields = HashMap::new();
+    extra_fields.insert("clean", json!(clean));
+
+    let payload = build_git_response(&exec, text, Some(extra_fields));
 
     RpcResponse::ok(id, payload)
 }
@@ -551,20 +515,10 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": !exec.success,
-        "git_bin": exec.git_bin,
-        "args": exec.args,
-        "working_dir": exec.working_dir,
-        "exit_code": exec.exit_code,
-        "timed_out": exec.timed_out,
-        "max_bytes": max_bytes,
-        "truncated_stdout": exec.truncated_stdout,
-        "truncated_stderr": exec.truncated_stderr,
-        "stdout": exec.stdout,
-        "stderr": exec.stderr,
-    });
+    let mut extra_fields = HashMap::new();
+    extra_fields.insert("max_bytes", json!(max_bytes));
+
+    let payload = build_git_response(&exec, text, Some(extra_fields));
 
     RpcResponse::ok(id, payload)
 }
@@ -706,19 +660,7 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": !exec.success,
-        "git_bin": exec.git_bin,
-        "args": exec.args,
-        "working_dir": exec.working_dir,
-        "exit_code": exec.exit_code,
-        "timed_out": exec.timed_out,
-        "truncated_stdout": exec.truncated_stdout,
-        "truncated_stderr": exec.truncated_stderr,
-        "stdout": exec.stdout,
-        "stderr": exec.stderr,
-    });
+    let payload = build_git_response(&exec, text, None);
 
     RpcResponse::ok(id, payload)
 }
@@ -855,17 +797,7 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": !exec.success,
-        "git_bin": exec.git_bin,
-        "args": exec.args,
-        "working_dir": exec.working_dir,
-        "exit_code": exec.exit_code,
-        "timed_out": exec.timed_out,
-        "stdout": exec.stdout,
-        "stderr": exec.stderr,
-    });
+    let payload = build_git_response(&exec, text, None);
 
     RpcResponse::ok(id, payload)
 }
@@ -1026,19 +958,11 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": !exec.success,
-        "git_bin": exec.git_bin,
-        "args": exec.args,
-        "working_dir": exec.working_dir,
-        "exit_code": exec.exit_code,
-        "timed_out": exec.timed_out,
-        "commit_message": commit_msg,
-        "commit_hash": commit_hash,
-        "stdout": exec.stdout,
-        "stderr": exec.stderr,
-    });
+    let mut extra_fields = HashMap::new();
+    extra_fields.insert("commit_message", json!(commit_msg));
+    extra_fields.insert("commit_hash", json!(commit_hash));
+
+    let payload = build_git_response(&exec, text, Some(extra_fields));
 
     RpcResponse::ok(id, payload)
 }

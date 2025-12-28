@@ -148,6 +148,7 @@ fn should_skip_headers() -> bool {
 mod codequery;
 mod config;
 mod git_tools;
+mod git_utils;
 mod process_utils;
 mod read_file;
 mod ripgrep;
