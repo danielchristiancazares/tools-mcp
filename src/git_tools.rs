@@ -1,3 +1,61 @@
+//! Git operation wrappers for MCP tool execution.
+//!
+//! This module provides safe, structured wrappers around common Git commands, designed
+//! for use as MCP (Model Context Protocol) tools. Each wrapper executes Git in a
+//! subprocess with configurable timeouts and output limits, returning machine-parseable
+//! JSON responses.
+//!
+//! # Architecture
+//!
+//! All Git operations flow through [`run_git`], which:
+//! 1. Spawns `git` (or `git.exe` on Windows) as a child process
+//! 2. Configures deterministic output (`--no-pager`, `color.ui=false`)
+//! 3. Captures stdout/stderr with configurable byte limits
+//! 4. Enforces timeout with graceful kill on expiration
+//! 5. Returns structured results via [`GitExecResult`]
+//!
+//! # Tools Provided
+//!
+//! | Tool | Function | Description |
+//! |------|----------|-------------|
+//! | `GitStatus` | [`handle_git_status`] | Working tree status with porcelain output |
+//! | `GitDiff` | [`handle_git_diff`] | Show changes in working tree or staging area |
+//! | `GitRestore` | [`handle_git_restore`] | Discard uncommitted changes (destructive) |
+//! | `GitAdd` | [`handle_git_add`] | Stage files for commit |
+//! | `GitCommit` | [`handle_git_commit`] | Create conventional commits |
+//!
+//! # Response Format
+//!
+//! All handlers return MCP-compliant responses with:
+//! - `content`: Array containing `{"type": "text", "text": "..."}` with human-readable output
+//! - `isError`: Boolean indicating command failure
+//! - `git_bin`: The Git executable used (`git` or `git.exe`)
+//! - `args`: Full argument list passed to Git
+//! - `working_dir`: Working directory if specified
+//! - `exit_code`: Process exit code (null if terminated by signal)
+//! - `timed_out`: Whether the command exceeded its timeout
+//! - `stdout`/`stderr`: Raw captured output
+//! - `truncated_stdout`/`truncated_stderr`: Whether output was truncated
+//!
+//! # Error Handling
+//!
+//! Errors are categorized as:
+//! - **Spawn failures**: Git not installed or not on PATH
+//! - **Timeout**: Command exceeded `timeout_ms`, process killed
+//! - **Git errors**: Non-zero exit code with error in stderr
+//! - **Validation errors**: Invalid parameters (empty paths, conflicting flags)
+//!
+//! All errors return valid MCP responses with `isError: true` rather than panicking.
+//!
+//! # Configuration
+//!
+//! Default limits from [`crate::config`]:
+//! - `DEFAULT_GIT_TIMEOUT_MS`: 30,000ms (30 seconds)
+//! - `MAX_GIT_TIMEOUT_MS`: 300,000ms (5 minutes)
+//! - `DEFAULT_GIT_STDOUT_BYTES`: 200,000 bytes
+//! - `DEFAULT_GIT_STDERR_BYTES`: 100,000 bytes
+//! - `MAX_OUTPUT_BYTES`: 5,000,000 bytes
+
 use crate::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS,
     MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
@@ -11,6 +69,21 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time;
 
+/// Result of executing a Git command via [`run_git`].
+///
+/// Captures all information needed to construct an MCP response, including
+/// the exact command executed, output streams, and execution metadata.
+///
+/// # Fields
+///
+/// - `git_bin`: The Git executable name (`git` on Unix, `git.exe` on Windows)
+/// - `args`: Complete argument vector including `--no-pager` and color config
+/// - `working_dir`: The working directory if one was specified
+/// - `exit_code`: Process exit code, or `None` if terminated by signal
+/// - `success`: `true` if exit code is 0 and no timeout occurred
+/// - `stdout`/`stderr`: Captured output as UTF-8 strings (lossy conversion)
+/// - `truncated_stdout`/`truncated_stderr`: Whether output exceeded byte limits
+/// - `timed_out`: Whether the command was killed due to timeout
 struct GitExecResult {
     git_bin: String,
     args: Vec<String>,
@@ -24,6 +97,68 @@ struct GitExecResult {
     timed_out: bool,
 }
 
+/// Execute a Git command with timeout and output capture.
+///
+/// This is the core execution engine for all Git tools. It spawns Git as a
+/// subprocess with deterministic output settings and captures results within
+/// configured limits.
+///
+/// # Arguments
+///
+/// * `working_dir` - Optional working directory for the Git command. If `None`,
+///   uses the current process working directory.
+/// * `subcommand_args` - Arguments to pass to Git after the standard prefixes.
+///   Example: `["status", "--porcelain=1", "-b"]`
+/// * `timeout_ms` - Maximum execution time in milliseconds. Clamped to
+///   `[100, MAX_GIT_TIMEOUT_MS]`. On timeout, the process is killed.
+/// * `max_stdout_bytes` - Maximum bytes to capture from stdout. Clamped to
+///   `[1, MAX_OUTPUT_BYTES]`. Excess output is discarded.
+/// * `max_stderr_bytes` - Maximum bytes to capture from stderr. Same limits.
+///
+/// # Command Construction
+///
+/// The final command is constructed as:
+/// ```text
+/// git --no-pager -c color.ui=false <subcommand_args...>
+/// ```
+///
+/// The `--no-pager` flag prevents interactive pagers, and `color.ui=false`
+/// ensures no ANSI escape codes in output, making it safe for machine parsing.
+///
+/// # Timeout Behavior
+///
+/// 1. If the command completes within `timeout_ms`, normal exit handling occurs
+/// 2. On timeout, `SIGKILL` (or equivalent) is sent to the process
+/// 3. A 2-second grace period allows the process to terminate
+/// 4. If still running after grace period, returns an error
+///
+/// # Errors
+///
+/// Returns `Err` only for infrastructure failures:
+/// - Git executable not found on PATH
+/// - Failed to capture stdout/stderr handles
+/// - Process did not terminate after kill signal
+///
+/// Git command failures (non-zero exit) are returned as `Ok(GitExecResult)`
+/// with `success: false`.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = run_git(
+///     Some("/path/to/repo".to_string()),
+///     vec!["status".into(), "--porcelain=1".into()],
+///     30_000,  // 30 second timeout
+///     200_000, // 200KB stdout limit
+///     100_000, // 100KB stderr limit
+/// ).await?;
+///
+/// if result.success {
+///     println!("Status: {}", result.stdout);
+/// } else {
+///     eprintln!("Git error: {}", result.stderr);
+/// }
+/// ```
 async fn run_git(
     working_dir: Option<String>,
     subcommand_args: Vec<String>,
@@ -115,6 +250,80 @@ async fn run_git(
     })
 }
 
+/// Handle the `GitStatus` MCP tool request.
+///
+/// Executes `git status` and returns working tree state in a structured format.
+/// By default, uses porcelain output for reliable machine parsing.
+///
+/// # Parameters
+///
+/// | Name | Type | Default | Description |
+/// |------|------|---------|-------------|
+/// | `working_dir` | `string` | CWD | Directory containing the Git repository |
+/// | `timeout_ms` | `integer` | 30000 | Maximum execution time (100-300000ms) |
+/// | `porcelain` | `boolean` | `true` | Use `--porcelain=1` for stable output format |
+/// | `branch` | `boolean` | `true` | Include branch info via `-b` (porcelain only) |
+/// | `untracked` | `boolean` | `true` | Include untracked files; `false` uses `-uno` |
+///
+/// # Porcelain Output Format
+///
+/// When `porcelain: true` (default), output follows Git's porcelain v1 format:
+///
+/// ```text
+/// ## main...origin/main [ahead 2]
+/// M  src/lib.rs
+///  M src/main.rs
+/// ?? new_file.txt
+/// ```
+///
+/// Status codes (first two columns):
+/// - ` ` (space): Unmodified
+/// - `M`: Modified
+/// - `A`: Added
+/// - `D`: Deleted
+/// - `R`: Renamed
+/// - `C`: Copied
+/// - `U`: Updated but unmerged
+/// - `?`: Untracked
+/// - `!`: Ignored
+///
+/// First column = staging area, second column = working tree.
+///
+/// # Response Fields
+///
+/// In addition to standard fields, includes:
+/// - `clean`: `true` if working tree has no changes (stdout empty on success)
+///
+/// # Example
+///
+/// Request:
+/// ```json
+/// {
+///   "working_dir": "/path/to/repo",
+///   "porcelain": true,
+///   "branch": true
+/// }
+/// ```
+///
+/// Response (clean repository):
+/// ```json
+/// {
+///   "content": [{"type": "text", "text": "clean"}],
+///   "isError": false,
+///   "clean": true,
+///   "exit_code": 0
+/// }
+/// ```
+///
+/// Response (with changes):
+/// ```json
+/// {
+///   "content": [{"type": "text", "text": "## main\n M src/lib.rs"}],
+///   "isError": false,
+///   "clean": false,
+///   "exit_code": 0
+/// }
+/// ```
 pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
     struct GitStatusRequest {
@@ -196,6 +405,66 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
     RpcResponse::ok(id, payload)
 }
 
+/// Handle the `GitDiff` MCP tool request.
+///
+/// Executes `git diff` to show changes between commits, the staging area, and
+/// the working tree. Supports various output formats and path filtering.
+///
+/// # Parameters
+///
+/// | Name | Type | Default | Description |
+/// |------|------|---------|-------------|
+/// | `working_dir` | `string` | CWD | Directory containing the Git repository |
+/// | `timeout_ms` | `integer` | 30000 | Maximum execution time (100-300000ms) |
+/// | `cached` | `boolean` | `false` | Show staged changes (`--cached`) |
+/// | `stat` | `boolean` | `false` | Show diffstat summary only (`--stat`) |
+/// | `name_only` | `boolean` | `false` | Show only changed file names (`--name-only`) |
+/// | `unified` | `integer` | Git default (3) | Context lines around changes (`-U<N>`) |
+/// | `paths` | `string[]` | all | Limit diff to specific paths |
+/// | `max_bytes` | `integer` | 200000 | Maximum stdout capture (1-5000000) |
+///
+/// # Diff Modes
+///
+/// - **Working tree vs staging** (default): Shows unstaged changes
+/// - **Staging vs HEAD** (`cached: true`): Shows what will be committed
+///
+/// # Output Formats
+///
+/// - **Unified diff** (default): Full patch with context
+/// - **Stat** (`stat: true`): Summary like `file.rs | 10 ++--`
+/// - **Name only** (`name_only: true`): Just file paths, one per line
+///
+/// # Response Fields
+///
+/// In addition to standard fields, includes:
+/// - `max_bytes`: The effective byte limit used for stdout capture
+///
+/// # Example
+///
+/// Request (staged changes, stat only):
+/// ```json
+/// {
+///   "cached": true,
+///   "stat": true
+/// }
+/// ```
+///
+/// Response:
+/// ```json
+/// {
+///   "content": [{"type": "text", "text": " src/lib.rs | 15 +++++++++------\n 1 file changed, 9 insertions(+), 6 deletions(-)"}],
+///   "isError": false,
+///   "exit_code": 0
+/// }
+/// ```
+///
+/// Request (specific file with more context):
+/// ```json
+/// {
+///   "paths": ["src/main.rs"],
+///   "unified": 10
+/// }
+/// ```
 pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
     struct GitDiffRequest {
@@ -299,6 +568,69 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
     RpcResponse::ok(id, payload)
 }
 
+/// Handle the `GitRestore` MCP tool request.
+///
+/// Executes `git restore` to discard uncommitted changes. This is a **destructive
+/// operation** that cannot be undone for working tree changes.
+///
+/// # Warning
+///
+/// This tool permanently discards changes:
+/// - Working tree changes are lost forever (not recoverable)
+/// - Staged changes can be recovered from the index if only `--staged` is used
+///
+/// # Parameters
+///
+/// | Name | Type | Default | Required | Description |
+/// |------|------|---------|----------|-------------|
+/// | `paths` | `string[]` | - | **Yes** | Files to restore (passed after `--`) |
+/// | `working_dir` | `string` | CWD | No | Directory containing the Git repository |
+/// | `timeout_ms` | `integer` | 30000 | No | Maximum execution time (100-300000ms) |
+/// | `staged` | `boolean` | `false` | No | Restore the staging area (`--staged`) |
+/// | `worktree` | `boolean` | `true` | No | Restore the working tree (`--worktree`) |
+///
+/// # Restore Modes
+///
+/// | `staged` | `worktree` | Effect |
+/// |----------|------------|--------|
+/// | `false` | `true` | Discard working tree changes (revert to staged or HEAD) |
+/// | `true` | `false` | Unstage files (keep working tree changes) |
+/// | `true` | `true` | Discard all changes (revert to HEAD) |
+/// | `false` | `false` | **Error**: At least one must be true |
+///
+/// # Validation
+///
+/// Returns an error if:
+/// - `paths` is empty
+/// - Both `staged` and `worktree` are `false`
+///
+/// # Example
+///
+/// Request (discard working tree changes):
+/// ```json
+/// {
+///   "paths": ["src/lib.rs", "src/main.rs"],
+///   "worktree": true
+/// }
+/// ```
+///
+/// Request (unstage files, keep changes):
+/// ```json
+/// {
+///   "paths": ["src/lib.rs"],
+///   "staged": true,
+///   "worktree": false
+/// }
+/// ```
+///
+/// Response (success):
+/// ```json
+/// {
+///   "content": [{"type": "text", "text": "ok"}],
+///   "isError": false,
+///   "exit_code": 0
+/// }
+/// ```
 pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
     struct GitRestoreRequest {
@@ -390,6 +722,70 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
     RpcResponse::ok(id, payload)
 }
 
+/// Handle the `GitAdd` MCP tool request.
+///
+/// Executes `git add` to stage files for the next commit. Supports staging
+/// specific paths, all changes, or only tracked file updates.
+///
+/// # Parameters
+///
+/// | Name | Type | Default | Description |
+/// |------|------|---------|-------------|
+/// | `paths` | `string[]` | - | Specific files to stage |
+/// | `working_dir` | `string` | CWD | Directory containing the Git repository |
+/// | `timeout_ms` | `integer` | 30000 | Maximum execution time (100-300000ms) |
+/// | `all` | `boolean` | `false` | Stage all changes including untracked (`-A`) |
+/// | `update` | `boolean` | `false` | Stage modifications/deletions only (`-u`) |
+///
+/// # Staging Modes
+///
+/// | Mode | Flag | Behavior |
+/// |------|------|----------|
+/// | Specific paths | `paths: [...]` | Stage only listed files |
+/// | All changes | `all: true` | Stage all: new, modified, and deleted files |
+/// | Update only | `update: true` | Stage tracked files only (no new files) |
+///
+/// When `all: true`, the `-A` flag is used. When `update: true`, the `-u` flag
+/// is used. If both are specified, `all` takes precedence.
+///
+/// # Validation
+///
+/// Returns an error if:
+/// - `paths` is empty AND `all` is false AND `update` is false
+///
+/// This prevents accidental no-op calls.
+///
+/// # Example
+///
+/// Request (stage specific files):
+/// ```json
+/// {
+///   "paths": ["src/lib.rs", "src/main.rs"]
+/// }
+/// ```
+///
+/// Request (stage all changes):
+/// ```json
+/// {
+///   "all": true
+/// }
+/// ```
+///
+/// Request (stage only modified/deleted tracked files):
+/// ```json
+/// {
+///   "update": true
+/// }
+/// ```
+///
+/// Response (success):
+/// ```json
+/// {
+///   "content": [{"type": "text", "text": "ok"}],
+///   "isError": false,
+///   "exit_code": 0
+/// }
+/// ```
 pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
     struct GitAddRequest {
@@ -473,6 +869,91 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
     RpcResponse::ok(id, payload)
 }
 
+/// Handle the `GitCommit` MCP tool request.
+///
+/// Creates a Git commit using the [Conventional Commits](https://www.conventionalcommits.org/)
+/// format. The commit message is automatically formatted as `type(scope): message`
+/// or `type: message` if no scope is provided.
+///
+/// # Parameters
+///
+/// | Name | Type | Default | Required | Description |
+/// |------|------|---------|----------|-------------|
+/// | `type` | `string` | - | **Yes** | Commit type (feat, fix, docs, etc.) |
+/// | `message` | `string` | - | **Yes** | Commit description |
+/// | `scope` | `string` | - | No | Optional scope/area of change |
+/// | `working_dir` | `string` | CWD | No | Directory containing the Git repository |
+/// | `timeout_ms` | `integer` | 30000 | No | Maximum execution time (100-300000ms) |
+///
+/// # Conventional Commit Types
+///
+/// Common types (not enforced, but recommended):
+/// - `feat`: New feature
+/// - `fix`: Bug fix
+/// - `docs`: Documentation only
+/// - `style`: Code style (formatting, semicolons, etc.)
+/// - `refactor`: Code change that neither fixes a bug nor adds a feature
+/// - `perf`: Performance improvement
+/// - `test`: Adding or correcting tests
+/// - `chore`: Maintenance tasks, dependency updates
+/// - `ci`: CI/CD configuration changes
+/// - `build`: Build system or external dependency changes
+///
+/// # Message Format
+///
+/// The final commit message is constructed as:
+/// - With scope: `type(scope): message`
+/// - Without scope: `type: message`
+///
+/// All components are trimmed of leading/trailing whitespace.
+///
+/// # Validation
+///
+/// Returns an error if:
+/// - `type` is empty or whitespace-only
+/// - `message` is empty or whitespace-only
+///
+/// # Response Fields
+///
+/// In addition to standard fields, includes:
+/// - `commit_message`: The formatted conventional commit message
+/// - `commit_hash`: Extracted commit SHA (if parseable from Git output)
+///
+/// # Commit Hash Extraction
+///
+/// The handler attempts to extract the commit hash from Git's output, which
+/// typically looks like `[main abc1234] commit message`. The hash is extracted
+/// by finding a token of at least 7 hex characters.
+///
+/// # Example
+///
+/// Request:
+/// ```json
+/// {
+///   "type": "feat",
+///   "scope": "auth",
+///   "message": "add OAuth2 login support"
+/// }
+/// ```
+///
+/// Response:
+/// ```json
+/// {
+///   "content": [{"type": "text", "text": "[main abc1234] feat(auth): add OAuth2 login support"}],
+///   "isError": false,
+///   "commit_message": "feat(auth): add OAuth2 login support",
+///   "commit_hash": "abc1234",
+///   "exit_code": 0
+/// }
+/// ```
+///
+/// Request (without scope):
+/// ```json
+/// {
+///   "type": "fix",
+///   "message": "resolve null pointer exception in parser"
+/// }
+/// ```
 pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
     struct GitCommitRequest {

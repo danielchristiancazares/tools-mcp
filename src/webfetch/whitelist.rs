@@ -1,41 +1,120 @@
-/// Known JS-heavy domains that require browser rendering
-/// These sites typically use client-side rendering (React, Vue, Angular, etc.)
-/// and return minimal HTML without JavaScript execution
+//! Whitelist of known JavaScript-heavy domains requiring browser rendering.
+//!
+//! This module maintains a curated list of domains known to require JavaScript
+//! execution to render meaningful content. URLs matching these domains bypass
+//! HTTP-first fetching and go directly to browser rendering.
+//!
+//! ## Why a Whitelist?
+//!
+//! While heuristic detection (see [`super::heuristics`]) can identify JS-heavy
+//! sites, it requires fetching the page first. For known SPA domains, this
+//! wastes a round-trip. The whitelist provides instant classification.
+//!
+//! ## Pattern Types
+//!
+//! The whitelist supports two pattern types:
+//!
+//! 1. **Exact/subdomain match**: `"example.com"` matches both `example.com`
+//!    and any subdomain like `www.example.com` or `blog.example.com`
+//!
+//! 2. **Wildcard match**: `"*.example.com"` matches only subdomains like
+//!    `app.example.com`, NOT `example.com` itself
+//!
+//! ## Adding New Domains
+//!
+//! Add domains to `JS_HEAVY_DOMAINS` when:
+//! - The domain consistently serves SPA content
+//! - HTTP fetch returns empty/minimal HTML
+//! - Heuristic detection would always trigger browser fallback
+
 use url::Url;
 
-/// List of domain patterns that are known to require JavaScript rendering
+/// Curated list of domains known to require JavaScript rendering.
+///
+/// Organized by category for maintainability. Patterns can be:
+/// - Exact domain: `"example.com"` (matches example.com and subdomains)
+/// - Wildcard: `"*.example.com"` (matches only subdomains, not root)
 const JS_HEAVY_DOMAINS: &[&str] = &[
-    // Documentation sites with React/Next.js
+    // ========================================================================
+    // Framework Documentation Sites (React/Next.js/Vue/Angular)
+    // ========================================================================
     "react.dev",
     "nextjs.org",
     "vuejs.org",
     "angular.dev",
     "angular.io",
     "svelte.dev",
-    // Content platforms
+    // ========================================================================
+    // Content Platforms (CSR-heavy)
+    // ========================================================================
     "medium.com",
     "notion.so",
     "notion.site",
-    // Developer tools/platforms
+    // ========================================================================
+    // Developer Platforms
+    // ========================================================================
     "vercel.com",
     "netlify.app",
     "cloudflare.com",
-    // Modern docs platforms
+    // ========================================================================
+    // Documentation Platforms
+    // ========================================================================
     "gitbook.io",
     "readme.io",
     "docusaurus.io",
-    // Single-page applications
+    // ========================================================================
+    // Single-Page Applications
+    // ========================================================================
     "app.slack.com",
     "web.telegram.org",
     "discord.com",
-    // Common SPA patterns
+    // ========================================================================
+    // Wildcard Patterns (hosting platforms serving user SPAs)
+    // ========================================================================
     "*.vercel.app",
     "*.netlify.app",
     "*.pages.dev",
     "*.web.app",
 ];
 
-/// Check if a URL's domain matches the whitelist of known JS-heavy sites
+// ============================================================================
+// Pattern Matching
+// ============================================================================
+
+/// Checks if a URL's domain is in the JS-heavy whitelist.
+///
+/// This is the main entry point for whitelist checking. URLs matching
+/// whitelisted domains will use browser rendering immediately without
+/// attempting HTTP-first fetching.
+///
+/// # Pattern Matching Rules
+///
+/// 1. **Exact match**: `"example.com"` in whitelist
+///    - Matches: `example.com`
+///    - Matches: `www.example.com` (subdomain)
+///    - Matches: `blog.example.com` (subdomain)
+///
+/// 2. **Wildcard match**: `"*.example.com"` in whitelist
+///    - Matches: `app.example.com`
+///    - Matches: `www.example.com`
+///    - Does NOT match: `example.com` (root domain)
+///
+/// # Arguments
+///
+/// * `url` - The URL to check (must be parseable)
+///
+/// # Returns
+///
+/// `true` if the URL's domain matches any whitelist pattern, `false` otherwise.
+/// Returns `false` for unparseable URLs.
+///
+/// # Examples
+///
+/// ```ignore
+/// assert!(is_whitelisted_js_heavy("https://medium.com/article"));
+/// assert!(is_whitelisted_js_heavy("https://myapp.vercel.app/"));
+/// assert!(!is_whitelisted_js_heavy("https://example.com/"));
+/// ```
 pub fn is_whitelisted_js_heavy(url: &str) -> bool {
     let Ok(parsed) = Url::parse(url) else {
         return false;
@@ -47,13 +126,12 @@ pub fn is_whitelisted_js_heavy(url: &str) -> bool {
 
     for pattern in JS_HEAVY_DOMAINS {
         if let Some(suffix) = pattern.strip_prefix("*.") {
-            // Wildcard pattern: *.vercel.app matches foo.vercel.app but not vercel.app itself
+            // Wildcard: *.vercel.app matches foo.vercel.app but NOT vercel.app
             if host != suffix && host.ends_with(&format!(".{}", suffix)) {
                 return true;
             }
         } else if host == *pattern || host.ends_with(&format!(".{}", pattern)) {
-            // Exact match or subdomain match
-            // e.g., "medium.com" matches both "medium.com" and "blog.medium.com"
+            // Exact or subdomain: medium.com matches medium.com AND blog.medium.com
             return true;
         }
     }

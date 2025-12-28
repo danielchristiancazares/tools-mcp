@@ -1,6 +1,49 @@
-/// Headless browser pool for rendering JavaScript-heavy websites
-/// Uses chromiumoxide for async Chrome DevTools Protocol access
-use anyhow::{Context, Result, anyhow};
+//! Headless browser pool for rendering JavaScript-heavy websites.
+//!
+//! This module provides a managed Chrome/Chromium browser pool that handles the
+//! complexity of headless browser automation for web scraping. It uses the
+//! Chrome DevTools Protocol (CDP) via the `chromiumoxide` crate.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! +------------------+     +------------------+     +------------------+
+//! |   BrowserPool    |---->|  BrowserInstance |---->|  Chrome Process  |
+//! |   (singleton)    |     |  (managed state) |     |  (headless)      |
+//! +------------------+     +------------------+     +------------------+
+//!         |                        |
+//!         v                        v
+//!   Lifecycle Mgmt           Request Counter
+//!   - Lazy spawn             - Age tracking
+//!   - Auto-restart           - Memory cleanup
+//! ```
+//!
+//! ## Lifecycle Management
+//!
+//! The browser pool automatically manages Chrome process lifecycle to prevent
+//! memory leaks and ensure stability:
+//!
+//! - **Lazy initialization**: Browser is not spawned until first render request
+//! - **Request-based restart**: Restarts after 100 requests to clear accumulated memory
+//! - **Age-based restart**: Restarts after 1 hour regardless of request count
+//! - **Graceful shutdown**: Attempts clean close before process termination
+//!
+//! ## Stealth Configuration
+//!
+//! The browser is configured to avoid detection as a headless browser:
+//! - Realistic user agent string
+//! - `navigator.webdriver` property masked
+//! - Automation-related Chrome flags disabled
+//!
+//! ## Resource Optimization
+//!
+//! To reduce bandwidth and improve performance:
+//! - Images are disabled via Blink settings
+//! - Web fonts are disabled (system fallbacks used)
+//! - Video/audio autoplay is blocked
+//! - Background networking is disabled
+
+use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
 use chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired;
@@ -11,42 +54,111 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// Maximum number of requests before forcing browser restart
+// ============================================================================
+// Configuration Constants
+// ============================================================================
+
+/// Maximum requests before browser restart to prevent memory leaks.
+/// Chrome accumulates memory over time; periodic restarts keep usage bounded.
 const MAX_REQUESTS_BEFORE_RESTART: usize = 100;
 
-/// Maximum time browser can run before forced restart
+/// Maximum browser uptime before forced restart.
+/// Even with few requests, long-running Chrome processes can degrade.
 const MAX_BROWSER_AGE: Duration = Duration::from_secs(3600); // 1 hour
 
-/// Timeout for page navigation
+/// Timeout for initial page navigation.
+/// Covers DNS resolution, TCP connect, TLS handshake, and initial HTML load.
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Timeout for network idle after page load
+/// Time to wait for network activity to settle after page load.
+/// Allows dynamic content and XHR requests to complete.
 const NETWORK_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Browser pool manager with automatic restarts to prevent memory leaks
+/// Thread-safe browser pool with automatic lifecycle management.
+///
+/// The pool maintains at most one Chrome process at a time and handles:
+/// - Lazy spawning on first request
+/// - Automatic restart based on request count or age
+/// - Graceful shutdown when possible
+///
+/// # Thread Safety
+///
+/// The pool uses `Arc<Mutex<Option<BrowserInstance>>>` to allow safe concurrent
+/// access. The mutex is held only during spawn/restart decisions, not during
+/// page rendering, allowing multiple pages to render concurrently.
+///
+/// # Example
+///
+/// ```ignore
+/// let pool = BrowserPool::new();
+/// if BrowserPool::is_available().await {
+///     let html = pool.render_page("https://example.com").await?;
+/// }
+/// ```
 pub struct BrowserPool {
+    /// The managed browser instance, wrapped in Arc<Mutex> for thread-safe access.
+    /// `None` indicates the browser has not been spawned yet or was shut down.
     browser: Arc<Mutex<Option<BrowserInstance>>>,
 }
 
+/// Internal state tracking for a browser process.
+///
+/// Tracks metrics used to decide when the browser should be restarted
+/// to prevent memory leaks and maintain performance.
 struct BrowserInstance {
+    /// Handle to the Chrome process, wrapped in Arc for shared ownership
+    /// across concurrent page renders.
     browser: Arc<Browser>,
+
+    /// Timestamp when this browser instance was spawned.
+    /// Used for age-based restart decisions.
     created_at: Instant,
+
+    /// Number of pages rendered by this instance.
+    /// Used for request-count-based restart decisions.
     request_count: usize,
 }
 
 impl BrowserPool {
-    /// Create a new browser pool (browser lazily spawned on first use)
+    /// Creates a new browser pool with no active browser.
+    ///
+    /// The Chrome process is not spawned until the first `render_page` call.
+    /// This allows the pool to be created at startup without incurring the
+    /// cost of spawning Chrome if browser rendering is never needed.
     pub fn new() -> Self {
         Self {
             browser: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Get or spawn browser instance, with automatic restart if needed
+    /// Obtains a browser instance, spawning or restarting as needed.
+    ///
+    /// This is the core lifecycle management function. It implements the
+    /// following logic:
+    ///
+    /// 1. **Restart check**: If an instance exists, check if it should be
+    ///    restarted based on request count (>= 100) or age (>= 1 hour)
+    ///
+    /// 2. **Graceful shutdown**: If restarting, attempt to close the old
+    ///    browser cleanly. If other references exist (concurrent renders),
+    ///    skip close and let the old instance be dropped naturally.
+    ///
+    /// 3. **Spawn new instance**: If no instance exists (first call or after
+    ///    restart), spawn a new Chrome process with stealth configuration.
+    ///
+    /// 4. **Increment counter**: Track this request for restart decisions.
+    ///
+    /// # Locking Behavior
+    ///
+    /// The mutex is held for the duration of this function. However, once a
+    /// browser `Arc` is cloned and returned, page rendering happens outside
+    /// the lock, allowing concurrent page renders.
     async fn get_or_spawn(&self) -> Result<Arc<Browser>> {
         let mut guard = self.browser.lock().await;
 
-        // Check if restart needed
+        // ====================================================================
+        // Phase 1: Determine if restart is needed
+        // ====================================================================
         let needs_restart = if let Some(instance) = &*guard {
             let age = instance.created_at.elapsed();
             let should_restart =
@@ -64,18 +176,24 @@ impl BrowserPool {
             false
         };
 
-        // Restart if needed
+        // ====================================================================
+        // Phase 2: Handle restart if needed
+        // ====================================================================
         if needs_restart {
             if let Some(mut instance) = guard.take() {
-                // Attempt graceful shutdown (don't fail if there are multiple refs)
+                // Try to get exclusive ownership for graceful close.
+                // Arc::get_mut succeeds only if this is the sole reference.
                 match Arc::get_mut(&mut instance.browser) {
                     Some(browser) => {
+                        // We have exclusive access - close cleanly via CDP
                         if let Err(e) = browser.close().await {
                             warn!("Error closing browser during restart: {}", e);
                         }
                     }
                     None => {
-                        // Don't fail the request - old browser will be dropped when refs go away
+                        // Other references exist (concurrent renders in progress).
+                        // Don't block - the old browser will be dropped when those complete.
+                        // This is safe: Chrome process cleanup happens on Browser drop.
                         warn!(
                             "Cannot gracefully close browser during restart: multiple references exist"
                         );
@@ -84,7 +202,9 @@ impl BrowserPool {
             }
         }
 
-        // Spawn new browser if none exists
+        // ====================================================================
+        // Phase 3: Spawn new browser if needed
+        // ====================================================================
         if guard.is_none() {
             info!("Spawning new browser instance");
             let browser = spawn_browser().await?;
@@ -95,20 +215,51 @@ impl BrowserPool {
             });
         }
 
-        // Increment request counter and return browser
+        // ====================================================================
+        // Phase 4: Increment counter and return browser reference
+        // ====================================================================
         if let Some(instance) = guard.as_mut() {
             instance.request_count += 1;
             Ok(Arc::clone(&instance.browser))
         } else {
+            // This should be unreachable - we just spawned above if guard was None
             Err(anyhow!("Failed to initialize browser"))
         }
     }
 
-    /// Render a page with JavaScript execution
+    /// Renders a page and returns the fully-rendered HTML.
+    ///
+    /// This function:
+    /// 1. Obtains a browser instance (spawning if needed)
+    /// 2. Opens a new tab (page) in the browser
+    /// 3. Navigates to the URL and waits for JavaScript execution
+    /// 4. Waits for network activity to settle
+    /// 5. Extracts and returns the rendered HTML
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The URL to render. Should already be SSRF-validated.
+    ///
+    /// # Returns
+    ///
+    /// The fully-rendered HTML content as a string, including any content
+    /// added by JavaScript execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Browser spawn fails (Chrome not installed)
+    /// - Navigation fails (network error, invalid URL)
+    /// - Rendering times out (15 second limit)
+    ///
+    /// # Timeout Behavior
+    ///
+    /// The entire render operation is wrapped in a 15-second timeout.
+    /// This covers navigation, JavaScript execution, and network idle wait.
     pub async fn render_page(&self, url: &str) -> Result<String> {
         let browser = self.get_or_spawn().await?;
 
-        // Create new page (tab)
+        // Open new tab starting at about:blank (stealth config applied before navigation)
         let page = browser
             .new_page("about:blank")
             .await
@@ -128,13 +279,15 @@ impl BrowserPool {
         }
     }
 
-    /// Force restart the browser (useful for recovery from errors)
+    /// Forces an immediate browser restart, bypassing normal lifecycle checks.
+    ///
+    /// Useful for recovery after errors that may have corrupted browser state.
+    /// The next `render_page` call will spawn a fresh browser instance.
     #[allow(dead_code)]
     pub async fn force_restart(&self) {
         let mut guard = self.browser.lock().await;
         if let Some(mut instance) = guard.take() {
             info!("Force restarting browser");
-            // Try to get exclusive access to close the browser
             if let Some(browser) = Arc::get_mut(&mut instance.browser) {
                 if let Err(e) = browser.close().await {
                     warn!("Error closing browser during force restart: {}", e);
@@ -145,21 +298,59 @@ impl BrowserPool {
         }
     }
 
-    /// Check if browser is available (Chrome/Chromium installed)
+    /// Checks if a Chrome/Chromium browser is available on the system.
+    ///
+    /// This is a synchronous check that searches for Chrome binaries in:
+    /// - Environment variables: `CHROME_PATH`, `CHROMIUM_PATH`, `CHROME_EXECUTABLE`
+    /// - Common installation paths on Linux, macOS, and Windows
+    /// - System PATH via `which`/`where` commands
+    ///
+    /// Call this before attempting browser rendering to provide graceful
+    /// fallback to HTTP-only mode when Chrome is not installed.
     pub async fn is_available() -> bool {
-        // Try to find Chrome/Chromium binary
         find_chrome_binary().is_some()
     }
 }
 
 impl Drop for BrowserPool {
     fn drop(&mut self) {
-        // Note: Can't await in Drop, browser will be killed when process exits
+        // Cannot await in Drop trait. The Chrome process will be terminated
+        // when the process exits or when the Browser handle is dropped.
         debug!("BrowserPool dropped, browser process will be terminated");
     }
 }
 
-/// Spawn a new headless Chrome instance with stealth configuration
+// ============================================================================
+// Browser Spawning and Configuration
+// ============================================================================
+
+/// Spawns a new headless Chrome instance with stealth and performance settings.
+///
+/// The browser is configured with:
+///
+/// ## Stealth Settings (avoid bot detection)
+/// - `--disable-blink-features=AutomationControlled`: Hides automation flag
+/// - Custom user agent set after launch
+/// - JavaScript patches to mask `navigator.webdriver`
+///
+/// ## Performance Settings
+/// - `--blink-settings=imagesEnabled=false`: Blocks image loading
+/// - `--disable-remote-fonts`: Uses system fonts only
+/// - `--autoplay-policy=document-user-activation-required`: Blocks autoplay
+/// - `--max-old-space-size=512`: Limits V8 heap to 512MB
+///
+/// ## Security/Stability Settings
+/// - `--no-sandbox`: Required for containerized environments (Docker, etc.)
+/// - `--disable-dev-shm-usage`: Avoids /dev/shm size issues in containers
+/// - `--disable-breakpad`: Disables crash reporting
+///
+/// # Returns
+///
+/// A `Browser` handle connected via Chrome DevTools Protocol (CDP).
+///
+/// # Errors
+///
+/// Returns an error if Chrome binary is not found or fails to launch.
 async fn spawn_browser() -> Result<Browser> {
     let chrome_path = find_chrome_binary()
         .ok_or_else(|| anyhow!("Chrome/Chromium not found. Please install Chrome or Chromium."))?;
@@ -221,28 +412,41 @@ async fn spawn_browser() -> Result<Browser> {
     Ok(browser)
 }
 
-/// Render a page and extract HTML content
+/// Internal page rendering logic with guaranteed cleanup.
+///
+/// This function handles the complete page lifecycle:
+/// 1. Apply stealth configuration (user agent, JS patches)
+/// 2. Navigate to the target URL
+/// 3. Wait for the page load event
+/// 4. Wait for network activity to settle (XHR, dynamic content)
+/// 5. Extract the rendered HTML
+/// 6. Close the page (always, even on error)
+///
+/// # Page Cleanup
+///
+/// The page is always closed after rendering, regardless of success or failure.
+/// This prevents resource leaks from accumulated browser tabs.
 async fn render_page_internal(page: Page, url: &str) -> Result<String> {
     debug!("Navigating to: {}", url);
 
-    // Inner block so we always close the page even on errors
+    // Use async block to ensure page cleanup happens even on early return/error
     let result: Result<String> = async {
-        // Configure stealth settings
+        // Step 1: Apply stealth configuration before navigation
         configure_stealth(&page).await?;
 
-        // Navigate to URL
+        // Step 2: Navigate to target URL
         page.goto(url).await.context("Failed to navigate to URL")?;
 
-        // Wait for load event
+        // Step 3: Wait for initial page load (DOMContentLoaded + resources)
         debug!("Waiting for page load event");
         let mut load_event = page.event_listener::<EventLoadEventFired>().await?;
         let _ = tokio::time::timeout(Duration::from_secs(10), load_event.next()).await;
 
-        // Wait for network idle (additional content loading)
+        // Step 4: Wait for network to settle (catches AJAX/fetch requests)
         debug!("Waiting for network idle");
         wait_for_network_idle(&page).await?;
 
-        // Extract HTML content
+        // Step 5: Extract fully-rendered HTML including JS-generated content
         debug!("Extracting HTML content");
         let html = page
             .content()
@@ -253,7 +457,7 @@ async fn render_page_internal(page: Page, url: &str) -> Result<String> {
     }
     .await;
 
-    // Always close the page to free resources (even on errors)
+    // Step 6: Always close page to free resources (runs even if above failed)
     if let Err(e) = page.close().await {
         warn!("Error closing page: {}", e);
     }
@@ -261,28 +465,47 @@ async fn render_page_internal(page: Page, url: &str) -> Result<String> {
     result
 }
 
-/// Configure stealth settings to avoid detection
+/// Applies stealth configuration to avoid headless browser detection.
+///
+/// Many websites employ anti-bot measures that detect headless browsers.
+/// This function applies common evasion techniques:
+///
+/// ## User Agent
+/// Sets a realistic Chrome user agent string matching a standard desktop browser.
+///
+/// ## JavaScript Property Patches
+/// Injects a script that runs before page JavaScript to mask automation:
+/// - `navigator.webdriver`: Returns `false` instead of `true`
+/// - `navigator.plugins`: Returns a non-empty array (headless has empty)
+/// - `navigator.languages`: Returns realistic language preferences
+///
+/// # Note
+///
+/// These techniques provide basic evasion but are not foolproof. Sophisticated
+/// anti-bot systems may still detect headless browsers through other signals
+/// (timing analysis, mouse movements, etc.).
 async fn configure_stealth(page: &Page) -> Result<()> {
-    // Set realistic user agent
+    // Use a recent, realistic Chrome user agent for Linux desktop
     let user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
     page.set_user_agent(user_agent)
         .await
         .context("Failed to set user agent")?;
 
-    // Inject scripts to mask headless indicators
+    // Inject JavaScript patches to mask headless browser indicators.
+    // These run before any page JavaScript executes.
     let stealth_script = r#"
-        // Override navigator.webdriver
+        // Override navigator.webdriver - headless browsers set this to true
         Object.defineProperty(navigator, 'webdriver', {
             get: () => false
         });
 
-        // Mock plugins
+        // Mock plugins array - headless browsers have empty plugins
         Object.defineProperty(navigator, 'plugins', {
             get: () => [1, 2, 3, 4, 5]
         });
 
-        // Mock languages
+        // Mock languages - ensures realistic language preferences
         Object.defineProperty(navigator, 'languages', {
             get: () => ['en-US', 'en']
         });
@@ -295,13 +518,37 @@ async fn configure_stealth(page: &Page) -> Result<()> {
     Ok(())
 }
 
-/// Wait for network to become idle (no new requests for NETWORK_IDLE_TIMEOUT)
+/// Waits for network activity to settle, indicating dynamic content has loaded.
+///
+/// Many modern websites load content dynamically via XHR/fetch after the initial
+/// page load. This function monitors network responses and waits until no new
+/// responses have been received for `NETWORK_IDLE_TIMEOUT` (2 seconds).
+///
+/// ## Algorithm
+///
+/// 1. Subscribe to CDP `Network.responseReceived` events
+/// 2. Track timestamp of last network activity
+/// 3. Wait until no activity for 2 seconds (idle timeout)
+/// 4. Safety limit: Always exit after 20 seconds maximum
+///
+/// ## Exit Conditions
+///
+/// The function returns when any of these conditions are met:
+/// - No network activity for 2 seconds (success - page is idle)
+/// - Event stream ends (browser closed or navigation)
+/// - 20 second safety timeout exceeded (prevents infinite wait)
+///
+/// # Note
+///
+/// This heuristic works well for typical SPAs but may not catch all dynamic
+/// content (e.g., content loaded on scroll or after user interaction).
 async fn wait_for_network_idle(page: &Page) -> Result<()> {
     let mut response_event = page.event_listener::<EventResponseReceived>().await?;
     let start = Instant::now();
     let mut last_activity = Instant::now();
 
     loop {
+        // Calculate remaining time until we consider network idle
         let timeout_remaining = NETWORK_IDLE_TIMEOUT
             .checked_sub(last_activity.elapsed())
             .unwrap_or(Duration::from_secs(0));
@@ -313,22 +560,22 @@ async fn wait_for_network_idle(page: &Page) -> Result<()> {
 
         match tokio::time::timeout(timeout_remaining, response_event.next()).await {
             Ok(Some(_)) => {
-                // Network activity detected, reset timer
+                // Network activity detected - reset the idle timer
                 last_activity = Instant::now();
             }
             Ok(None) => {
-                // Stream ended
+                // Event stream ended (page closed or navigated away)
                 break;
             }
             Err(_) => {
-                // Timeout - network is idle
+                // Timeout expired with no activity - network is idle
                 break;
             }
         }
 
-        // Safety: Don't wait forever
+        // Safety valve: never wait longer than 20 seconds total
         if start.elapsed() > Duration::from_secs(20) {
-            debug!("Network idle wait timeout");
+            debug!("Network idle wait timeout (safety limit)");
             break;
         }
     }
@@ -336,9 +583,35 @@ async fn wait_for_network_idle(page: &Page) -> Result<()> {
     Ok(())
 }
 
-/// Find Chrome or Chromium binary on the system
+// ============================================================================
+// Chrome Binary Discovery
+// ============================================================================
+
+/// Locates a Chrome or Chromium binary on the system.
+///
+/// Searches in the following order:
+///
+/// 1. **Environment variables**: `CHROME_PATH`, `CHROMIUM_PATH`, `CHROME_EXECUTABLE`
+/// 2. **Common installation paths**: Platform-specific locations for Chrome, Chromium, Edge
+/// 3. **System PATH**: Uses `which` (Unix) or `where` (Windows) to find binaries
+///
+/// ## Supported Browsers
+///
+/// - Google Chrome
+/// - Chromium
+/// - Microsoft Edge (Chromium-based)
+///
+/// ## Platform-Specific Paths
+///
+/// **Linux**: `/usr/bin/google-chrome`, `/usr/bin/chromium`, `/snap/bin/chromium`
+/// **macOS**: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
+/// **Windows**: `C:\Program Files\Google\Chrome\Application\chrome.exe`
+///
+/// # Returns
+///
+/// `Some(path)` if a browser binary is found, `None` otherwise.
 fn find_chrome_binary() -> Option<String> {
-    // Allow explicit override via environment variable
+    // Priority 1: Explicit environment variable override
     for var in ["CHROME_PATH", "CHROMIUM_PATH", "CHROME_EXECUTABLE"] {
         if let Ok(p) = std::env::var(var) {
             let p = p.trim();

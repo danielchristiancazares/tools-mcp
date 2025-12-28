@@ -1,21 +1,70 @@
-/// Heuristics for detecting JavaScript-heavy websites that require browser rendering
-/// These indicators help identify client-side rendered (CSR) applications
+//! Heuristics for detecting JavaScript-heavy websites requiring browser rendering.
+//!
+//! Modern web applications often use client-side rendering (CSR) frameworks like
+//! React, Vue, or Angular. These sites return minimal HTML "shells" that require
+//! JavaScript execution to populate content. This module detects such sites so
+//! the fetcher can fall back to browser rendering.
+//!
+//! ## Detection Strategy
+//!
+//! The module uses a weighted confidence scoring system. Multiple indicators are
+//! checked, each contributing a weight to the overall confidence score. If the
+//! total score exceeds 0.5 (50%), the site is classified as JS-heavy.
+//!
+//! ## Heuristic Indicators
+//!
+//! | Indicator | Weight | Description |
+//! |-----------|--------|-------------|
+//! | Empty SPA shell | 0.5 | Minimal content with SPA root divs |
+//! | High script density | 0.25 | More than 5 external scripts |
+//! | Framework signatures | 0.3 | React, Vue, Angular, Next.js patterns |
+//! | Small HTML payload | 0.15 | Less than 5KB total HTML |
+//! | Noscript warnings | 0.5 | Explicit "enable JavaScript" messages |
+//!
+//! ## Framework Detection
+//!
+//! The module can detect signatures from:
+//! - **React**: `data-reactroot`, `__REACT`, `data-reactid`
+//! - **Vue**: `data-v-`, `v-cloak`, `__VUE__`
+//! - **Angular**: `ng-app`, `ng-version`, `ng-binding`
+//! - **Next.js**: `__NEXT_DATA__`, `_next/static`
+//! - **Svelte**: `svelte-`, `__SVELTE__`
+
 use scraper::{Html, Selector};
 
-/// Threshold for considering content as "empty" (in characters)
+// ============================================================================
+// Configuration Thresholds
+// ============================================================================
+
+/// Minimum extracted content length (chars) to consider page "populated".
+/// Below this threshold, the page is likely an empty SPA shell.
 const MIN_CONTENT_CHARS: usize = 500;
 
-/// Threshold for script tag density (number of script tags)
+/// Maximum external script tags before flagging as script-heavy.
+/// Modern SPAs often have many chunk/bundle scripts.
 const MAX_SCRIPT_TAGS: usize = 5;
 
-/// Minimum content-to-HTML ratio to avoid browser rendering
+/// Minimum ratio of extracted content to raw HTML size.
+/// Low ratios indicate most HTML is scaffolding, not content.
 const MIN_CONTENT_RATIO: f64 = 0.1;
 
-/// Container for heuristic analysis results
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Results from JS-heavy heuristic analysis.
+///
+/// Contains both the binary classification and supporting evidence
+/// for debugging and logging purposes.
 #[derive(Debug, Clone)]
 pub struct JsHeuristicResult {
+    /// True if the combined confidence exceeds the threshold (0.5).
     pub is_js_heavy: bool,
-    pub confidence: f64, // 0.0 to 1.0
+
+    /// Confidence score from 0.0 to 1.0, summed from individual heuristics.
+    pub confidence: f64,
+
+    /// Human-readable descriptions of triggered heuristics.
     pub reasons: Vec<String>,
 }
 

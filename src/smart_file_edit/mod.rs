@@ -1,4 +1,160 @@
 //! Smart, newline-aware file editing helper for MCP.
+//!
+//! This module provides surgical text replacement operations that preserve original line
+//! endings while allowing edits to be specified using a canonical LF-normalized view.
+//! It solves the fundamental problem of cross-platform text editing: callers can work
+//! with consistent LF-only text while the module transparently maintains the file's
+//! original CRLF, LF, or CR line endings.
+//!
+//! # Line Ending Preservation System
+//!
+//! Files on different platforms use different line ending conventions:
+//! - **LF** (`\n`): Unix, Linux, macOS
+//! - **CRLF** (`\r\n`): Windows
+//! - **CR** (`\r`): Classic Mac (rare)
+//!
+//! When editing files, it is critical to preserve the original line ending style to avoid:
+//! - Spurious diffs that show every line as changed
+//! - Breaking tools that expect specific line endings
+//! - Inconsistent formatting within a single file
+//!
+//! This module tracks the line ending style of each file and automatically converts
+//! replacement text to match the dominant style.
+//!
+//! # Canonical LF Processing
+//!
+//! Internally, all file content is normalized to a **canonical LF representation**:
+//!
+//! 1. The file is read as raw bytes
+//! 2. Line boundaries are detected (LF, CRLF, or CR)
+//! 3. A canonical string is built with all newlines normalized to LF
+//! 4. Offset mappings are maintained between canonical positions and file byte positions
+//!
+//! This canonical view enables:
+//! - **Consistent string matching**: Callers can search using LF-only patterns
+//! - **Portable snippets**: The same `old_snippet` works regardless of the file's line endings
+//! - **Accurate byte offsets**: Replacements are written to the exact correct file positions
+//!
+//! # Mixed Newline Handling
+//!
+//! Real-world files sometimes contain mixed line endings (e.g., a file created on Windows
+//! but edited on Unix). The module handles this by:
+//!
+//! 1. **Tracking statistics**: Counting occurrences of each newline type (LF, CRLF, CR)
+//! 2. **Determining dominance**: The most frequently used style becomes the "dominant" style
+//! 3. **Applying consistently**: All new content uses the dominant style
+//!
+//! The priority order when counts are equal: CRLF > LF > CR. This prefers the more
+//! explicit Windows style when ambiguous, as converting CRLF to LF loses information
+//! while LF to CRLF is always safe.
+//!
+//! # Architecture Overview
+//!
+//! ```text
+//!                        +------------------+
+//!                        |   Raw File Bytes |
+//!                        +--------+---------+
+//!                                 |
+//!                                 v
+//!                        +------------------+
+//!                        |   split_lines()  |  Detect line boundaries
+//!                        +--------+---------+  Track newline types
+//!                                 |
+//!                 +---------------+---------------+
+//!                 |                               |
+//!                 v                               v
+//!        +----------------+              +----------------+
+//!        | CanonicalData  |              | NewlineStats   |
+//!        | - LF-only text |              | - LF count     |
+//!        | - Line views   |              | - CRLF count   |
+//!        | - Boundaries   |              | - CR count     |
+//!        +----------------+              +----------------+
+//!                 |                               |
+//!                 +---------------+---------------+
+//!                                 |
+//!                                 v
+//!                        +------------------+
+//!                        |    FileModel     |  Complete file representation
+//!                        +------------------+
+//! ```
+//!
+//! # Supported Actions
+//!
+//! The module exposes three operations through [`handle_smart_file_edit`]:
+//!
+//! ## `get_region`
+//! Retrieves a portion of a file with line numbers and metadata. Returns both the
+//! plain text and a numbered canonical view suitable for display. Also provides
+//! a file hash for staleness detection.
+//!
+//! ## `apply_snippet_edit`
+//! Replaces an exact substring (the `old_snippet`) with new content (`new_snippet`).
+//! The old snippet must match exactly in the canonical view. An optional `match_hint`
+//! can constrain the search to specific line ranges for disambiguation.
+//!
+//! ## `apply_unified_diff`
+//! Applies a unified diff (the format produced by `git diff` or `diff -u`). Each
+//! hunk is converted to a snippet edit and applied sequentially. Supports context
+//! lines and the `\ No newline at end of file` marker.
+//!
+//! # Staleness Detection
+//!
+//! Each file read produces a SHA-256 hash (`file_hash`). Callers can pass this hash
+//! back when applying edits; if the file has changed since the hash was computed,
+//! the edit is rejected with a `stale_file` status. This prevents overwriting
+//! concurrent modifications.
+//!
+//! # Usage Examples
+//!
+//! ## Reading a file region
+//!
+//! ```json
+//! {
+//!   "action": "get_region",
+//!   "path": "/path/to/file.rs",
+//!   "start_line": 10,
+//!   "end_line": 20
+//! }
+//! ```
+//!
+//! Response includes:
+//! - `plain_text`: Raw content with original newlines
+//! - `canonical_text`: Numbered lines for display
+//! - `file_hash`: SHA-256 hash for staleness checks
+//! - `newline_style`: Statistics about line endings
+//!
+//! ## Applying a snippet edit
+//!
+//! ```json
+//! {
+//!   "action": "apply_snippet_edit",
+//!   "path": "/path/to/file.rs",
+//!   "old_snippet": "fn old_name(",
+//!   "new_snippet": "fn new_name(",
+//!   "file_hash": "sha256:abc123...",
+//!   "match_hint": { "start_line": 15, "end_line": 25 }
+//! }
+//! ```
+//!
+//! ## Applying a unified diff
+//!
+//! ```json
+//! {
+//!   "action": "apply_unified_diff",
+//!   "path": "/path/to/file.rs",
+//!   "diff": "@@ -1,3 +1,4 @@\n context\n-old line\n+new line\n+added line\n",
+//!   "file_hash": "sha256:abc123..."
+//! }
+//! ```
+//!
+//! # Error Handling
+//!
+//! The module returns structured JSON responses with a `status` field:
+//! - `"ok"`: Operation succeeded
+//! - `"no_match"`: The `old_snippet` was not found (includes candidate suggestions)
+//! - `"stale_file"`: The file changed since the provided hash was computed
+//!
+//! All errors include descriptive messages and relevant context for debugging.
 use crate::RpcResponse;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -8,7 +164,51 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// Primary entry point invoked by the MCP server.
+/// Primary entry point for smart file editing operations, invoked by the MCP server.
+///
+/// Routes incoming requests to the appropriate handler based on the `action` field.
+/// All actions operate on a single file and return structured JSON responses.
+///
+/// # Arguments
+///
+/// * `id` - Optional JSON-RPC request ID, included in the response for correlation
+/// * `args` - JSON object containing:
+///   - `action` (required): One of `"get_region"`, `"apply_snippet_edit"`, or `"apply_unified_diff"`
+///   - Additional fields specific to each action (see action handlers for details)
+///
+/// # Returns
+///
+/// An [`RpcResponse`] containing either:
+/// - Success: JSON payload with action results and `"status": "ok"`
+/// - Partial success: JSON payload with `"status": "no_match"` or `"status": "stale_file"`
+/// - Error: Error message describing the failure
+///
+/// # Supported Actions
+///
+/// | Action | Description |
+/// |--------|-------------|
+/// | `get_region` | Read file content with line numbers and metadata |
+/// | `apply_snippet_edit` | Replace exact substring with new content |
+/// | `apply_unified_diff` | Apply a unified diff (multiple hunks) |
+///
+/// # Example Request (JSON-RPC)
+///
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "mcp/tools/call",
+///   "params": {
+///     "name": "Edit",
+///     "arguments": {
+///       "action": "get_region",
+///       "path": "/path/to/file.rs",
+///       "start_line": 1,
+///       "end_line": 10
+///     }
+///   }
+/// }
+/// ```
 pub async fn handle_smart_file_edit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     let action = args
         .get("action")
@@ -23,21 +223,21 @@ pub async fn handle_smart_file_edit(id: Option<Value>, args: Value) -> RpcRespon
     match action.as_str() {
         "get_region" => match serde_json::from_value::<GetRegionRequest>(args) {
             Ok(req) => match handle_get_region(&req) {
-                Ok(payload) => ok_json(id, payload),
+                Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
                 Err(err) => RpcResponse::err(id, format!("smart_file_edit get_region error: {err}")),
             },
             Err(err) => RpcResponse::err(id, format!("invalid get_region arguments: {err}")),
         },
         "apply_snippet_edit" => match serde_json::from_value::<ApplySnippetEditRequest>(args) {
             Ok(req) => match handle_apply_snippet_edit(&req) {
-                Ok(payload) => ok_json(id, payload),
+                Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
                 Err(err) => RpcResponse::err(id, format!("smart_file_edit apply_snippet_edit error: {err}")),
             },
             Err(err) => RpcResponse::err(id, format!("invalid apply_snippet_edit arguments: {err}")),
         },
         "apply_unified_diff" => match serde_json::from_value::<ApplyUnifiedDiffRequest>(args) {
             Ok(req) => match handle_apply_unified_diff(&req) {
-                Ok(payload) => ok_json(id, payload),
+                Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
                 Err(err) => RpcResponse::err(id, format!("smart_file_edit apply_unified_diff error: {err}")),
             },
             Err(err) => RpcResponse::err(id, format!("invalid apply_unified_diff arguments: {err}")),
@@ -46,58 +246,162 @@ pub async fn handle_smart_file_edit(id: Option<Value>, args: Value) -> RpcRespon
     }
 }
 
+/// Request parameters for the `get_region` action.
+///
+/// Retrieves a portion of a file's content with line numbers and metadata.
+/// If line range is not specified, returns the entire file.
 #[derive(Deserialize)]
 struct GetRegionRequest {
+    /// Absolute or relative path to the file to read.
     path: String,
+    /// First line to include (1-indexed, inclusive). Defaults to 1.
     #[serde(default)]
     start_line: Option<usize>,
+    /// Last line to include (1-indexed, inclusive). Defaults to the last line.
+    /// Clamped to total line count if it exceeds file length.
     #[serde(default)]
     end_line: Option<usize>,
 }
 
+/// Request parameters for the `apply_snippet_edit` action.
+///
+/// Performs a surgical replacement of an exact substring within a file.
+/// The `old_snippet` must match exactly in the canonical (LF-normalized) view.
+///
+/// # Match Behavior
+///
+/// 1. If `match_hint` is provided, searches only within those lines first
+/// 2. If no match in the hint region, falls back to searching the entire file
+/// 3. Returns `no_match` status if the snippet is not found anywhere
+///
+/// # Staleness Check
+///
+/// If `file_hash` is provided, the operation fails with `stale_file` status
+/// if the file's current hash differs from the expected hash.
 #[derive(Deserialize)]
 struct ApplySnippetEditRequest {
+    /// Absolute or relative path to the file to modify.
     path: String,
+    /// Exact text to find and replace (must use LF newlines).
+    /// Must not be empty.
     old_snippet: String,
+    /// Replacement text (must use LF newlines).
+    /// LF characters are converted to the file's dominant line ending style.
     new_snippet: String,
+    /// Optional line range hint to disambiguate multiple matches.
     #[serde(default)]
     match_hint: Option<MatchHint>,
+    /// Expected file hash (from a previous `get_region` call).
+    /// If provided and mismatched, the edit is rejected.
     #[serde(default)]
     file_hash: Option<String>,
+    /// Optional identifier for tracking the region being edited.
+    /// Returned unchanged in the response for correlation.
     #[serde(default)]
     region_id: Option<String>,
 }
 
+/// Request parameters for the `apply_unified_diff` action.
+///
+/// Applies a unified diff (the format produced by `git diff` or `diff -u`).
+/// Each hunk in the diff is applied sequentially as a snippet edit.
+///
+/// # Diff Format Requirements
+///
+/// - Must contain at least one `@@ ... @@` hunk header
+/// - Each hunk must have context or removal lines (pure additions not supported)
+/// - Supports the `\ No newline at end of file` marker
+/// - File headers (`---`, `+++`, `diff`) are ignored
+///
+/// # Atomicity
+///
+/// Hunks are applied one at a time. If any hunk fails to match, the operation
+/// stops and returns an error. Previously applied hunks are NOT rolled back.
 #[derive(Deserialize)]
 struct ApplyUnifiedDiffRequest {
+    /// Absolute or relative path to the file to modify.
     path: String,
+    /// Unified diff content with `@@ ... @@` hunk headers.
+    /// Must not be empty.
     diff: String,
+    /// Expected file hash before the first hunk is applied.
+    /// Subsequent hunks use the hash from the previous successful application.
     #[serde(default)]
     file_hash: Option<String>,
 }
 
+/// Line range hint for disambiguating snippet matches.
+///
+/// When a file contains multiple occurrences of `old_snippet`, the match hint
+/// narrows the search to a specific region. The search first checks within
+/// the hinted range, then falls back to the entire file if no match is found.
+///
+/// Both line numbers are 1-indexed and inclusive.
 #[derive(Deserialize, Serialize)]
 struct MatchHint {
+    /// First line of the search region (1-indexed). Defaults to 1.
     #[serde(default)]
     start_line: Option<usize>,
+    /// Last line of the search region (1-indexed). Defaults to last line.
     #[serde(default)]
     end_line: Option<usize>,
 }
 
+/// Result status for snippet edit operations.
+///
+/// Used internally to communicate the outcome of an edit attempt,
+/// allowing the caller to decide how to handle partial failures.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SnippetStatusKind {
+    /// Edit applied successfully; file was modified.
     Ok,
+    /// The `old_snippet` was not found in the file.
     NoMatch,
+    /// The file's hash differs from the expected `file_hash`.
     StaleFile,
 }
 
+/// Internal result structure for snippet edit operations.
+///
+/// Contains both the JSON response payload and metadata for chaining
+/// multiple edits (used by unified diff application).
 struct SnippetResult {
+    /// Outcome of the edit attempt.
     status: SnippetStatusKind,
+    /// JSON response payload to return to the caller.
     payload: Value,
+    /// File hash before the edit (always populated).
     file_hash_before: Option<String>,
+    /// File hash after the edit (only populated on success).
     file_hash_after: Option<String>,
 }
 
+/// Handles the `get_region` action: reads a file region with metadata.
+///
+/// # Response Fields
+///
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `action` | string | Always `"get_region"` |
+/// | `path` | string | Echoed input path |
+/// | `start_line` | number | Actual start line (may differ from request) |
+/// | `end_line` | number | Actual end line (clamped to file length) |
+/// | `total_lines` | number | Total lines in the file |
+/// | `plain_text` | string | Raw content with LF newlines |
+/// | `canonical_text` | string | Line-numbered display format |
+/// | `region_id` | string | UUID for tracking this region |
+/// | `file_hash` | string | SHA-256 hash for staleness detection |
+/// | `canonical_range` | object | `{start, end}` offsets in canonical view |
+/// | `byte_range` | object | `{start, end}` offsets in raw file bytes |
+/// | `newline_style` | object | Line ending statistics |
+/// | `file_size_bytes` | number | Total file size in bytes |
+///
+/// # Errors
+///
+/// - `start_line` is 0 (must be >= 1)
+/// - `start_line` exceeds total lines
+/// - `end_line` < `start_line`
+/// - File cannot be read
 fn handle_get_region(req: &GetRegionRequest) -> Result<Value> {
     let path = PathBuf::from(&req.path);
     let model = FileModel::from_path(&path)?;
@@ -161,11 +465,59 @@ fn handle_get_region(req: &GetRegionRequest) -> Result<Value> {
     }))
 }
 
+/// Handles the `apply_snippet_edit` action: replaces a snippet in a file.
+///
+/// This is a thin wrapper that delegates to [`apply_snippet_edit_impl`] and
+/// extracts the JSON payload from the result.
+///
+/// # Response Fields (on success)
+///
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `action` | string | Always `"apply_snippet_edit"` |
+/// | `status` | string | `"ok"`, `"no_match"`, or `"stale_file"` |
+/// | `replaced_byte_range` | array | `[start, end]` byte offsets replaced |
+/// | `lines` | object | `{start, end}` affected line numbers |
+/// | `bytes_written` | number | Size of replacement in bytes |
+/// | `file_hash_before` | string | Hash before modification |
+/// | `file_hash_after` | string | Hash after modification |
+/// | `newline_kind` | string | Line ending style used (`"LF"`, `"CRLF"`, `"CR"`) |
+/// | `region_id` | string | Echoed from request if provided |
 fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value> {
     let result = apply_snippet_edit_impl(req)?;
     Ok(result.payload)
 }
 
+/// Handles the `apply_unified_diff` action: applies a unified diff to a file.
+///
+/// Parses the diff into hunks and applies each sequentially using snippet edits.
+/// Each hunk's context and removal lines form the `old_snippet`, while context
+/// and addition lines form the `new_snippet`.
+///
+/// # Response Fields (on success)
+///
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `action` | string | Always `"apply_unified_diff"` |
+/// | `status` | string | `"ok"`, `"no_match"`, or `"stale_file"` |
+/// | `hunks_applied` | number | Count of successfully applied hunks |
+/// | `file_hash_before` | string | Hash before first hunk |
+/// | `file_hash_after` | string | Hash after last hunk |
+/// | `results` | array | Per-hunk application details |
+///
+/// # Response Fields (on failure)
+///
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `failed_hunk` | number | 1-indexed hunk that failed |
+/// | `details` | object | Error details from the failed snippet edit |
+///
+/// # Errors
+///
+/// - Empty diff string
+/// - No `@@ ... @@` hunk headers found
+/// - Hunk with no context or removal lines (pure additions not supported)
+/// - Malformed hunk header syntax
 fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value> {
     if req.diff.trim().is_empty() {
         return Err(anyhow!("diff must not be empty"));
@@ -253,6 +605,18 @@ fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value> {
     }))
 }
 
+/// Core implementation of snippet editing logic.
+///
+/// Performs the actual file modification:
+/// 1. Reads and parses the file into a [`FileModel`]
+/// 2. Validates the file hash if provided (staleness check)
+/// 3. Searches for `old_snippet` in the canonical view
+/// 4. Computes byte offsets for the matched region
+/// 5. Builds replacement bytes with correct line endings
+/// 6. Writes the modified content back to disk
+///
+/// Returns a [`SnippetResult`] with status and metadata, allowing
+/// callers to handle partial success (no_match, stale_file) gracefully.
 fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResult> {
     if req.old_snippet.is_empty() {
         return Err(anyhow!("old_snippet must not be empty"));
@@ -368,16 +732,25 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
     })
 }
 
-fn ok_json(id: Option<Value>, payload: Value) -> RpcResponse<'static> {
-    RpcResponse::ok(id, json!({
-        "content": [{
-            "type": "json",
-            "json": payload
-        }],
-        "isError": false
-    }))
-}
-
+/// Searches for a needle in the canonical text, optionally constrained by a hint.
+///
+/// # Search Strategy
+///
+/// 1. If `hint` is provided, searches within the specified line range first
+/// 2. If no match in the hint region (or no hint), searches the entire file
+/// 3. Returns the canonical offset of the first match, or `None`
+///
+/// # Arguments
+///
+/// * `canonical` - The LF-normalized file view to search
+/// * `hint` - Optional line range to prioritize
+/// * `needle` - The exact string to find (must use LF newlines)
+///
+/// # Returns
+///
+/// * `Ok(Some(offset))` - Match found at canonical offset
+/// * `Ok(None)` - No match found anywhere in the file
+/// * `Err(_)` - Invalid hint line numbers
 fn compute_match_range(
     canonical: &CanonicalData,
     hint: Option<&MatchHint>,
@@ -530,6 +903,32 @@ fn canonical_range_for_lines(
     Ok(start..end)
 }
 
+/// Converts a canonical LF-based snippet to bytes with the target newline style.
+///
+/// This is the key function for line ending preservation: it takes replacement
+/// text that uses LF newlines and converts each LF to the file's dominant
+/// newline style (LF, CRLF, or CR).
+///
+/// # Arguments
+///
+/// * `new_snippet` - Replacement text with LF (`\n`) as line separators
+/// * `newline` - Target newline style to use in output
+///
+/// # Returns
+///
+/// Byte vector with LF characters replaced by the target newline sequence.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Converting to CRLF
+/// let bytes = build_replacement_bytes("line1\nline2", NewlineKind::CrLf);
+/// assert_eq!(bytes, b"line1\r\nline2");
+///
+/// // Preserving trailing newline
+/// let bytes = build_replacement_bytes("line1\n", NewlineKind::CrLf);
+/// assert_eq!(bytes, b"line1\r\n");
+/// ```
 fn build_replacement_bytes(new_snippet: &str, newline: NewlineKind) -> Vec<u8> {
     let newline_bytes = newline.as_bytes();
     let parts: Vec<&str> = new_snippet.split('\n').collect();
@@ -548,10 +947,22 @@ fn build_replacement_bytes(new_snippet: &str, newline: NewlineKind) -> Vec<u8> {
     out
 }
 
+/// Complete in-memory representation of a file for editing.
+///
+/// Combines the raw file bytes with derived metadata needed for safe editing:
+/// - A content-addressable hash for staleness detection
+/// - A canonical LF-normalized view for consistent matching
+/// - Statistics about line endings for preserving the original style
+///
+/// Created via [`FileModel::from_path`] which reads and parses the file.
 struct FileModel {
+    /// Raw file content as bytes (preserves original encoding and line endings).
     bytes: Vec<u8>,
+    /// SHA-256 hash of `bytes` in format `"sha256:<hex>"`.
     hash: String,
+    /// LF-normalized view with offset mappings back to `bytes`.
     canonical: CanonicalData,
+    /// Counts of each line ending type found in the file.
     newline_stats: NewlineStats,
 }
 
@@ -570,9 +981,30 @@ impl FileModel {
     }
 }
 
+/// LF-normalized representation of file content with bidirectional offset mapping.
+///
+/// This structure is the core of the canonical processing approach:
+///
+/// 1. **Normalized text**: All line endings are converted to LF (`\n`), enabling
+///    consistent string matching regardless of the original file's line ending style.
+///
+/// 2. **Line views**: Metadata for each logical line, including its position in
+///    both the canonical text and whether it has a trailing newline.
+///
+/// 3. **Boundaries**: A sorted list mapping canonical character offsets to file
+///    byte offsets. Used for translating match positions back to the original file.
+///
+/// # Offset Translation
+///
+/// When a match is found at canonical offset N, [`byte_offset`](Self::byte_offset)
+/// performs a binary search through `boundaries` to find the corresponding file
+/// byte position. This handles multi-byte characters and varying newline lengths.
 struct CanonicalData {
+    /// The complete file content with all newlines normalized to LF.
     text: String,
+    /// Per-line metadata for quick line number lookups.
     line_views: Vec<LineView>,
+    /// Sorted offset mappings from canonical positions to file byte positions.
     boundaries: Vec<Boundary>,
 }
 
@@ -669,19 +1101,36 @@ impl CanonicalData {
     }
 }
 
+/// Byte range of a single line within the raw file bytes.
+///
+/// Separates the line content from its trailing newline sequence,
+/// enabling precise byte-level manipulation during edits.
 #[derive(Clone)]
 struct LineSlice {
+    /// Byte offset where line content begins (inclusive).
     content_start: usize,
+    /// Byte offset where line content ends (exclusive, before newline).
     content_end: usize,
+    /// Byte offset after the newline sequence (exclusive).
+    /// Equal to `content_end` if there is no trailing newline.
     newline_end: usize,
+    /// Type of newline terminating this line.
     newline_kind: NewlineKind,
 }
 
+/// Line ending style for a single line or an entire file.
+///
+/// Used both to record the original line ending of each line and to
+/// determine the style to use when writing replacement content.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NewlineKind {
+    /// Unix-style: single line feed (`\n`, 0x0A).
     Lf,
+    /// Windows-style: carriage return + line feed (`\r\n`, 0x0D 0x0A).
     CrLf,
+    /// Classic Mac-style: single carriage return (`\r`, 0x0D). Rare.
     Cr,
+    /// No newline (typically the last line of a file without trailing newline).
     None,
 }
 
@@ -705,10 +1154,28 @@ impl NewlineKind {
     }
 }
 
+/// Aggregated counts of line ending types within a file.
+///
+/// Used to determine the "dominant" line ending style, which is applied
+/// to all newlines in replacement content. This preserves consistency
+/// even when the original file has mixed line endings.
+///
+/// # Dominance Rules
+///
+/// When determining the dominant style via [`dominant`](Self::dominant):
+/// 1. The style with the highest count wins
+/// 2. On ties, priority order is: CRLF > LF > CR
+/// 3. If no newlines exist, returns [`NewlineKind::None`]
+///
+/// The [`default_kind`](Self::default_kind) method returns LF as a fallback
+/// when no newlines are present (e.g., single-line files).
 #[derive(Clone, Copy, Default)]
 struct NewlineStats {
+    /// Count of LF (`\n`) line endings.
     lf: usize,
+    /// Count of CRLF (`\r\n`) line endings.
     crlf: usize,
+    /// Count of CR (`\r`) line endings.
     cr: usize,
 }
 
@@ -755,21 +1222,66 @@ impl NewlineStats {
     }
 }
 
+/// Metadata about a single logical line in the canonical view.
+///
+/// Tracks both the line's position in the canonical text and whether
+/// it originally had a trailing newline. This enables accurate
+/// line number lookups and proper handling of files that lack
+/// a final newline.
 #[derive(Clone)]
 struct LineView {
+    /// Offset in canonical text where line content begins.
     canonical_start: usize,
+    /// Offset in canonical text where line content ends (before newline).
     canonical_end: usize,
+    /// Offset after the LF in canonical text, or equal to `canonical_end`
+    /// if no trailing newline exists.
     canonical_full_end: usize,
+    /// The line's text content (without newline).
     text: String,
+    /// Whether this line had a trailing newline in the original file.
     has_trailing_newline: bool,
 }
 
+/// Mapping between a canonical text offset and a file byte offset.
+///
+/// Boundaries are stored in a sorted vector and searched via binary search
+/// to translate canonical positions (where matches are found) back to
+/// file byte positions (where edits are applied).
+///
+/// Boundaries are recorded at:
+/// - The start of the file (offset 0)
+/// - Each character boundary within line content
+/// - The end of each newline sequence
 #[derive(Clone)]
 struct Boundary {
+    /// Position in the canonical (LF-normalized) text.
     canonical_offset: usize,
+    /// Corresponding position in the raw file bytes.
     file_offset: usize,
 }
 
+/// Splits raw file bytes into logical lines, detecting line ending types.
+///
+/// Scans the byte array for newline sequences (LF, CRLF, CR) and records
+/// the position and type of each. Handles all three newline conventions
+/// and correctly identifies CRLF as a single two-byte sequence.
+///
+/// # Arguments
+///
+/// * `bytes` - Raw file content as bytes
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - `Vec<LineSlice>`: One entry per logical line with byte ranges
+/// - `NewlineStats`: Counts of each newline type encountered
+///
+/// # Edge Cases
+///
+/// - Empty input produces a single empty line with `NewlineKind::None`
+/// - A file ending without newline has `NewlineKind::None` on the last line
+/// - Mixed newlines are tracked individually per line
 fn split_lines(bytes: &[u8]) -> (Vec<LineSlice>, NewlineStats) {
     let mut lines = Vec::new();
     let mut stats = NewlineStats::default();
@@ -822,6 +1334,29 @@ fn split_lines(bytes: &[u8]) -> (Vec<LineSlice>, NewlineStats) {
     (lines, stats)
 }
 
+/// Decodes a line's bytes to a string, tracking character boundaries.
+///
+/// Attempts UTF-8 decoding first. If the bytes are not valid UTF-8,
+/// falls back to byte-by-byte decoding with replacement characters
+/// (U+FFFD) for invalid sequences.
+///
+/// # Arguments
+///
+/// * `bytes` - Raw bytes of a single line (without newline)
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - `String`: Decoded text (valid UTF-8, possibly with replacement chars)
+/// - `Vec<usize>`: Byte offsets of each character boundary, including
+///   the final offset (equal to `bytes.len()`)
+///
+/// # Character Boundary Tracking
+///
+/// The boundary vector enables accurate offset translation when the
+/// line contains multi-byte UTF-8 characters. For example, in a line
+/// with an emoji (4 bytes), the boundaries would map character index 0
+/// to byte 0, character index 1 to byte 4, etc.
 fn decode_line(bytes: &[u8]) -> (String, Vec<usize>) {
     if let Ok(text) = std::str::from_utf8(bytes) {
         let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
@@ -882,47 +1417,84 @@ fn utf8_char_width(byte: u8) -> usize {
     }
 }
 
+/// Computes a SHA-256 hash of the given bytes.
+///
+/// Returns the hash in the format `"sha256:<64-hex-chars>"` for use
+/// in staleness detection. This format is chosen to be:
+/// - Self-describing (includes algorithm name)
+/// - URL-safe (no special characters)
+/// - Consistent across platforms
 fn compute_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// Classification of a line within a unified diff hunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HunkLineKind {
+    /// Context line (prefix ` `): unchanged, used for matching.
     Context,
+    /// Addition line (prefix `+`): present only in new version.
     Add,
+    /// Removal line (prefix `-`): present only in old version.
     Remove,
 }
 
+/// A single line from a unified diff hunk.
 #[derive(Clone, Debug)]
 struct HunkLine {
+    /// Whether this line is context, addition, or removal.
     kind: HunkLineKind,
+    /// Line content (without the prefix character).
     text: String,
+    /// Whether this line has a trailing newline.
+    /// Set to `false` when followed by `\ No newline at end of file`.
     has_newline: bool,
 }
 
+/// A parsed hunk from a unified diff.
+///
+/// Represents a contiguous change region with header information
+/// (line numbers and counts) and the actual diff lines.
 #[derive(Clone, Debug)]
 struct UnifiedHunk {
+    /// Starting line number in the old (original) file.
     old_start: usize,
+    /// Number of lines from the old file in this hunk.
     old_len: usize,
+    /// Starting line number in the new (modified) file.
     #[allow(dead_code)] // Parsed from diff header but not currently used
     new_start: usize,
+    /// Number of lines in the new file in this hunk.
     #[allow(dead_code)] // Parsed from diff header but not currently used
     new_len: usize,
+    /// The diff lines (context, additions, removals).
     lines: Vec<HunkLine>,
 }
 
 impl UnifiedHunk {
+    /// Reconstructs the old (original) text from this hunk.
+    ///
+    /// Combines context lines and removal lines to produce the text
+    /// that should be found in the file before applying the diff.
     fn old_snippet(&self) -> String {
         build_snippet(&self.lines, |kind| kind != HunkLineKind::Add)
     }
 
+    /// Reconstructs the new (modified) text from this hunk.
+    ///
+    /// Combines context lines and addition lines to produce the text
+    /// that should replace the old snippet.
     fn new_snippet(&self) -> String {
         build_snippet(&self.lines, |kind| kind != HunkLineKind::Remove)
     }
 }
 
+/// Builds a snippet string from hunk lines matching a predicate.
+///
+/// Filters lines by the predicate and concatenates their text,
+/// adding newlines where indicated by `has_newline`.
 fn build_snippet<F>(lines: &[HunkLine], predicate: F) -> String
 where
     F: Fn(HunkLineKind) -> bool,
@@ -937,6 +1509,36 @@ where
     out
 }
 
+/// Parses a unified diff string into a vector of hunks.
+///
+/// Extracts hunk headers (`@@ -old,len +new,len @@`) and their associated
+/// diff lines. Ignores file headers (`---`, `+++`, `diff`) and other
+/// non-hunk content.
+///
+/// # Arguments
+///
+/// * `diff` - Unified diff content (as produced by `git diff` or `diff -u`)
+///
+/// # Returns
+///
+/// A vector of [`UnifiedHunk`] structs, one per hunk in the diff.
+///
+/// # Errors
+///
+/// - No `@@ ... @@` hunk headers found
+/// - Malformed hunk header (invalid line numbers)
+/// - Empty hunk (header with no diff lines)
+/// - Unexpected diff line prefix (not ` `, `+`, or `-`)
+///
+/// # Example Input
+///
+/// ```text
+/// @@ -1,3 +1,4 @@
+///  context line
+/// -removed line
+/// +added line
+/// +another added line
+/// ```
 fn parse_unified_diff(diff: &str) -> Result<Vec<UnifiedHunk>> {
     use std::iter::Peekable;
 

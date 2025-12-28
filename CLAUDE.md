@@ -299,48 +299,42 @@ async fn test_file_search_flow() {
 - Always provide a complete PLAN with REASONING based on evidence from code and logs before making changes.
 - Explain your OBSERVATIONS clearly, then provide REASONING to identify the exact issue. Add console logs when needed to gather more information.
 
+## Primary Components
 
-The project implements a hybrid code analysis system that combines machine learning with formal verification methods. The core architecture consists of five key business components:
+1. **MCP Server** (`src/main.rs`, `src/tool_registry.rs`)
+   - JSON-RPC protocol over stdin/stdout
+   - Tool registration and dispatch system
+   - Protocol alias handling for compatibility
 
-## Primary Business Components
+2. **OpenAI Vector Store Client** (`src/lib.rs`)
+   - File upload with automatic extension handling
+   - Vector store creation and management
+   - Semantic search via Responses API
+   - Hash-based reindexing with change detection
 
-1. Neuro-Symbolic Analysis Pipeline (`src/rustverify/mod.rs`)
-- Hybrid system merging LLM code review with formal verification
-- Symbolic execution validates LLM-generated hypotheses
-- Verification categories: overflow, division-by-zero, logic errors, unsafe blocks
-- Z3 theorem prover integration
-Importance Score: 90
+3. **CodeQuery** (`src/codequery/`)
+   - Semantic code search orchestration
+   - Automatic file discovery respecting .gitignore
+   - Vector store caching and resolution
+   - Incremental update processing
 
-2. Constraint System (`src/rustverify/constraints.rs`)
-- Transforms Rust AST into logical constraints for Z3
-- Maps language constructs to verification primitives
-- Control flow and dependency analysis
-Importance Score: 85
+4. **WebFetch** (`src/webfetch/`)
+   - HTTP-first with automatic browser fallback
+   - SSRF protection and robots.txt compliance
+   - HTML to Markdown conversion
+   - Token-aware chunking for LLM consumption
 
-3. Smart Line Ending System (`src/smart_file_edit/mod.rs`)
-- Preserves original line endings during code modifications
-- Canonical LF processing with original format retention
-- Mixed newline handling system
-Importance Score: 75
+5. **Smart File Edit** (`src/smart_file_edit/`)
+   - Line ending preservation (LF/CRLF/CR)
+   - Canonical LF processing with original format retention
+   - Snippet replacement and unified diff support
 
-4. JavaScript Content Analysis (`src/webfetch/heuristics.rs`)
-- Website JavaScript density analysis
-- Framework detection scoring
-- Dynamic rendering strategy selection
-Importance Score: 70
+6. **Git Tools** (`src/git_tools.rs`)
+   - GitStatus, GitDiff, GitRestore, GitAdd, GitCommit
+   - Porcelain output parsing
+   - Timeout and output limit enforcement
 
-5. Code Search Vector Management (`src/codequery/mod.rs`)
-- Semantic code search orchestration
-- Change-based reindexing system
-- Incremental update processing
-Importance Score: 65
-
-## Architecture Integration
-
-The system follows a two-phase verification approach:
-1. LLM generates initial code analysis hypotheses
-2. Formal verification confirms or rejects these hypotheses
-
-Core business value centers on the neuro-symbolic verification system that combines ML pattern recognition with mathematical verification methods.
-
-$END$
+7. **Process Utilities** (`src/process_utils.rs`)
+   - Shell script execution with timeouts
+   - PowerShell command support
+   - ANSI code stripping
