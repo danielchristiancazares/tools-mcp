@@ -85,11 +85,10 @@ pub struct ExtractedDocument {
 /// 2. First 256 bytes contain `<html` or `<!doctype html`
 fn looks_like_html(content_type: Option<&str>, bytes: &[u8]) -> bool {
     // Check Content-Type header first (most reliable)
-    if let Some(ct) = content_type {
-        if ct.to_ascii_lowercase().contains("html") {
+    if let Some(ct) = content_type
+        && ct.to_ascii_lowercase().contains("html") {
             return true;
         }
-    }
     // Fall back to content sniffing for the first 256 bytes
     let sample = bytes
         .iter()

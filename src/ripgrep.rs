@@ -118,12 +118,10 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         } else {
             "ugrep"
         }
+    } else if cfg!(target_os = "windows") {
+        "rg.exe"
     } else {
-        if cfg!(target_os = "windows") {
-            "rg.exe"
-        } else {
-            "rg"
-        }
+        "rg"
     };
 
     let run = async {
@@ -187,10 +185,10 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
                 "--no-ignore"
             });
         }
-        if let Some(c) = req.context {
-            if c > 0 {
-                cmd.arg("-C").arg(c.to_string());
-            }
+        if let Some(c) = req.context
+            && c > 0
+        {
+            cmd.arg("-C").arg(c.to_string());
         }
         if let Some(globs) = &req.glob {
             for g in globs {
@@ -372,10 +370,10 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
                 "matches": matches,
             });
 
-            if !stderr_text.is_empty() {
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("stderr".to_string(), Value::String(stderr_text));
-                }
+            if !stderr_text.is_empty()
+                && let Some(obj) = payload.as_object_mut()
+            {
+                obj.insert("stderr".to_string(), Value::String(stderr_text));
             }
 
             RpcResponse::ok(id, payload)

@@ -60,7 +60,7 @@ use crate::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS,
     MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 };
-use crate::git_utils::{GitExecResult, build_git_response, extract_git_output_text};
+use crate::git_utils::{build_git_response, GitExecResult};
 use crate::process_utils::read_to_end_limited;
 use crate::validation;
 use crate::RpcResponse;
@@ -473,19 +473,19 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
     if req.name_only.unwrap_or(false) {
         cmd_args.push("--name-only".into());
     }
-    if let Some(u) = req.unified {
-        if u >= 0 {
-            cmd_args.push(format!("-U{u}"));
-        }
+    if let Some(u) = req.unified
+        && u >= 0
+    {
+        cmd_args.push(format!("-U{u}"));
     }
 
-    if let Some(paths) = &req.paths {
-        if !paths.is_empty() {
-            cmd_args.push("--".into());
-            for p in paths {
-                if !p.trim().is_empty() {
-                    cmd_args.push(p.clone());
-                }
+    if let Some(paths) = &req.paths
+        && !paths.is_empty()
+    {
+        cmd_args.push("--".into());
+        for p in paths {
+            if !p.trim().is_empty() {
+                cmd_args.push(p.clone());
             }
         }
     }

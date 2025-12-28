@@ -152,7 +152,6 @@ mod git_utils;
 mod process_utils;
 mod read_file;
 mod ripgrep;
-mod rpc_helpers;
 mod script_runner;
 mod smart_file_edit;
 mod tool_registry;
@@ -675,8 +674,8 @@ where
         }
 
         // Parse Content-Length header (case-insensitive)
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length") {
                 let len = value.trim().parse::<usize>().map_err(|_| {
                     io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header")
                 })?;
@@ -688,7 +687,6 @@ where
                 }
                 content_length = Some(len);
             }
-        }
     }
 
     // Read the message body using the Content-Length

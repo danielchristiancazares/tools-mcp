@@ -90,15 +90,6 @@ async fn execute_pwsh(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         );
     }
 
-    let payload = json!({
-        "exit_code": result.exit_code,
-        "success": result.success,
-        "timed_out": result.timed_out,
-        "truncated_stdout": result.truncated_stdout,
-        "truncated_stderr": result.truncated_stderr,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    });
-
+    let payload = process_utils::build_process_result_response(&result, None);
     RpcResponse::ok_json_content(id, payload, !result.success)
 }

@@ -263,8 +263,8 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
 
     // Check browser cache (works even if Chrome isn't installed)
     let cache_key = format!("{}_browser", req.url);
-    if !req.no_cache {
-        if let Some(entry) = cache::read_cache(&cache_key).context("read browser cache")? {
+    if !req.no_cache
+        && let Some(entry) = cache::read_cache(&cache_key).context("read browser cache")? {
             let extracted = extract::extract(&entry.body, entry.content_type.as_deref(), &req.url)
                 .context("extract cached browser-rendered content")?;
 
@@ -277,7 +277,6 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
                 req.max_chunk_tokens,
             );
         }
-    }
 
     // Check if browser is available
     if !browser::BrowserPool::is_available().await {

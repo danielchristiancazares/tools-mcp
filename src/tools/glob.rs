@@ -121,11 +121,10 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         "files": files
     });
 
-    if truncated {
-        if let Some(obj) = payload.as_object_mut() {
+    if truncated
+        && let Some(obj) = payload.as_object_mut() {
             obj.insert("truncated".to_string(), Value::Bool(true));
         }
-    }
 
     RpcResponse::ok(id, payload)
 }

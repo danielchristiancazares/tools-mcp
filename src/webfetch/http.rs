@@ -341,11 +341,10 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
     // Check cache first (read lock)
     {
         let cache = ROBOTS_CACHE.read().await;
-        if let Some(ref map) = *cache {
-            if let Some(cached) = map.get(&domain) {
+        if let Some(ref map) = *cache
+            && let Some(cached) = map.get(&domain) {
                 return Ok(cached.clone());
             }
-        }
     }
 
     // Fetch robots.txt

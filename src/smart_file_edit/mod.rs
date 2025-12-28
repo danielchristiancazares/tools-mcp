@@ -630,8 +630,7 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
         .as_ref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-    {
-        if expected_hash != model.hash {
+        && expected_hash != model.hash {
             return Ok(SnippetResult {
                 status: SnippetStatusKind::StaleFile,
                 payload: json!({
@@ -645,7 +644,6 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
                 file_hash_after: None,
             });
         }
-    }
 
     let maybe_offset = compute_match_range(
         &model.canonical,
@@ -778,11 +776,10 @@ fn compute_match_range(
         None
     };
 
-    if let Some((start, end)) = search_slice {
-        if let Some(rel) = haystack[start..end].find(needle) {
+    if let Some((start, end)) = search_slice
+        && let Some(rel) = haystack[start..end].find(needle) {
             return Ok(Some(start + rel));
         }
-    }
 
     Ok(haystack.find(needle))
 }
@@ -861,7 +858,7 @@ fn compute_line_similarity(views: &[LineView], start_idx: usize, needle_lines: &
     matches as f64 / needle_lines.len() as f64
 }
 
-fn logical_snippet_lines<'a>(snippet: &'a str) -> Vec<&'a str> {
+fn logical_snippet_lines(snippet: &str) -> Vec<&str> {
     let mut parts: Vec<&str> = snippet.split('\n').collect();
     if snippet.ends_with('\n') && !parts.is_empty() {
         parts.pop();

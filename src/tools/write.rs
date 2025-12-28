@@ -29,9 +29,9 @@ async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     let path = Path::new(&req.path);
 
     // Create parent directories if needed
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() && !parent.exists()
+            && let Err(err) = tokio::fs::create_dir_all(parent).await {
                 return RpcResponse::err(
                     id,
                     format!(
@@ -40,8 +40,6 @@ async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
                     ),
                 );
             }
-        }
-    }
 
     // Write the file
     let bytes = req.content.as_bytes();

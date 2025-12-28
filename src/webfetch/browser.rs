@@ -179,8 +179,8 @@ impl BrowserPool {
         // ====================================================================
         // Phase 2: Handle restart if needed
         // ====================================================================
-        if needs_restart {
-            if let Some(mut instance) = guard.take() {
+        if needs_restart
+            && let Some(mut instance) = guard.take() {
                 // Try to get exclusive ownership for graceful close.
                 // Arc::get_mut succeeds only if this is the sole reference.
                 match Arc::get_mut(&mut instance.browser) {
@@ -200,7 +200,6 @@ impl BrowserPool {
                     }
                 }
             }
-        }
 
         // ====================================================================
         // Phase 3: Spawn new browser if needed

@@ -99,11 +99,10 @@ pub fn analyze_js_heavy(
     let mut result = JsHeuristicResult::new();
 
     // Skip analysis for non-HTML content (case-insensitive check)
-    if let Some(ct) = content_type {
-        if !ct.to_ascii_lowercase().contains("text/html") {
+    if let Some(ct) = content_type
+        && !ct.to_ascii_lowercase().contains("text/html") {
             return result;
         }
-    }
 
     // Heuristic 1: Empty or minimal body with SPA root divs
     if check_empty_spa_shell(html_body, extracted_markdown, &mut result) {
@@ -265,11 +264,10 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
 /// Heuristic 4: Check HTTP headers and content size hints
 fn check_header_hints(content_length: Option<usize>, _result: &mut JsHeuristicResult) -> bool {
     // Small HTML payload (< 5KB) often indicates a shell page
-    if let Some(length) = content_length {
-        if length < 5000 {
+    if let Some(length) = content_length
+        && length < 5000 {
             return true;
         }
-    }
 
     false
 }

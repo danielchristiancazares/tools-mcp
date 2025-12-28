@@ -75,49 +75,13 @@ pub fn build_git_response(
     });
 
     // Add any extra fields provided by the caller
-    if let Some(extra) = extra_fields {
-        if let Some(obj) = payload.as_object_mut() {
-            for (key, value) in extra {
-                obj.insert(key.to_string(), value);
-            }
+    if let Some(extra) = extra_fields
+        && let Some(obj) = payload.as_object_mut()
+    {
+        for (key, value) in extra {
+            obj.insert(key.to_string(), value);
         }
     }
 
     payload
-}
-
-/// Extract readable output text from a Git execution result.
-///
-/// Handles the common pattern of formatting Git output with fallbacks for errors:
-/// 1. If successful and stdout is not empty, use stdout
-/// 2. If successful and stdout is empty, use the success message
-/// 3. If failed and stderr is not empty, use stderr
-/// 4. Otherwise, use a generic error message
-///
-/// # Arguments
-///
-/// * `exec` - The Git execution result
-/// * `success_message` - Message to display when command succeeds with no output
-///
-/// # Returns
-///
-/// A formatted string suitable for display to the user
-///
-/// # Example
-///
-/// ```ignore
-/// let text = extract_git_output_text(&exec, "Working tree is clean");
-/// ```
-pub fn extract_git_output_text(exec: &GitExecResult, success_message: &str) -> String {
-    if exec.success {
-        if !exec.stdout.trim().is_empty() {
-            exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-        } else {
-            success_message.to_string()
-        }
-    } else if !exec.stderr.trim().is_empty() {
-        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else {
-        "git command failed".to_string()
-    }
 }

@@ -660,116 +660,6 @@ pub async fn run_pwsh_command(
     })
 }
 
-/// Result of capturing output from a process's stdout and stderr.
-///
-/// Produced by [`capture_process_output`] and contains the captured text
-/// and metadata about truncation.
-#[derive(Debug)]
-pub struct CapturedOutput {
-    /// Captured stdout with ANSI codes stripped
-    pub stdout: String,
-    /// Captured stderr with ANSI codes stripped
-    pub stderr: String,
-    /// Whether stdout was truncated due to byte limit
-    pub truncated_stdout: bool,
-    /// Whether stderr was truncated due to byte limit
-    pub truncated_stderr: bool,
-}
-
-/// Wait for a process to complete with timeout enforcement.
-///
-/// This helper consolidates the repeated pattern of:
-/// 1. Waiting for process completion with timeout
-/// 2. Forcibly killing the process on timeout
-/// 3. Allowing grace period for cleanup
-///
-/// # Arguments
-///
-/// * `child` - The running child process
-/// * `timeout_ms` - Timeout in milliseconds
-///
-/// # Returns
-///
-/// A tuple of (Option<ExitStatus>, bool) where:
-/// - First element: Some(status) if process completed, None if timed out
-/// - Second element: true if timeout occurred, false otherwise
-///
-/// # Note
-///
-/// On timeout, the process is killed and we wait up to 2 seconds for cleanup
-/// before returning.
-pub async fn wait_with_timeout(
-    child: &mut tokio::process::Child,
-    timeout_ms: u64,
-) -> io::Result<(Option<std::process::ExitStatus>, bool)> {
-    let mut timed_out = false;
-    let status = match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            timed_out = true;
-            let _ = child.kill().await;
-            let _ = time::timeout(Duration::from_millis(2_000), child.wait()).await;
-            None
-        }
-    };
-    Ok((status, timed_out))
-}
-
-/// Capture stdout and stderr from a process with byte limits.
-///
-/// This helper consolidates the repeated pattern of:
-/// 1. Spawning separate tasks to read stdout and stderr
-/// 2. Collecting both outputs in parallel to prevent deadlock
-/// 3. Converting to strings with ANSI code stripping
-///
-/// # Arguments
-///
-/// * `stdout` - The process's stdout pipe
-/// * `stderr` - The process's stderr pipe
-/// * `max_stdout_bytes` - Maximum bytes to capture from stdout
-/// * `max_stderr_bytes` - Maximum bytes to capture from stderr
-///
-/// # Returns
-///
-/// A CapturedOutput struct containing the captured text and truncation flags
-///
-/// # Note
-///
-/// Uses parallel tasks to prevent deadlock if the child fills pipe buffers.
-pub async fn capture_process_output(
-    stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-) -> io::Result<CapturedOutput> {
-    let stdout_task = tokio::spawn(async move {
-        read_to_end_limited(stdout, max_stdout_bytes).await
-    });
-    let stderr_task = tokio::spawn(async move {
-        read_to_end_limited(stderr, max_stderr_bytes).await
-    });
-
-    let (stdout_bytes, truncated_stdout) = stdout_task
-        .await
-        .unwrap_or_else(|_| Ok((Vec::new(), false)))
-        .unwrap_or((Vec::new(), false));
-    let (stderr_bytes, truncated_stderr) = stderr_task
-        .await
-        .unwrap_or_else(|_| Ok((Vec::new(), false)))
-        .unwrap_or((Vec::new(), false));
-
-    let stdout = strip_ansi_codes(&String::from_utf8_lossy(&stdout_bytes));
-    let stderr = strip_ansi_codes(&String::from_utf8_lossy(&stderr_bytes));
-
-    Ok(CapturedOutput {
-        stdout,
-        stderr,
-        truncated_stdout,
-        truncated_stderr,
-    })
-}
-
 /// Build a standard MCP-compatible process result response payload.
 ///
 /// This consolidates the repeated pattern of building JSON responses from
@@ -811,12 +701,11 @@ pub fn build_process_result_response(
         "stderr": result.stderr,
     });
 
-    // Add any extra fields provided by the caller
-    if let Some(extra) = extra_fields {
-        if let Some(obj) = payload.as_object_mut() {
-            for (key, value) in extra {
-                obj.insert(key.to_string(), value);
-            }
+    if let Some(extra) = extra_fields
+        && let Some(obj) = payload.as_object_mut()
+    {
+        for (key, value) in extra {
+            obj.insert(key.to_string(), value);
         }
     }
 

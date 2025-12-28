@@ -3,6 +3,7 @@ use crate::process_utils;
 use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
 use tracing::{error, info};
 
@@ -88,17 +89,9 @@ pub async fn run_script_tool(
         );
     }
 
-    let payload = json!({
-        "script": script_name,
-        "working_dir": work_dir,
-        "exit_code": result.exit_code,
-        "success": result.success,
-        "timed_out": result.timed_out,
-        "truncated_stdout": result.truncated_stdout,
-        "truncated_stderr": result.truncated_stderr,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    });
-
+    let mut extra = HashMap::new();
+    extra.insert("script", json!(script_name));
+    extra.insert("working_dir", json!(work_dir));
+    let payload = process_utils::build_process_result_response(&result, Some(extra));
     RpcResponse::ok_json_content(id, payload, !result.success)
 }
