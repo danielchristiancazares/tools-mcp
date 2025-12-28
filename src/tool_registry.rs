@@ -102,3 +102,91 @@ impl Default for ToolRegistry {
         Self::new()
     }
 }
+
+/// Macro to define an MCP tool with reduced boilerplate.
+///
+/// # Syntax
+///
+/// ```ignore
+/// define_mcp_tool! {
+///     /// Optional doc comment for the tool struct
+///     ToolName,
+///     name: "ToolName",
+///     aliases: ["alias1", "alias2"],  // optional, defaults to empty
+///     description: "Tool description",
+///     schema: { "type": "object", ... },
+///     handler: handler_function
+/// }
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// define_mcp_tool! {
+///     /// Reads file contents with optional line range.
+///     ReadTool,
+///     name: "Read",
+///     aliases: ["read", "ReadFile"],
+///     description: "Read file contents with optional line range",
+///     schema: {
+///         "type": "object",
+///         "properties": {
+///             "path": { "type": "string", "description": "Path to read" }
+///         },
+///         "required": ["path"]
+///     },
+///     handler: handle_read_file
+/// }
+/// ```
+#[macro_export]
+macro_rules! define_mcp_tool {
+    // With aliases
+    (
+        $(#[$meta:meta])*
+        $tool:ident,
+        name: $name:expr,
+        aliases: [$($alias:expr),* $(,)?],
+        description: $desc:expr,
+        schema: $schema:tt,
+        handler: $handler:expr
+    ) => {
+        $(#[$meta])*
+        pub struct $tool;
+
+        impl $crate::tool_registry::McpTool for $tool {
+            const NAME: &'static str = $name;
+            const ALIASES: &'static [&'static str] = &[$($alias),*];
+            const DESCRIPTION: &'static str = $desc;
+
+            fn input_schema() -> serde_json::Value {
+                serde_json::json!($schema)
+            }
+
+            fn execute(
+                id: Option<serde_json::Value>,
+                args: serde_json::Value,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = $crate::RpcResponse<'static>> + Send>> {
+                Box::pin($handler(id, args))
+            }
+        }
+    };
+    // Without aliases (convenience form)
+    (
+        $(#[$meta:meta])*
+        $tool:ident,
+        name: $name:expr,
+        description: $desc:expr,
+        schema: $schema:tt,
+        handler: $handler:expr
+    ) => {
+        $crate::define_mcp_tool! {
+            $(#[$meta])*
+            $tool,
+            name: $name,
+            aliases: [],
+            description: $desc,
+            schema: $schema,
+            handler: $handler
+        }
+    };
+}

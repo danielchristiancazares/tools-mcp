@@ -1,13 +1,9 @@
-use crate::tool_registry::McpTool;
+use crate::define_mcp_tool;
 use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use tree_sitter::{Node, Parser};
-
-pub struct OutlineTool;
 
 #[derive(Deserialize)]
 struct OutlineRequest {
@@ -450,33 +446,25 @@ fn find_preceding_comment<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str
     None
 }
 
-impl McpTool for OutlineTool {
-    const NAME: &'static str = "Outline";
-    const ALIASES: &'static [&'static str] = &["outline"];
-    const DESCRIPTION: &'static str = "Extract structural outline from C++ source code";
-
-    fn input_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the C++ file to outline"
-                },
-                "include_private": {
-                    "type": "boolean",
-                    "description": "Include private members in output"
-                }
+define_mcp_tool! {
+    OutlineTool,
+    name: "Outline",
+    aliases: ["outline"],
+    description: "Extract structural outline from C++ source code",
+    schema: {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the C++ file to outline"
             },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        id: Option<Value>,
-        args: Value,
-    ) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>> {
-        Box::pin(handle_outline(id, args))
-    }
+            "include_private": {
+                "type": "boolean",
+                "description": "Include private members in output"
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    handler: handle_outline
 }

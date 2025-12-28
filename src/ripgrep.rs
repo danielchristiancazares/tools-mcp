@@ -107,8 +107,8 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         return resp;
     }
 
-    let max_results = req.max_results.unwrap_or(200).clamp(1, 10_000);
-    let timeout_ms = req.timeout_ms.unwrap_or(20_000).clamp(100, 300_000);
+    let max_results = validation::clamp_limit(req.max_results, 200, 1, 10_000);
+    let timeout_ms = validation::clamp_timeout(req.timeout_ms, 20_000, 100, 300_000);
     let fuzzy_distance = req.fuzzy.map(|f| f.clamp(1, 4));
     let use_ugrep = fuzzy_distance.is_some();
 

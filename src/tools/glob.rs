@@ -1,16 +1,12 @@
 use crate::config::{DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT};
-use crate::tool_registry::McpTool;
+use crate::define_mcp_tool;
 use crate::validation;
 use crate::RpcResponse;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
-
-pub struct GlobTool;
 
 #[derive(Deserialize)]
 struct GlobRequest {
@@ -35,10 +31,7 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
 
     let base_path = req.path.as_deref().unwrap_or(".");
     let include_hidden = req.hidden.unwrap_or(false);
-    let limit = req
-        .limit
-        .unwrap_or(DEFAULT_GLOB_LIMIT)
-        .clamp(1, MAX_GLOB_LIMIT);
+    let limit = validation::clamp_limit(req.limit, DEFAULT_GLOB_LIMIT, 1, MAX_GLOB_LIMIT);
 
     let base = Path::new(base_path);
     if !base.exists() {
@@ -129,41 +122,33 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     RpcResponse::ok(id, payload)
 }
 
-impl McpTool for GlobTool {
-    const NAME: &'static str = "Glob";
-    const ALIASES: &'static [&'static str] = &["glob"];
-    const DESCRIPTION: &'static str = "Find files matching a glob pattern";
-
-    fn input_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Glob pattern (e.g., '**/*.rs', 'src/*.ts')"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Base directory to search from"
-                },
-                "hidden": {
-                    "type": "boolean",
-                    "description": "Include hidden files"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of matches to return"
-                }
+define_mcp_tool! {
+    GlobTool,
+    name: "Glob",
+    aliases: ["glob"],
+    description: "Find files matching a glob pattern",
+    schema: {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern (e.g., '**/*.rs', 'src/*.ts')"
             },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        id: Option<Value>,
-        args: Value,
-    ) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>> {
-        Box::pin(handle_glob(id, args))
-    }
+            "path": {
+                "type": "string",
+                "description": "Base directory to search from"
+            },
+            "hidden": {
+                "type": "boolean",
+                "description": "Include hidden files"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of matches to return"
+            }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    },
+    handler: handle_glob
 }

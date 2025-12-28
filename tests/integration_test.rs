@@ -187,7 +187,7 @@ fn test_tools_list() {
     assert_eq!(response["id"], 3);
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17); // ping, WebFetch, Search, CodeQuery, Read, Edit, GitStatus, GitDiff, GitRestore, GitAdd, GitCommit, Write, Delete, Glob, Build, Test, Outline
+    assert_eq!(tools.len(), 18); // ping, WebFetch, Search, CodeQuery, Read, Edit, GitStatus, GitDiff, GitRestore, GitAdd, GitCommit, Write, Delete, Glob, Build, Test, Outline, Pwsh
 
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();

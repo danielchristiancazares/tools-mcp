@@ -1,13 +1,9 @@
-use crate::tool_registry::McpTool;
+use crate::define_mcp_tool;
 use crate::validation;
 use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
-
-pub struct DeleteTool;
 
 #[derive(Deserialize)]
 struct DeleteRequest {
@@ -51,29 +47,21 @@ async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     )
 }
 
-impl McpTool for DeleteTool {
-    const NAME: &'static str = "Delete";
-    const ALIASES: &'static [&'static str] = &["delete"];
-    const DESCRIPTION: &'static str = "Delete a file";
-
-    fn input_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to delete"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        id: Option<Value>,
-        args: Value,
-    ) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>> {
-        Box::pin(handle_delete(id, args))
-    }
+define_mcp_tool! {
+    DeleteTool,
+    name: "Delete",
+    aliases: ["delete"],
+    description: "Delete a file",
+    schema: {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to delete"
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    handler: handle_delete
 }

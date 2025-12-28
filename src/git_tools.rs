@@ -457,10 +457,7 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
-    let max_bytes = req
-        .max_bytes
-        .unwrap_or(DEFAULT_GIT_STDOUT_BYTES)
-        .clamp(1, MAX_OUTPUT_BYTES);
+    let max_bytes = validation::clamp_bytes(req.max_bytes, DEFAULT_GIT_STDOUT_BYTES, MAX_OUTPUT_BYTES);
 
     let mut cmd_args: Vec<String> = vec!["diff".into()];
 

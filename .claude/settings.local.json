@@ -18,7 +18,9 @@
       "mcp__tools-mcp__Read",
       "mcp__tools-mcp__Edit",
       "mcp__tools-mcp__WebFetch",
-      "mcp__tools-mcp__Glob"
+      "mcp__tools-mcp__Glob",
+      "mcp__tools-mcp__Search",
+      "mcp__tools-mcp__Delete"
     ],
     "deny": [],
     "ask": []

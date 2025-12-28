@@ -1,14 +1,10 @@
-use crate::tool_registry::McpTool;
+use crate::define_mcp_tool;
 use crate::validation;
 use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use tokio::io::AsyncWriteExt;
-
-pub struct WriteTool;
 
 #[derive(Deserialize)]
 struct WriteRequest {
@@ -78,33 +74,25 @@ async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     )
 }
 
-impl McpTool for WriteTool {
-    const NAME: &'static str = "Write";
-    const ALIASES: &'static [&'static str] = &["write"];
-    const DESCRIPTION: &'static str = "Write content to a new file, creating directories as needed";
-
-    fn input_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
+define_mcp_tool! {
+    WriteTool,
+    name: "Write",
+    aliases: ["write"],
+    description: "Write content to a new file, creating directories as needed",
+    schema: {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to write"
             },
-            "required": ["path", "content"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        id: Option<Value>,
-        args: Value,
-    ) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>> {
-        Box::pin(handle_write(id, args))
-    }
+            "content": {
+                "type": "string",
+                "description": "Content to write to the file"
+            }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+    },
+    handler: handle_write
 }
