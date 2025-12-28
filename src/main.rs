@@ -152,6 +152,7 @@ mod git_utils;
 mod process_utils;
 mod read_file;
 mod ripgrep;
+mod rpc_helpers;
 mod script_runner;
 mod smart_file_edit;
 mod tool_registry;
