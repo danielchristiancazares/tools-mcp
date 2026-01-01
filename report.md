@@ -2,7 +2,7 @@
 
 ## Scope
 
-Comprehensive codebase review of `tools-mcp`, focusing on cleanliness, architecture, and minimal refactoring where clearly beneficial.
+Comprehensive codebase review of `tools`, focusing on cleanliness, architecture, and minimal refactoring where clearly beneficial.
 
 ## Overall Assessment
 
@@ -51,7 +51,7 @@ Comprehensive codebase review of `tools-mcp`, focusing on cleanliness, architect
 ## Assumptions & Open Questions
 
 - Vector stores are generally scoped per repository so waiting on all files is acceptable. If not, we should adjust `wait_for_vector_file_ready` to track specific file IDs.
-- WebFetch cache (`/tmp/tools-mcp-webfetch`) persists indefinitely. Introduce TTL or pruning only if disk usage becomes a concern.
+- WebFetch cache (`/tmp/tools-webfetch`) persists indefinitely. Introduce TTL or pruning only if disk usage becomes a concern.
 - MCP responses continue to embed JSON as strings for compatibility; no change made without guidance.
 
 ## Future Enhancements (Optional)

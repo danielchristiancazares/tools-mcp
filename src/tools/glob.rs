@@ -1,12 +1,77 @@
+use crate::RpcResponse;
 use crate::config::{DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT};
 use crate::define_mcp_tool;
 use crate::validation;
-use crate::RpcResponse;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
+
+/// Expands brace patterns like `{a,b,c}` into multiple alternatives.
+/// Handles nested braces and multiple brace groups.
+/// Example: `**/*.{cpp,h}` -> `["**/*.cpp", "**/*.h"]`
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let mut results = vec![pattern.to_string()];
+
+    loop {
+        let mut expanded = false;
+        let mut new_results = Vec::new();
+
+        for pat in &results {
+            if let Some(expansion) = expand_single_brace(pat) {
+                new_results.extend(expansion);
+                expanded = true;
+            } else {
+                new_results.push(pat.clone());
+            }
+        }
+
+        results = new_results;
+        if !expanded {
+            break;
+        }
+    }
+
+    results
+}
+
+/// Expands the first (innermost) brace group found in the pattern.
+/// Returns None if no braces found.
+fn expand_single_brace(pattern: &str) -> Option<Vec<String>> {
+    // Find innermost brace group (one without nested braces)
+    let bytes = pattern.as_bytes();
+    let mut brace_start = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'{' {
+            brace_start = Some(i);
+        } else if b == b'}' {
+            if let Some(start) = brace_start {
+                // Found a complete brace group from start to i
+                let prefix = &pattern[..start];
+                let suffix = &pattern[i + 1..];
+                let alternatives = &pattern[start + 1..i];
+
+                // Split by comma (handling escaped commas would be complex, skip for now)
+                let parts: Vec<&str> = alternatives.split(',').collect();
+
+                if parts.len() > 1 {
+                    return Some(
+                        parts
+                            .into_iter()
+                            .map(|p| format!("{prefix}{p}{suffix}"))
+                            .collect(),
+                    );
+                }
+                // Single item in braces, just remove the braces
+                return Some(vec![format!("{prefix}{}{suffix}", &pattern[start + 1..i])]);
+            }
+        }
+    }
+
+    None
+}
 
 #[derive(Deserialize)]
 struct GlobRequest {
@@ -44,9 +109,14 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         );
     }
 
-    // Parse the glob pattern
-    let pattern = match Pattern::new(&req.pattern) {
-        Ok(p) => p,
+    // Expand brace patterns and parse each
+    let expanded = expand_braces(&req.pattern);
+    let patterns: Vec<Pattern> = match expanded
+        .iter()
+        .map(|p| Pattern::new(p))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(ps) => ps,
         Err(err) => {
             return RpcResponse::err(id, format!("invalid glob pattern: {err}"));
         }
@@ -84,7 +154,11 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         let path = entry.path();
         let rel_path = path.strip_prefix(base).unwrap_or(path);
 
-        if !pattern.matches_path_with(rel_path, match_options) {
+        // Check if path matches any of the expanded patterns
+        let matches = patterns
+            .iter()
+            .any(|p| p.matches_path_with(rel_path, match_options));
+        if !matches {
             continue;
         }
 
@@ -114,10 +188,9 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         "files": files
     });
 
-    if truncated
-        && let Some(obj) = payload.as_object_mut() {
-            obj.insert("truncated".to_string(), Value::Bool(true));
-        }
+    if truncated && let Some(obj) = payload.as_object_mut() {
+        obj.insert("truncated".to_string(), Value::Bool(true));
+    }
 
     RpcResponse::ok(id, payload)
 }
@@ -132,7 +205,7 @@ define_mcp_tool! {
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "Glob pattern (e.g., '**/*.rs', 'src/*.ts')"
+                "description": "Glob pattern with brace expansion (e.g., '**/*.rs', 'src/*.{ts,tsx}', '**/*.{cpp,h}')"
             },
             "path": {
                 "type": "string",

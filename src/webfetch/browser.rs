@@ -43,7 +43,7 @@
 //! - Video/audio autoplay is blocked
 //! - Background networking is disabled
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
 use chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired;
@@ -179,27 +179,26 @@ impl BrowserPool {
         // ====================================================================
         // Phase 2: Handle restart if needed
         // ====================================================================
-        if needs_restart
-            && let Some(mut instance) = guard.take() {
-                // Try to get exclusive ownership for graceful close.
-                // Arc::get_mut succeeds only if this is the sole reference.
-                match Arc::get_mut(&mut instance.browser) {
-                    Some(browser) => {
-                        // We have exclusive access - close cleanly via CDP
-                        if let Err(e) = browser.close().await {
-                            warn!("Error closing browser during restart: {}", e);
-                        }
-                    }
-                    None => {
-                        // Other references exist (concurrent renders in progress).
-                        // Don't block - the old browser will be dropped when those complete.
-                        // This is safe: Chrome process cleanup happens on Browser drop.
-                        warn!(
-                            "Cannot gracefully close browser during restart: multiple references exist"
-                        );
+        if needs_restart && let Some(mut instance) = guard.take() {
+            // Try to get exclusive ownership for graceful close.
+            // Arc::get_mut succeeds only if this is the sole reference.
+            match Arc::get_mut(&mut instance.browser) {
+                Some(browser) => {
+                    // We have exclusive access - close cleanly via CDP
+                    if let Err(e) = browser.close().await {
+                        warn!("Error closing browser during restart: {}", e);
                     }
                 }
+                None => {
+                    // Other references exist (concurrent renders in progress).
+                    // Don't block - the old browser will be dropped when those complete.
+                    // This is safe: Chrome process cleanup happens on Browser drop.
+                    warn!(
+                        "Cannot gracefully close browser during restart: multiple references exist"
+                    );
+                }
             }
+        }
 
         // ====================================================================
         // Phase 3: Spawn new browser if needed

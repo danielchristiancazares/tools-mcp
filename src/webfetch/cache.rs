@@ -7,8 +7,8 @@
 //! ## Cache Location
 //!
 //! Cache files are stored in the system temp directory:
-//! - **Unix**: `/tmp/tools-mcp-webfetch/`
-//! - **Windows**: `%TEMP%\tools-mcp-webfetch\`
+//! - **Unix**: `/tmp/tools-webfetch/`
+//! - **Windows**: `%TEMP%\tools-webfetch\`
 //!
 //! ## Cache Key Strategy
 //!
@@ -26,7 +26,7 @@
 //!
 //! Entries are stored as JSON files containing:
 //! - `content_type`: Original Content-Type header
-//! - `body`: Raw response bytes (base64 in JSON)
+//! - `body`: Raw response bytes (base64 string in JSON)
 //! - `fetched_at`: ISO 8601 timestamp
 //!
 //! ## Limitations
@@ -36,8 +36,9 @@
 //! - No cache invalidation API (delete files manually to clear)
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
@@ -53,7 +54,7 @@ use std::path::PathBuf;
 /// and to ensure the cache is cleaned up on system restart (on some systems).
 fn cache_root() -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push("tools-mcp-webfetch");
+    dir.push("tools-webfetch");
     dir
 }
 
@@ -103,11 +104,71 @@ pub struct CachedFetch {
 
     /// Raw response body bytes.
     /// For browser-rendered content, this is the final HTML after JS execution.
+    ///
+    /// Serialized as base64 for compact JSON, but deserialization also accepts the
+    /// legacy JSON `Vec<u8>` representation (an array of numbers) for backward
+    /// compatibility with existing cache files.
+    #[serde(
+        serialize_with = "serialize_body_base64",
+        deserialize_with = "deserialize_body_base64_or_array"
+    )]
     pub body: Vec<u8>,
 
     /// Timestamp when the content was originally fetched.
     /// Preserved in response to indicate content freshness.
     pub fetched_at: DateTime<Utc>,
+}
+
+fn serialize_body_base64<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let encoded = general_purpose::STANDARD.encode(bytes);
+    serializer.serialize_str(&encoded)
+}
+
+fn deserialize_body_base64_or_array<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BodyVisitor;
+
+    impl<'de> de::Visitor<'de> for BodyVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a base64 string or an array of bytes")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            general_purpose::STANDARD
+                .decode(v)
+                .map_err(|e| de::Error::custom(format!("invalid base64 body: {e}")))
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&v)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(BodyVisitor)
 }
 
 // ============================================================================
@@ -160,4 +221,64 @@ pub fn write_cache(url: &str, data: &CachedFetch) -> Result<()> {
     let bytes = serde_json::to_vec(data).context("serialize cache entry")?;
     file.write_all(&bytes).context("write cache bytes")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone as _;
+
+    #[test]
+    fn cached_fetch_serializes_body_as_base64_string() {
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let entry = CachedFetch {
+            content_type: Some("text/plain".to_string()),
+            body: vec![0, 1, 2, 3],
+            fetched_at,
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&entry).expect("serialize");
+        let body = v.get("body").expect("missing body");
+        assert!(body.is_string(), "body should be base64 string");
+        assert_eq!(body.as_str().unwrap(), "AAECAw==");
+    }
+
+    #[test]
+    fn cached_fetch_deserializes_legacy_body_array() {
+        let fetched_at = "2025-01-01T00:00:00Z";
+        let v = serde_json::json!({
+            "content_type": "text/plain",
+            "body": [0, 1, 2, 3],
+            "fetched_at": fetched_at
+        });
+
+        let entry: CachedFetch = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(entry.body, vec![0, 1, 2, 3]);
+        assert_eq!(entry.content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn cache_write_then_read_roundtrip() {
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let key = format!("test://cache-roundtrip-{}_http", uuid::Uuid::new_v4());
+        let entry = CachedFetch {
+            content_type: Some("text/html".to_string()),
+            body: b"<html><body>ok</body></html>".to_vec(),
+            fetched_at,
+        };
+
+        // Ensure clean slate.
+        let path = cache_path_for(&key).expect("cache path");
+        let _ = fs::remove_file(&path);
+
+        write_cache(&key, &entry).expect("write cache");
+        let loaded = read_cache(&key)
+            .expect("read cache")
+            .expect("expected cache hit");
+        assert_eq!(loaded.content_type, entry.content_type);
+        assert_eq!(loaded.body, entry.body);
+
+        // Cleanup so temp dir doesn't grow unbounded during test runs.
+        let _ = fs::remove_file(&path);
+    }
 }

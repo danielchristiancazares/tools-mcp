@@ -1,10 +1,11 @@
 [package]
-name = "tools-mcp"
+name = "tools"
 version = "1.0.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chromiumoxide = "0.7"
 futures = "0.3"
@@ -36,5 +37,5 @@ name = "file_search_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "tools-mcp"
+name = "tools"
 path = "src/main.rs"

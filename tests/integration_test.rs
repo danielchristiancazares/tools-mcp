@@ -235,7 +235,7 @@ fn test_ping_tool_call() {
 }
 
 #[test]
-fn test_read_file_with_line_numbers() {
+fn test_read_file_line_numbers_by_default() {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 40,
@@ -243,10 +243,9 @@ fn test_read_file_with_line_numbers() {
         "params": {
             "name": "ReadFile",
             "arguments": {
-                "path": "src/read_file.rs",
+                "path": "src/tools/handlers/read_file.rs",
                 "start_line": 1,
-                "end_line": 1,
-                "show_line_numbers": true
+                "end_line": 1
             }
         }
     });
@@ -262,10 +261,10 @@ fn test_read_file_with_line_numbers() {
         .expect("missing ReadFile content text");
     assert!(
         text.starts_with("1\t"),
-        "expected line number prefix when show_line_numbers is true"
+        "expected line number prefix by default"
     );
     assert!(
-        text.contains("use crate"),
+        text.contains("File reading handler implementation."),
         "expected ReadFile source content"
     );
     assert_eq!(response["result"]["start_line"], 1);
@@ -274,7 +273,7 @@ fn test_read_file_with_line_numbers() {
 }
 
 #[test]
-fn test_read_file_no_line_numbers_by_default() {
+fn test_read_file_no_line_numbers_when_disabled() {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 41,
@@ -282,9 +281,10 @@ fn test_read_file_no_line_numbers_by_default() {
         "params": {
             "name": "ReadFile",
             "arguments": {
-                "path": "src/read_file.rs",
+                "path": "src/tools/handlers/read_file.rs",
                 "start_line": 1,
-                "end_line": 1
+                "end_line": 1,
+                "show_line_numbers": false
             }
         }
     });
@@ -300,10 +300,10 @@ fn test_read_file_no_line_numbers_by_default() {
         .expect("missing ReadFile content text");
     assert!(
         !text.starts_with("1\t"),
-        "should not have line number prefix by default"
+        "should not have line number prefix when disabled"
     );
     assert!(
-        text.starts_with("use crate"),
+        text.starts_with("//! File reading handler implementation."),
         "expected raw file content without line numbers"
     );
     assert_eq!(response["result"]["start_line"], 1);
@@ -340,7 +340,7 @@ fn test_ripgrep_tool_call_if_rg_installed() {
             "name": "RipGrep",
             "arguments": {
                 "pattern": "handle_read_file",
-                "path": "src/read_file.rs",
+                "path": "src/tools/handlers/read_file.rs",
                 "fixed_strings": true,
                 "max_results": 20,
                 "timeout_ms": 20000
@@ -354,7 +354,10 @@ fn test_ripgrep_tool_call_if_rg_installed() {
     assert_eq!(response["id"], 41);
     assert_eq!(response["result"]["isError"], false);
     assert_eq!(response["result"]["pattern"], "handle_read_file");
-    assert_eq!(response["result"]["path"], "src/read_file.rs");
+    assert_eq!(
+        response["result"]["path"],
+        "src/tools/handlers/read_file.rs"
+    );
     assert!(response["result"]["count"].as_u64().unwrap_or(0) >= 1);
     assert!(response["result"]["matches"].is_array());
 }

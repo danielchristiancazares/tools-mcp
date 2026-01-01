@@ -184,6 +184,21 @@ pub async fn write_mcp_response<W>(writer: &mut W, resp: &RpcResponse<'_>) -> Re
 where
     W: AsyncWrite + Unpin,
 {
+    write_mcp_response_with_mode(writer, resp, should_skip_headers()).await
+}
+
+/// Writes an MCP response to the output stream with an explicit framing mode.
+///
+/// This is primarily used for deterministic tests; production code should prefer
+/// [`write_mcp_response`], which consults `MCP_SKIP_HEADERS`.
+pub async fn write_mcp_response_with_mode<W>(
+    writer: &mut W,
+    resp: &RpcResponse<'_>,
+    skip_headers: bool,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut payload = serde_json::to_vec(resp).context("serialize response")?;
 
     // Ensure payload ends with newline for clean line-based parsing
@@ -194,7 +209,7 @@ where
     let payload_len = payload.len();
 
     // Write Content-Length header unless in raw JSON mode
-    if !should_skip_headers() {
+    if !skip_headers {
         let header = format!("Content-Length: {}\r\n\r\n", payload_len);
         writer
             .write_all(header.as_bytes())
@@ -210,4 +225,118 @@ where
     // Flush immediately to ensure client receives the response
     writer.flush().await.context("flush stdout")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, BufReader};
+
+    #[tokio::test]
+    async fn read_mcp_message_reads_raw_json_line() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let mut reader = BufReader::new(&input[..]);
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg, r#"{"jsonrpc":"2.0","id":1}"#);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_reads_content_length_body_and_consumes_trailing_newline() {
+        let input = b"Content-Length: 5\r\n\r\nhello\r\n{\"ok\":true}\n";
+        let mut reader = BufReader::new(&input[..]);
+
+        let msg1 = read_mcp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg1, "hello");
+
+        let msg2 = read_mcp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg2, r#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_skips_leading_blank_lines_before_headers() {
+        let input = b"\n\nContent-Length: 2\n\nhi\n";
+        let mut reader = BufReader::new(&input[..]);
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg, "hi");
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_errors_on_invalid_content_length() {
+        let input = b"Content-Length: nope\r\n\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected invalid Content-Length to error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_errors_on_invalid_utf8_body() {
+        let input = [b"Content-Length: 2\r\n\r\n".as_slice(), &[0xFFu8, 0xFFu8]].concat();
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected invalid UTF-8 body to error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn write_mcp_response_with_headers_includes_correct_content_length() {
+        let resp = RpcResponse::ok(Some(json!(1)), json!({"ok": true}));
+        let (mut r, mut w) = tokio::io::duplex(4096);
+
+        write_mcp_response_with_mode(&mut w, &resp, false)
+            .await
+            .expect("write failed");
+        w.shutdown().await.expect("shutdown failed");
+
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.expect("read failed");
+
+        let out_str = String::from_utf8(out).expect("output not utf-8");
+        let (header, body) = out_str
+            .split_once("\r\n\r\n")
+            .expect("missing header separator");
+        assert!(header.starts_with("Content-Length: "));
+        let len: usize = header["Content-Length: ".len()..]
+            .trim()
+            .parse()
+            .expect("invalid length");
+
+        assert_eq!(body.as_bytes().len(), len);
+        assert!(body.ends_with('\n'), "payload should end with newline");
+
+        // Validate JSON parses (strip trailing newline).
+        let json_body = body.trim_end_matches('\n');
+        let v: serde_json::Value = serde_json::from_str(json_body).expect("invalid json");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["isError"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn write_mcp_response_without_headers_is_raw_json_line() {
+        let resp = RpcResponse::ok(Some(json!(2)), json!({"ok": true}));
+        let (mut r, mut w) = tokio::io::duplex(4096);
+
+        write_mcp_response_with_mode(&mut w, &resp, true)
+            .await
+            .expect("write failed");
+        w.shutdown().await.expect("shutdown failed");
+
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.expect("read failed");
+        let out_str = String::from_utf8(out).expect("output not utf-8");
+        assert!(
+            !out_str.starts_with("Content-Length:"),
+            "raw mode should not include headers"
+        );
+        assert!(out_str.ends_with('\n'));
+
+        let v: serde_json::Value =
+            serde_json::from_str(out_str.trim_end_matches('\n')).expect("invalid json");
+        assert_eq!(v["id"], 2);
+        assert!(v.get("error").is_none() || v["error"].is_null());
+    }
 }

@@ -201,8 +201,6 @@
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, StatusCode, multipart};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
 
@@ -215,633 +213,24 @@ pub use openai::file_ext::{
     is_codequery_indexable_ext, is_codequery_indexable_filename, is_codequery_indexable_path,
 };
 
+// Re-export types from openai module (these are the canonical definitions)
+pub use openai::types::{
+    ApiConfig, CodeQueryOptions, ContentItem, FileCounts, FileInfo, FileObj, FileSearchOutput,
+    MessageOutput, OutputItem, ResponseObject, VectorStore, VectorStoreDetails, VectorStoreEntry,
+    VectorStoreFileItem, VectorStoreFilesList, VectorStoreList,
+};
+
+// Re-export hash utilities
+use openai::hash::looks_binary_by_content;
+pub use openai::hash::{compute_bytes_hash, compute_file_hash};
+
+// Internal types used only within this crate
+use openai::types::{ResponsesCreate, VectorStoreCreate, VectorStoreFileCreate};
+
 /// Base URL for all OpenAI API requests.
 ///
 /// All API endpoints are constructed by appending paths to this base URL.
 pub const BASE_URL: &str = "https://api.openai.com/v1";
-
-/// Represents a complete response from OpenAI's Responses API.
-///
-/// This struct captures the full response payload from a Responses API call,
-/// including the generated output, status information, and optional error/usage data.
-///
-/// # Structure
-///
-/// The response contains one or more [`OutputItem`] entries in the `output` vector,
-/// typically including:
-/// - A [`OutputItem::FileSearchCall`] when file search tools are used
-/// - A [`OutputItem::Message`] containing the assistant's response
-///
-/// # Example
-///
-/// ```ignore
-/// let response: ResponseObject = serde_json::from_value(api_response)?;
-/// let text = response.extract_text(true);  // include search results
-/// println!("Response: {}", text);
-/// ```
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ResponseObject {
-    /// Unique identifier for this response (e.g., "resp_abc123").
-    pub id: String,
-    /// Object type, always "response" for Responses API.
-    pub object: String,
-    /// Unix timestamp (seconds) when the response was created.
-    pub created_at: i64,
-    /// Current status: "completed", "failed", "in_progress", etc.
-    pub status: String,
-    /// Model used to generate the response (e.g., "gpt-4o").
-    pub model: String,
-    /// List of output items produced by the model.
-    pub output: Vec<OutputItem>,
-    /// Error details if the response failed (typically a JSON object with "code" and "message").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<serde_json::Value>,
-    /// Token usage statistics (prompt_tokens, completion_tokens, total_tokens).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<serde_json::Value>,
-}
-
-/// An individual output item from the Responses API.
-///
-/// The Responses API can produce multiple output items per request, discriminated by the `type`
-/// field. This enum deserializes each known type into a strongly-typed variant.
-///
-/// # Variants
-///
-/// - `Message`: The assistant's generated text response
-/// - `FileSearchCall`: Results from the file_search tool invocation
-/// - `Other`: Catch-all for unknown or unsupported output types
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum OutputItem {
-    /// A message output containing the assistant's response text.
-    #[serde(rename = "message")]
-    Message(MessageOutput),
-    /// A file search tool call with query and results.
-    #[serde(rename = "file_search_call")]
-    FileSearchCall(FileSearchOutput),
-    /// Catch-all variant for unrecognized output types.
-    ///
-    /// This ensures forward compatibility when OpenAI adds new output types.
-    #[serde(other)]
-    Other,
-}
-
-/// The assistant's message output containing generated text.
-///
-/// This represents the main response from the model, including any text content
-/// and optional annotations (citations, file references, etc.).
-#[derive(Debug, Deserialize, Serialize)]
-pub struct MessageOutput {
-    /// Unique identifier for this message (e.g., "msg_abc123").
-    pub id: String,
-    /// The role that produced this message, typically "assistant".
-    pub role: String,
-    /// Processing status: "completed", "in_progress", etc.
-    pub status: String,
-    /// List of content blocks in this message.
-    ///
-    /// Most responses contain a single text content block, but may include
-    /// multiple blocks for complex outputs.
-    #[serde(default)]
-    pub content: Vec<ContentItem>,
-}
-
-/// Output from a file_search tool invocation.
-///
-/// When the Responses API uses the file_search tool, this struct captures
-/// the search queries executed and the matching results from the vector store.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct FileSearchOutput {
-    /// Unique identifier for this tool call (e.g., "fs_abc123").
-    pub id: String,
-    /// Processing status: "completed", "in_progress", etc.
-    pub status: String,
-    /// The search queries generated and executed by the model.
-    ///
-    /// The model may reformulate the user's question into multiple
-    /// search queries for better recall.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queries: Option<Vec<String>>,
-    /// Search results from the vector store.
-    ///
-    /// Each result is a JSON object containing:
-    /// - `filename`: The source file name
-    /// - `score`: Relevance score (0.0 to 1.0)
-    /// - `text`: The matching text snippet
-    ///
-    /// Only populated when `include: ["file_search_call.results"]` is specified.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub results: Option<Vec<serde_json::Value>>,
-}
-
-/// A content block within a message output.
-///
-/// Messages can contain multiple content blocks of different types.
-/// Currently, the primary type is "output_text" for text content.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ContentItem {
-    /// The type of content: "output_text", "refusal", etc.
-    #[serde(rename = "type")]
-    pub content_type: String,
-    /// The text content (present for "output_text" type).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// Annotations attached to this content (citations, file references).
-    ///
-    /// Each annotation is a JSON object with type-specific fields.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<Vec<serde_json::Value>>,
-}
-
-impl ResponseObject {
-    /// Extracts the main text content from the response, optionally including search results.
-    ///
-    /// This method navigates the response structure to find the assistant's message content
-    /// and formats it for display. When `include_results` is true, it also appends a
-    /// formatted summary of file search results.
-    ///
-    /// # Arguments
-    ///
-    /// * `include_results` - If true, appends formatted file search results to the output
-    ///
-    /// # Returns
-    ///
-    /// The extracted text content. Returns `"No response text found"` if the response
-    /// contains no message output or the message has no text content.
-    ///
-    /// # Output Format
-    ///
-    /// When `include_results` is true and search results are present:
-    ///
-    /// ```text
-    /// [Main response text]
-    ///
-    /// ---
-    /// ### Search Results:
-    ///
-    /// 1. **filename.rs** (score: 0.95)
-    ///    First two lines of matching text...
-    /// 2. **another.rs** (score: 0.87)
-    ///    Matching snippet preview...
-    /// ```
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let response: ResponseObject = serde_json::from_value(api_response)?;
-    ///
-    /// // Get just the answer
-    /// let answer = response.extract_text(false);
-    ///
-    /// // Get answer with search results appended
-    /// let full_output = response.extract_text(true);
-    /// ```
-    pub fn extract_text(&self, include_results: bool) -> String {
-        // Find the message output
-        let message = self.output.iter().find_map(|item| {
-            if let OutputItem::Message(msg) = item {
-                Some(msg)
-            } else {
-                None
-            }
-        });
-
-        if let Some(msg) = message
-            && let Some(content) = msg.content.first()
-            && let Some(text) = &content.text
-        {
-            let mut result = text.clone();
-
-            // Optionally append search results.
-            if include_results
-                && let Some(file_search) = self.output.iter().find_map(|item| match item {
-                    OutputItem::FileSearchCall(fs) => Some(fs),
-                    _ => None,
-                })
-                && let Some(results) = &file_search.results
-            {
-                result.push_str("\n\n---\n### Search Results:\n");
-                for (i, r) in results.iter().take(5).enumerate() {
-                    if let (Some(filename), Some(score)) = (
-                        r.get("filename").and_then(|v| v.as_str()),
-                        r.get("score").and_then(|v| v.as_f64()),
-                    ) {
-                        result.push_str(&format!(
-                            "\n{}. **{}** (score: {:.2})",
-                            i + 1,
-                            filename,
-                            score
-                        ));
-                        if let Some(text_snippet) = r.get("text").and_then(|v| v.as_str()) {
-                            let preview = text_snippet
-                                .lines()
-                                .take(2)
-                                .collect::<Vec<_>>()
-                                .join("\n   ");
-                            if !preview.is_empty() {
-                                result.push_str(&format!("\n   {}", preview.trim()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            return result;
-        }
-
-        // Fallback to empty string if no text found
-        String::from("No response text found")
-    }
-}
-
-/// Configuration for OpenAI API authentication and defaults.
-///
-/// This struct holds the credentials and default settings needed to make API requests.
-/// It is designed to be cloned and shared across multiple API calls.
-///
-/// # Security Note
-///
-/// The API key is stored in plain text. Ensure this struct is not logged or serialized
-/// in ways that could expose the key. Load the key from environment variables or a
-/// secure secrets manager.
-///
-/// # Example
-///
-/// ```
-/// use file_search_core::ApiConfig;
-///
-/// // Create from environment variable
-/// let config = ApiConfig::new(
-///     std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY required"),
-///     "gpt-4o",
-/// );
-/// ```
-#[derive(Clone)]
-pub struct ApiConfig {
-    /// OpenAI API key for authentication (Bearer token).
-    ///
-    /// Obtain from <https://platform.openai.com/api-keys>.
-    pub api_key: String,
-    /// Default model to use when not explicitly specified.
-    ///
-    /// Common values: "gpt-4o", "gpt-4o-mini", "gpt-4-turbo".
-    pub default_model: String,
-}
-
-impl ApiConfig {
-    /// Creates a new API configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `api_key` - OpenAI API key (can be any type that implements `Into<String>`)
-    /// * `default_model` - Default model identifier for API calls
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use file_search_core::ApiConfig;
-    ///
-    /// let config = ApiConfig::new("sk-...", "gpt-4o");
-    /// assert_eq!(config.default_model, "gpt-4o");
-    /// ```
-    pub fn new(api_key: impl Into<String>, default_model: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            default_model: default_model.into(),
-        }
-    }
-}
-
-/// Response from OpenAI's file upload endpoint.
-///
-/// Returned when a file is successfully uploaded to OpenAI's storage.
-/// The `id` can be used to attach the file to vector stores or assistants.
-#[derive(Deserialize, Debug)]
-pub struct FileObj {
-    /// Unique file identifier (e.g., "file-abc123").
-    ///
-    /// Use this ID with [`add_file_to_vector_store`] to index the file.
-    pub id: String,
-}
-
-/// Response from vector store creation.
-///
-/// Returned when a new vector store is successfully created.
-#[derive(Deserialize, Debug)]
-pub struct VectorStore {
-    /// Unique vector store identifier (e.g., "vs_abc123").
-    pub id: String,
-}
-
-/// Request payload for creating a new vector store.
-#[derive(Serialize, Debug)]
-struct VectorStoreCreate {
-    /// Human-readable name for the vector store.
-    name: String,
-}
-
-/// Request payload for adding a file to a vector store.
-#[derive(Serialize, Debug)]
-struct VectorStoreFileCreate {
-    /// The file ID to attach (from [`upload_file`]).
-    file_id: String,
-    /// Optional metadata attributes stored with the file.
-    ///
-    /// Common attributes:
-    /// - `path`: Original file path for reindexing
-    /// - `hash`: SHA256 hash for change detection
-    /// - `indexed_at`: ISO 8601 timestamp
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attributes: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Optional chunking configuration for the file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chunking_strategy: Option<serde_json::Value>,
-}
-
-/// Detailed vector store information including file processing status.
-///
-/// This struct provides aggregate file counts for efficient polling of indexing
-/// progress without needing to list individual files.
-///
-/// # Usage
-///
-/// Use [`get_vector_store_details`] to fetch this data, then check `file_counts`
-/// to determine if all files have finished processing.
-///
-/// # Example
-///
-/// ```ignore
-/// let details = get_vector_store_details(&client, &config, "vs_abc123").await?;
-/// if details.file_counts.in_progress == 0 {
-///     println!("All {} files indexed!", details.file_counts.completed);
-/// }
-/// ```
-#[derive(Deserialize, Debug)]
-pub struct VectorStoreDetails {
-    /// Unique vector store identifier.
-    pub id: String,
-    /// Aggregate counts of files in each processing state.
-    #[serde(default)]
-    pub file_counts: FileCounts,
-}
-
-/// Aggregate file processing counts for a vector store.
-///
-/// These counts reflect the current state of all files attached to a vector store.
-/// Use for efficient batch indexing status checks instead of polling individual files.
-///
-/// # State Transitions
-///
-/// Files progress through states: `in_progress` -> `completed` | `failed` | `cancelled`
-///
-/// # Invariant
-///
-/// `total == in_progress + completed + failed + cancelled`
-#[derive(Deserialize, Debug, Default)]
-pub struct FileCounts {
-    /// Number of files currently being indexed.
-    #[serde(default)]
-    pub in_progress: u64,
-    /// Number of files successfully indexed and searchable.
-    #[serde(default)]
-    pub completed: u64,
-    /// Number of files that failed to index (permanent error).
-    #[serde(default)]
-    pub failed: u64,
-    /// Number of files whose indexing was cancelled.
-    #[serde(default)]
-    pub cancelled: u64,
-    /// Total number of files attached to the vector store.
-    #[serde(default)]
-    pub total: u64,
-}
-
-/// Paginated list of files in a vector store.
-///
-/// Returned by [`list_vector_store_files`]. Supports cursor-based pagination
-/// for vector stores with many files.
-#[derive(Deserialize, Debug)]
-pub struct VectorStoreFilesList {
-    /// Files in this page of results.
-    pub data: Vec<VectorStoreFileItem>,
-    /// True if more pages are available.
-    #[serde(default)]
-    pub has_more: bool,
-    /// Cursor for fetching the next page (ID of last item).
-    #[serde(default)]
-    pub last_id: Option<String>,
-}
-
-/// A file attached to a vector store.
-///
-/// Represents the relationship between a file and a vector store, including
-/// the file's indexing status and optional metadata attributes.
-///
-/// # API Compatibility
-///
-/// The OpenAI API has returned file information in different formats over time.
-/// This struct accepts both nested `file` objects and flat `file_id` fields
-/// for robustness across API versions.
-#[derive(Deserialize, Debug)]
-pub struct VectorStoreFileItem {
-    /// Unique identifier for this vector store file relationship.
-    ///
-    /// Note: This is NOT the underlying file ID. Use `file_id` or `file.id` instead.
-    pub id: String,
-    /// Indexing status: "in_progress", "completed", "failed", "cancelled".
-    pub status: String,
-    /// Nested file object (present in some API responses).
-    #[serde(default)]
-    pub file: Option<FileInfo>,
-    /// Direct file ID reference (present in some API responses).
-    #[serde(default)]
-    pub file_id: Option<String>,
-    /// Filename (may be present at top level in some responses).
-    #[serde(default)]
-    pub filename: Option<String>,
-    /// Custom metadata attributes attached when the file was added.
-    ///
-    /// Used by [`reindex_files`] to store `path`, `hash`, and `indexed_at`.
-    #[serde(default)]
-    pub attributes: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
-/// Detailed information about an uploaded file.
-///
-/// Contains metadata about a file in OpenAI's storage, including its
-/// original filename, size, and custom attributes.
-#[derive(Deserialize, Debug)]
-pub struct FileInfo {
-    /// Unique file identifier (e.g., "file-abc123").
-    pub id: String,
-    /// Original filename as uploaded.
-    pub filename: Option<String>,
-    /// File purpose: "assistants", "fine-tune", etc.
-    #[serde(default)]
-    pub purpose: Option<String>,
-    /// File size in bytes.
-    #[serde(default)]
-    pub bytes: Option<u64>,
-    /// Unix timestamp when the file was uploaded.
-    #[serde(default)]
-    pub created_at: Option<i64>,
-    /// Custom metadata attributes (path, hash, indexed_at for reindexing).
-    #[serde(default)]
-    pub attributes: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
-/// Configuration options for a [`code_query`] invocation.
-///
-/// Controls concurrency, timeouts, model selection, and result formatting
-/// for semantic code search operations.
-///
-/// # Example
-///
-/// ```
-/// use file_search_core::CodeQueryOptions;
-///
-/// let options = CodeQueryOptions {
-///     concurrent_limit: 5,      // Max 5 concurrent file uploads
-///     timeout_ms: 60000,        // 60 second timeout for indexing
-///     model: Some("gpt-4o"),    // Use GPT-4o for the query
-///     max_num_results: Some(10), // Return up to 10 search results
-///     include_results: true,     // Include result snippets in output
-/// };
-/// ```
-pub struct CodeQueryOptions<'a> {
-    /// Maximum number of concurrent file upload/indexing operations.
-    ///
-    /// Higher values improve throughput but may trigger rate limits.
-    /// Recommended range: 3-10.
-    pub concurrent_limit: usize,
-    /// Maximum time in milliseconds to wait for file indexing to complete.
-    ///
-    /// Applies to the aggregate wait after all files are uploaded.
-    /// Default: 60000 (60 seconds).
-    pub timeout_ms: u64,
-    /// Model to use for the query. If `None`, uses [`ApiConfig::default_model`].
-    pub model: Option<&'a str>,
-    /// Maximum number of search results to return from the vector store.
-    ///
-    /// If `None`, uses OpenAI's default (typically 10).
-    pub max_num_results: Option<u32>,
-    /// Whether to include search result snippets in the response.
-    ///
-    /// When `true`, the response includes matching text snippets and scores.
-    /// When `false`, only the synthesized answer is returned.
-    pub include_results: bool,
-}
-
-/// Computes the SHA256 hash of a file's contents.
-///
-/// Reads the file in chunks to handle large files efficiently without loading
-/// the entire file into memory.
-///
-/// # Arguments
-///
-/// * `path` - Path to the file to hash
-///
-/// # Returns
-///
-/// The SHA256 hash as a lowercase hexadecimal string (64 characters).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The file cannot be opened (does not exist, permission denied)
-/// - An I/O error occurs while reading
-///
-/// # Example
-///
-/// ```ignore
-/// let hash = compute_file_hash("src/main.rs").await?;
-/// println!("Hash: {}", hash);  // e.g., "a1b2c3d4..."
-/// ```
-///
-/// # Performance
-///
-/// Uses 8KB chunks for reading, providing a good balance between memory usage
-/// and system call overhead.
-pub async fn compute_file_hash(path: &str) -> Result<String> {
-    use tokio::fs::File;
-    use tokio::io::AsyncReadExt;
-
-    let mut file = File::open(path)
-        .await
-        .with_context(|| format!("Failed to open file: {}", path))?;
-
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 8192];
-
-    loop {
-        let bytes_read = file.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// Detects if a file appears to contain binary content.
-///
-/// Reads the first 8KB of the file and checks for NUL bytes, which are a strong
-/// indicator of binary data. This is used by [`code_query`] to skip binary files
-/// that would produce noise in semantic code search.
-///
-/// # Arguments
-///
-/// * `path` - Path to the file to check
-///
-/// # Returns
-///
-/// `true` if the file contains NUL bytes in its first 8KB, indicating binary content.
-///
-/// # Design
-///
-/// Intentionally conservative: errs on the side of classifying files as binary
-/// to avoid uploading inappropriate content to CodeQuery.
-async fn looks_binary_by_content(path: &str) -> Result<bool> {
-    use tokio::fs::File;
-    use tokio::io::AsyncReadExt;
-
-    let mut file = File::open(path)
-        .await
-        .with_context(|| format!("Failed to open file: {}", path))?;
-
-    let mut buf = vec![0u8; 8192];
-    let n = file.read(&mut buf).await?;
-    Ok(buf[..n].contains(&0))
-}
-
-/// Computes the SHA256 hash of a byte slice.
-///
-/// Synchronous version for in-memory data. For files, prefer [`compute_file_hash`]
-/// which reads in chunks.
-///
-/// # Arguments
-///
-/// * `bytes` - The byte slice to hash
-///
-/// # Returns
-///
-/// The SHA256 hash as a lowercase hexadecimal string (64 characters).
-///
-/// # Example
-///
-/// ```
-/// use file_search_core::compute_bytes_hash;
-///
-/// let hash = compute_bytes_hash(b"hello world");
-/// assert_eq!(hash.len(), 64);  // SHA256 produces 64 hex chars
-/// ```
-pub fn compute_bytes_hash(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
 
 /// Uploads a file to OpenAI's file storage system.
 ///
@@ -1127,25 +516,6 @@ pub async fn create_vector_store(client: &Client, cfg: &ApiConfig, name: &str) -
     };
     let vs: VectorStore = res.json().await?;
     Ok(vs.id)
-}
-
-/// Response from the list vector stores endpoint.
-#[derive(Deserialize, Debug)]
-pub struct VectorStoreList {
-    /// Vector stores in this response.
-    pub data: Vec<VectorStoreEntry>,
-}
-
-/// Summary information about a vector store.
-///
-/// Returned by [`list_vector_stores`]. For detailed information including
-/// file counts, use [`get_vector_store_details`].
-#[derive(Deserialize, Debug)]
-pub struct VectorStoreEntry {
-    /// Unique vector store identifier (e.g., "vs_abc123").
-    pub id: String,
-    /// Human-readable name assigned at creation.
-    pub name: Option<String>,
 }
 
 /// Lists all vector stores in the account.
@@ -1711,20 +1081,6 @@ pub async fn list_vector_store_files_with_details(
     Ok(detailed_files)
 }
 
-/// Request payload for the Responses API.
-#[derive(Serialize, Debug)]
-struct ResponsesCreate<'a> {
-    /// Model to use for generating the response.
-    model: &'a str,
-    /// User query or prompt.
-    input: &'a str,
-    /// Tools available to the model (e.g., file_search).
-    tools: Vec<serde_json::Value>,
-    /// Optional fields to include in the response.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    include: Option<Vec<&'a str>>,
-}
-
 /// Executes a semantic search query against a vector store using the Responses API.
 ///
 /// Sends a natural language query to OpenAI's Responses API with the file_search tool
@@ -1996,79 +1352,98 @@ pub async fn reindex_files(
     let mut to_delete: HashMap<String, String> = HashMap::new(); // file_id -> reason
     let mut errors = Vec::new();
 
-    // Check each local file
-    for path in file_paths {
-        // Compute hash of local file
-        let local_hash = match compute_file_hash(path).await {
-            Ok(h) => h,
-            Err(e) => {
-                errors.push((path.clone(), format!("Failed to hash: {}", e)));
+    // Hash local files concurrently (I/O bound) while preserving the original input order.
+    // This is a hot path for large repos and can dominate end-to-end indexing time.
+    type HashedPathOk = (String, String, Option<String>);
+    type HashedPathErr = (String, String);
+    type HashedPathResult = std::result::Result<HashedPathOk, HashedPathErr>;
+
+    let mut hash_results: Vec<(usize, HashedPathResult)> =
+        stream::iter(file_paths.iter().cloned().enumerate())
+            .map(|(idx, path)| async move {
+                let filename = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from);
+
+                match compute_file_hash(&path).await {
+                    Ok(hash) => (idx, Ok((path, hash, filename))),
+                    Err(e) => (idx, Err((path, format!("Failed to hash: {}", e)))),
+                }
+            })
+            .buffer_unordered(concurrent_limit)
+            .collect()
+            .await;
+
+    hash_results.sort_by_key(|(idx, _)| *idx);
+
+    // Check each local file (in original order) against store maps.
+    for (_, result) in hash_results {
+        let (path, local_hash, filename) = match result {
+            Ok(ok) => ok,
+            Err((path, err)) => {
+                errors.push((path, err));
                 continue;
             }
         };
 
-        // Extract filename for fallback matching
-        let filename = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(String::from);
-
         // Check by path first (highest priority - exact match)
-        if let Some((file_id, store_hash)) = path_map.get(path).cloned() {
+        if let Some((file_id, store_hash)) = path_map.get(&path).cloned() {
             if store_hash.as_ref() == Some(&local_hash) {
                 // Path and hash both match - skip upload
-                to_skip.push(path.clone());
-                path_map.remove(path);
+                path_map.remove(&path);
                 hash_map.remove(&local_hash);
                 if let Some(ref fname) = filename {
                     filename_map.remove(fname);
                 }
+                to_skip.push(path);
             } else {
                 // Same path, different hash - content changed
                 to_delete.insert(file_id.clone(), format!("content changed: {}", path));
-                to_upload.push((path.clone(), local_hash.clone()));
-                path_map.remove(path);
+                path_map.remove(&path);
                 if let Some(old_hash) = store_hash {
                     hash_map.remove(&old_hash);
                 }
                 if let Some(ref fname) = filename {
                     filename_map.remove(fname);
                 }
+                to_upload.push((path, local_hash));
             }
         } else if let Some((old_key, file_id)) = hash_map.get(&local_hash).cloned() {
             // Same hash at different location - file was moved
+            // Remove from tracking maps before moving `path`/`local_hash` into `to_upload`.
             to_delete.insert(
                 file_id.clone(),
                 format!("moved from {} to {}", old_key, path),
             );
-            to_upload.push((path.clone(), local_hash.clone()));
             path_map.remove(&old_key);
             hash_map.remove(&local_hash);
             if let Some(ref fname) = filename {
                 filename_map.remove(fname);
             }
+            to_upload.push((path, local_hash));
         } else if let Some(ref fname) = filename {
             // Check by filename as fallback for legacy files
             if let Some((file_id, store_hash)) = filename_map.get(fname).cloned() {
                 if store_hash.as_ref() == Some(&local_hash) {
                     // Filename and hash match - skip (legacy file still current)
-                    to_skip.push(path.clone());
+                    to_skip.push(path);
                 } else {
                     // Filename matches but hash differs - content changed
                     to_delete.insert(
                         file_id.clone(),
                         format!("content changed (legacy): {}", fname),
                     );
-                    to_upload.push((path.clone(), local_hash.clone()));
+                    to_upload.push((path, local_hash));
                 }
                 filename_map.remove(fname);
             } else {
                 // Completely new file
-                to_upload.push((path.clone(), local_hash));
+                to_upload.push((path, local_hash));
             }
         } else {
             // Completely new file
-            to_upload.push((path.clone(), local_hash));
+            to_upload.push((path, local_hash));
         }
     }
 
@@ -2587,14 +1962,8 @@ pub async fn code_query(
     )
     .await?;
 
-    let response_text = match serde_json::from_value::<ResponseObject>(raw_response.clone()) {
-        Ok(parsed) => parsed.extract_text(include_results),
-        Err(err) => {
-            tracing::warn!("Failed to deserialize response object: {}", err);
-            serde_json::to_string(&raw_response)
-                .unwrap_or_else(|_| "Failed to decode response".into())
-        }
-    };
+    let response_text =
+        crate::openai::types::extract_text_from_response_value(&raw_response, include_results);
 
     Ok((response_text, reindex_summary))
 }

@@ -1,8 +1,10 @@
-use crate::config::{DEFAULT_PWSH_TIMEOUT_MS, MAX_PWSH_STDERR_BYTES, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_TIMEOUT_MS};
+use crate::RpcResponse;
+use crate::config::{
+    DEFAULT_PWSH_TIMEOUT_MS, MAX_PWSH_STDERR_BYTES, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_TIMEOUT_MS,
+};
 use crate::define_mcp_tool;
 use crate::process_utils;
 use crate::validation;
-use crate::RpcResponse;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{error, info};
@@ -23,7 +25,12 @@ async fn execute_pwsh(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     };
 
     let work_dir = req.working_dir.as_deref().unwrap_or(".");
-    let timeout_ms = validation::clamp_timeout(req.timeout_ms, DEFAULT_PWSH_TIMEOUT_MS, 100, MAX_PWSH_TIMEOUT_MS);
+    let timeout_ms = validation::clamp_timeout(
+        req.timeout_ms,
+        DEFAULT_PWSH_TIMEOUT_MS,
+        100,
+        MAX_PWSH_TIMEOUT_MS,
+    );
 
     info!("Pwsh tool: executing command in {}", work_dir);
 

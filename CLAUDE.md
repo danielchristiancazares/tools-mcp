@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Tool Preferences
 
-When tools-mcp is available, prefer its dedicated tools over Bash equivalents:
+When tools is available, prefer its dedicated tools over Bash equivalents:
 
 - Prefer `Read` over `cat`, `head`, `tail` for reading files
 - Prefer `Search` over `grep`, `rg` for searching file contents
@@ -41,10 +41,10 @@ This is a **Rust-based MCP (Model Context Protocol) server** that provides file 
 
 3. **WebFetch Pipeline (`src/webfetch/`)**
    - Retrieves remote pages with HTTP or headless browser rendering
-   - Caches under `/tmp/tools-mcp-webfetch` (separate cache keys for http vs browser)
+   - Caches under `/tmp/tools-webfetch` (separate cache keys for http vs browser)
    - **Respects robots.txt** - Fetches and caches robots.txt per domain, blocks disallowed URLs [robotstxt v0.3.0]
    - **SSRF protection** - Validates URLs, blocks file://, localhost, private IPs, and non-HTTP(S) schemes (applied to both HTTP and browser paths)
-   - User agent: `tools-mcp-webfetch/0.1`
+   - User agent: `tools-webfetch/0.1`
    - **Hybrid rendering strategy**:
      - HTTP-first with automatic browser fallback for JS-heavy sites
      - Whitelisted domains (e.g., medium.com, notion.so) automatically use browser
@@ -109,7 +109,7 @@ Add to your `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.vector-store]
-command = "/path/to/tools-mcp/target/release/tools-mcp"
+command = "/path/to/tools/target/release/tools"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}", MCP_SKIP_HEADERS = "true", RUST_LOG = "error" }
 ```
 

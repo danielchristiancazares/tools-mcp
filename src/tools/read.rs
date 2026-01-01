@@ -1,5 +1,5 @@
+use super::handlers::handle_read_file;
 use crate::define_mcp_tool;
-use crate::read_file::handle_read_file;
 
 define_mcp_tool! {
     ReadTool,
@@ -23,7 +23,7 @@ define_mcp_tool! {
             },
             "show_line_numbers": {
                 "type": "boolean",
-                "description": "Include line numbers in output"
+                "description": "Include line numbers in output (default: true)"
             }
         },
         "required": ["path"],

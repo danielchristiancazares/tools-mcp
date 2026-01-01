@@ -1,4 +1,4 @@
-# tools-mcp Technical Documentation
+# tools Technical Documentation
 
 ## Table of Contents
 
@@ -21,7 +21,7 @@
 
 ## Project Overview
 
-**tools-mcp** is a Rust-based Model Context Protocol (MCP) server that provides a comprehensive suite of developer tools for AI-assisted coding workflows. The server communicates via JSON-RPC 2.0 over stdin/stdout, enabling seamless integration with MCP-compatible clients such as Codex agents.
+**tools** is a Rust-based Model Context Protocol (MCP) server that provides a comprehensive suite of developer tools for AI-assisted coding workflows. The server communicates via JSON-RPC 2.0 over stdin/stdout, enabling seamless integration with MCP-compatible clients such as Codex agents.
 
 ### Key Capabilities
 
@@ -71,8 +71,8 @@
 
 ```bash
 # Clone and enter the repo
-git clone https://github.com/your-org/tools-mcp.git
-cd tools-mcp
+git clone https://github.com/your-org/tools.git
+cd tools
 
 # Build the binary
 cargo build --release
@@ -116,7 +116,7 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 
 ```
 +------------------+     +-------------------+     +-------------------+
-|   MCP Client     |     |   tools-mcp       |     |   External APIs   |
+|   MCP Client     |     |   tools           |     |   External APIs   |
 |   (Codex Agent)  |<--->|   (JSON-RPC 2.0)  |<--->|   (OpenAI, Web)   |
 +------------------+     +-------------------+     +-------------------+
         |                        |
@@ -158,7 +158,7 @@ src/
 
   git_tools.rs         # Git command execution
   ripgrep.rs           # File search (rg/ugrep)
-  read_file.rs         # File reading
+  tools/handlers/read_file.rs # File reading
   write.rs             # File creation
   delete.rs            # File deletion
   glob_files.rs        # Glob pattern matching
@@ -486,7 +486,7 @@ pub async fn validate_url_ssrf(url: &str) -> Result<()>
 /// robots.txt content is cached per domain in a global RwLock-protected HashMap
 ///
 /// # User-Agent
-/// Uses "tools-mcp-webfetch/0.1" for matching
+/// Uses "tools-webfetch/0.1" for matching
 async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool>
 ```
 
@@ -496,7 +496,7 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool>
 /// Builds HTTP client with security settings
 ///
 /// # Configuration
-/// - User-Agent: "tools-mcp-webfetch/0.1"
+/// - User-Agent: "tools-webfetch/0.1"
 /// - Timeout: 20 seconds
 /// - Redirects: Disabled (manual handling for SSRF protection)
 /// - Compression: brotli, gzip, deflate enabled
@@ -753,7 +753,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
 
 ### read_file.rs - File Reading
 
-**Location**: `src/read_file.rs`
+**Location**: `src/tools/handlers/read_file.rs`
 
 ```rust
 /// Reads file contents with optional line range
@@ -762,7 +762,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
 /// - path: String (required) - File path to read
 /// - start_line: usize (1-based) - First line to read
 /// - end_line: usize (1-based, inclusive) - Last line to read
-/// - show_line_numbers: bool (default: false) - Prefix lines with numbers
+/// - show_line_numbers: bool (default: true) - Prefix lines with numbers
 ///
 /// # Response
 /// - content: File text (with optional line numbers)
@@ -917,7 +917,7 @@ Index code and query an OpenAI vector store in a single call.
 - **Response**:
   - `result` contains a `content` array:
     - First item: natural-language answer text.
-    - Optional second item: pretty-printed JSON summary of the reindexing operations.
+    - Optional second item: JSON summary of the reindexing operations (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
 
 #### CodeQuery Architecture
 
@@ -972,7 +972,7 @@ When `file_paths` is non-empty, `src/lib.rs::code_query` syncs local files into 
 
 **Response shape**
 - The MCP result always returns `content[0].text` as the assistant answer.
-- If reindexing ran, it also returns `content[1].text` containing a pretty-printed JSON "reindex summary" with uploaded/skipped/deleted/errors counts and entries.
+- If reindexing ran, it also returns `content[1].text` containing a JSON "reindex summary" with uploaded/skipped/deleted/errors counts and entries (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
 
 ### WebFetch
 
@@ -987,7 +987,7 @@ Fetch and normalize external web content with caching and JS-aware rendering.
   - `force_browser` (boolean) – when true, forces headless browser rendering even if heuristics do not flag the page as JS-heavy.
 - **Behavior**:
   - Builds a hardened HTTP client, validates the URL against SSRF rules, and enforces `robots.txt`.
-  - Caches responses under `/tmp/tools-mcp-webfetch` keyed by URL + method.
+  - Caches responses under `/tmp/tools-webfetch` keyed by URL + method.
   - Extracts readable content and produces Markdown.
   - Uses heuristics to detect JavaScript-heavy pages and, where possible, re-renders them via a headless Chrome/Chromium browser.
   - Splits content into token-aware chunks with headings.
@@ -1024,8 +1024,9 @@ Read a local file (optionally a line range) for quick inspection without uploads
   - `path` - filesystem path to read.
 - **Optional**:
   - `start_line`, `end_line` (1-based, inclusive).
+  - `show_line_numbers` (default: true) - set to `false` for raw content.
 - **Response**:
-  - `content[0].text` is line-numbered (similar to `nl -ba` / `cat -n`).
+  - `content[0].text` is line-numbered by default (similar to `nl -ba` / `cat -n`).
   - Includes `start_line`, `end_line`, and `total_lines`.
 
 ### SmartFileEdit
@@ -1092,7 +1093,7 @@ Run shell commands via bash with timeout and stdout/stderr capture.
   - `timeout_ms` - timeout in milliseconds (default 30000).
   - `working_dir` - optional working directory for the command.
 - **Response**:
-  - Returns a pretty-printed JSON summary (including `stdout`, `stderr`, `exit_code`) in `content[0].text`.
+  - Returns a JSON summary (including `stdout`, `stderr`, `exit_code`) in `content[0].text` (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
 
 ### ping
 
@@ -1440,19 +1441,20 @@ pub struct FetchChunk {
 | RUST_LOG | No | Logging level (debug, info, warn, error) |
 | APP_VERSION | No | Version string exposed in server info |
 | HOME | No | Home directory for cache storage |
+| TOOLS_PRETTY_JSON | No | Set to "true" (or 1/yes/on) to pretty-print JSON payloads returned as text (default: compact) |
 
 ### Cache Locations
 
 | Cache | Path | Purpose |
 |-------|------|---------|
 | CodeQuery stores | `$HOME/.codex/mcp/stores.json` | Vector store ID mapping |
-| WebFetch content | `/tmp/tools-mcp-webfetch/` | HTTP response cache |
+| WebFetch content | `/tmp/tools-webfetch/` | HTTP response cache |
 
 ### MCP Client Configuration Example
 
 ```toml
-[mcp_servers.tools-mcp]
-command = "/path/to/tools-mcp/target/release/tools-mcp"
+[mcp_servers.tools]
+command = "/path/to/tools/target/release/tools"
 env = {
   OPENAI_API_KEY = "${OPENAI_API_KEY}",
   MCP_SKIP_HEADERS = "true",
@@ -1480,7 +1482,7 @@ The WebFetch tool implements comprehensive SSRF protection:
 ### Robots.txt Compliance
 
 - Fetches and caches robots.txt per domain
-- Uses User-Agent `tools-mcp-webfetch/0.1` for matching
+- Uses User-Agent `tools-webfetch/0.1` for matching
 - Blocks URLs disallowed by robots.txt
 - Missing robots.txt allows all paths
 
@@ -1654,8 +1656,8 @@ APP_VERSION="1.0.0" cargo build --release
 
 ### Binary Location
 
-- Debug: `target/debug/tools-mcp`
-- Release: `target/release/tools-mcp`
+- Debug: `target/debug/tools`
+- Release: `target/release/tools`
 
 ### System Requirements
 
@@ -1672,4 +1674,4 @@ APP_VERSION="1.0.0" cargo build --release
 
 ---
 
-*Generated documentation for tools-mcp v1.0.0*
+*Generated documentation for tools v1.0.0*

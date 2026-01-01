@@ -57,6 +57,21 @@
 use anyhow::Result;
 use htmd::HtmlToMarkdown;
 use scraper::{Html, Selector};
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
+/// Global HTML→Markdown converter instance.
+///
+/// Building the converter allocates handler tables and options; reuse it across requests.
+static HTML_TO_MARKDOWN: OnceLock<HtmlToMarkdown> = OnceLock::new();
+
+fn get_converter() -> &'static HtmlToMarkdown {
+    HTML_TO_MARKDOWN.get_or_init(|| {
+        HtmlToMarkdown::builder()
+            .skip_tags(vec!["script", "style", "nav", "footer", "header"])
+            .build()
+    })
+}
 
 /// Extracted document with metadata and Markdown content.
 ///
@@ -84,19 +99,26 @@ pub struct ExtractedDocument {
 /// 1. Content-Type header contains "html"
 /// 2. First 256 bytes contain `<html` or `<!doctype html`
 fn looks_like_html(content_type: Option<&str>, bytes: &[u8]) -> bool {
+    fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
+        haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
     // Check Content-Type header first (most reliable)
     if let Some(ct) = content_type
-        && ct.to_ascii_lowercase().contains("html") {
-            return true;
-        }
+        && contains_ignore_ascii_case(ct.as_bytes(), b"html")
+    {
+        return true;
+    }
     // Fall back to content sniffing for the first 256 bytes
-    let sample = bytes
-        .iter()
-        .take(256)
-        .map(|c| *c as char)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    sample.contains("<html") || sample.contains("<!doctype html")
+    let prefix_len = bytes.len().min(256);
+    let sample = &bytes[..prefix_len];
+    contains_ignore_ascii_case(sample, b"<html")
+        || contains_ignore_ascii_case(sample, b"<!doctype html")
 }
 
 // ============================================================================
@@ -109,11 +131,19 @@ fn looks_like_html(content_type: Option<&str>, bytes: &[u8]) -> bool {
 /// Returns `None` if no title tag exists or if it's empty.
 fn extract_title(document: &Html) -> Option<String> {
     let selector = Selector::parse("title").ok()?;
-    document
-        .select(&selector)
-        .next()
-        .map(|node| node.text().collect::<Vec<_>>().join(" ").trim().to_string())
-        .filter(|s| !s.is_empty())
+    let node = document.select(&selector).next()?;
+    let mut title = String::new();
+    for t in node.text() {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(t);
+    }
+    if title.is_empty() { None } else { Some(title) }
 }
 
 /// Extracts the document language from HTML attributes or meta tags.
@@ -165,34 +195,40 @@ fn extract_language(document: &Html) -> Option<String> {
 /// | `header` | Often contains logo/nav, not content |
 /// | `footer` | Usually contains copyright/links, not content |
 fn clean_markdown(html: &str) -> String {
-    // Configure htmd with tag filtering for boilerplate removal
-    let converter = HtmlToMarkdown::builder()
-        .skip_tags(vec!["script", "style", "nav", "footer", "header"])
-        .build();
+    let converter = get_converter();
 
     let md = converter.convert(html).unwrap_or_else(|_| html.to_string());
 
-    // Normalize whitespace: collapse excessive blank lines, trim line endings
+    // Normalize whitespace: collapse excessive blank lines, trim trailing whitespace per line.
     let mut result = String::with_capacity(md.len());
-    let mut consecutive_newlines = 0;
+    let mut pending_blank_line = false;
     for line in md.lines() {
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
-            consecutive_newlines += 1;
-            // Allow max 2 consecutive newlines (one blank line)
-            if consecutive_newlines <= 2 {
-                result.push('\n');
+            // Avoid leading blank lines; defer blank-line emission until we see the next
+            // non-empty line so we also avoid trailing blank lines.
+            if !result.is_empty() {
+                pending_blank_line = true;
             }
         } else {
-            if consecutive_newlines > 0 && !result.is_empty() {
-                // Newlines already pushed above
+            if pending_blank_line {
+                // We always end non-empty lines with '\n', so emitting one extra '\n' yields a
+                // single blank line between blocks.
+                if !result.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push('\n');
+                pending_blank_line = false;
             }
-            consecutive_newlines = 0;
             result.push_str(trimmed);
             result.push('\n');
         }
     }
-    result.trim().to_string()
+    // Drop the trailing newline we always append after the last non-empty line.
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
 }
 
 /// Extracts content from HTML bytes, producing metadata and Markdown.
@@ -205,25 +241,25 @@ fn clean_markdown(html: &str) -> String {
 /// 4. Extract `<body>` inner HTML (avoids `<head>` content)
 /// 5. Convert body to Markdown with boilerplate removal
 fn extract_from_html(bytes: &[u8], _source_url: &str) -> Result<ExtractedDocument> {
-    let html_owned = String::from_utf8_lossy(bytes).to_string();
-    let document = Html::parse_document(&html_owned);
+    let html_source = String::from_utf8_lossy(bytes);
+    let document = Html::parse_document(html_source.as_ref());
 
     let title = extract_title(&document);
     let language = extract_language(&document);
 
     // Extract just the <body> content to avoid head/script/style noise
-    let body_html = if let Ok(body_selector) = Selector::parse("body") {
+    let body_html: Cow<'_, str> = if let Ok(body_selector) = Selector::parse("body") {
         document
             .select(&body_selector)
             .next()
-            .map(|body| body.inner_html())
-            .unwrap_or_else(|| html_owned.clone())
+            .map(|body| Cow::Owned(body.inner_html()))
+            .unwrap_or_else(|| Cow::Borrowed(html_source.as_ref()))
     } else {
-        html_owned.clone()
+        Cow::Borrowed(html_source.as_ref())
     };
 
     // Convert body HTML to markdown
-    let markdown = clean_markdown(&body_html);
+    let markdown = clean_markdown(body_html.as_ref());
 
     Ok(ExtractedDocument {
         title,
@@ -283,5 +319,64 @@ pub fn extract(
     } else {
         // Non-HTML content: treat as plain text/Markdown
         extract_from_text(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_html_true_for_content_type_html() {
+        assert!(looks_like_html(
+            Some("text/HTML; charset=utf-8"),
+            b"not html bytes"
+        ));
+    }
+
+    #[test]
+    fn looks_like_html_true_for_doctype_sniff() {
+        assert!(looks_like_html(
+            None,
+            b"<!DOCTYPE html><html><body></body></html>"
+        ));
+    }
+
+    #[test]
+    fn extract_html_metadata_and_markdown() {
+        let html = br#"<!doctype html>
+<html lang="en">
+  <head><title>My Title</title></head>
+  <body>
+    <h1>Hello</h1>
+    <script>console.log("nope")</script>
+    <p>World</p>
+  </body>
+</html>"#;
+
+        let doc = extract(
+            html,
+            Some("text/html; charset=utf-8"),
+            "https://example.com",
+        )
+        .expect("extract failed");
+        assert_eq!(doc.title.as_deref(), Some("My Title"));
+        assert_eq!(doc.language.as_deref(), Some("en"));
+        assert!(doc.markdown.contains("Hello"));
+        assert!(doc.markdown.contains("World"));
+        assert!(
+            !doc.markdown.contains("console.log"),
+            "script content should be filtered out"
+        );
+    }
+
+    #[test]
+    fn extract_text_fallback_for_non_html() {
+        let bytes = b"plain text\nline 2\n";
+        let doc =
+            extract(bytes, Some("text/plain"), "https://example.com").expect("extract failed");
+        assert_eq!(doc.title, None);
+        assert_eq!(doc.language, None);
+        assert_eq!(doc.markdown, "plain text\nline 2\n");
     }
 }

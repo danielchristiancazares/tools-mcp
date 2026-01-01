@@ -399,8 +399,8 @@ where
 /// } else if result.timed_out {
 ///     eprintln!("Build timed out!");
 /// } else {
-///     eprintln!("Build failed (exit {}): {}", 
-///         result.exit_code.unwrap_or(-1), 
+///     eprintln!("Build failed (exit {}): {}",
+///         result.exit_code.unwrap_or(-1),
 ///         result.stderr);
 /// }
 /// # Ok(())
@@ -448,12 +448,10 @@ pub async fn run_shell_script(
 
     // Spawn concurrent tasks to drain both pipes simultaneously
     // This prevents deadlock if the child fills one pipe buffer while we read the other
-    let stdout_task = tokio::spawn(async move {
-        read_to_end_limited(stdout, max_stdout_bytes).await
-    });
-    let stderr_task = tokio::spawn(async move {
-        read_to_end_limited(stderr, max_stderr_bytes).await
-    });
+    let stdout_task =
+        tokio::spawn(async move { read_to_end_limited(stdout, max_stdout_bytes).await });
+    let stderr_task =
+        tokio::spawn(async move { read_to_end_limited(stderr, max_stderr_bytes).await });
 
     // Wait for process completion with timeout enforcement
     let mut timed_out = false;
@@ -604,19 +602,19 @@ pub async fn run_pwsh_command(
     cmd.current_dir(working_dir);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn pwsh: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn pwsh: {e}"))?;
 
     // Take ownership of stdout/stderr handles for async reading
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
 
     // Spawn concurrent tasks to drain both pipes simultaneously
-    let stdout_task = tokio::spawn(async move {
-        read_to_end_limited(stdout, max_stdout_bytes).await
-    });
-    let stderr_task = tokio::spawn(async move {
-        read_to_end_limited(stderr, max_stderr_bytes).await
-    });
+    let stdout_task =
+        tokio::spawn(async move { read_to_end_limited(stdout, max_stdout_bytes).await });
+    let stderr_task =
+        tokio::spawn(async move { read_to_end_limited(stderr, max_stderr_bytes).await });
 
     // Wait for process completion with timeout enforcement
     let mut timed_out = false;

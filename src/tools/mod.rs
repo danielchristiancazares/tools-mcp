@@ -4,6 +4,7 @@ mod delete;
 mod edit;
 mod git;
 mod glob;
+mod handlers;
 mod outline;
 mod ping;
 mod pwsh;

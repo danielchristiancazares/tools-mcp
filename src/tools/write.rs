@@ -1,8 +1,8 @@
+use crate::RpcResponse;
 use crate::define_mcp_tool;
 use crate::validation;
-use crate::RpcResponse;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -26,16 +26,18 @@ async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
 
     // Create parent directories if needed
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() && !parent.exists()
-            && let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return RpcResponse::err(
-                    id,
-                    format!(
-                        "failed to create parent directories for {}: {err}",
-                        path.display()
-                    ),
-                );
-            }
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        return RpcResponse::err(
+            id,
+            format!(
+                "failed to create parent directories for {}: {err}",
+                path.display()
+            ),
+        );
+    }
 
     // Write the file
     let bytes = req.content.as_bytes();

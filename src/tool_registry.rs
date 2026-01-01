@@ -34,8 +34,11 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
-type ToolExecutor =
-    Box<dyn Fn(Option<Value>, Value) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>> + Send + Sync>;
+type ToolExecutor = Box<
+    dyn Fn(Option<Value>, Value) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>>
+        + Send
+        + Sync,
+>;
 
 struct ToolEntry {
     def: ToolDef,
@@ -100,6 +103,60 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::define_mcp_tool;
+    use serde_json::json;
+
+    async fn ok_tool(id: Option<Value>, _args: Value) -> RpcResponse<'static> {
+        RpcResponse::ok(
+            id,
+            json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": false
+            }),
+        )
+    }
+
+    define_mcp_tool! {
+        DummyTool,
+        name: "Dummy",
+        aliases: ["dummy", "d"],
+        description: "dummy tool for registry tests",
+        schema: {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        handler: ok_tool
+    }
+
+    #[tokio::test]
+    async fn registry_dispatches_by_name_and_alias() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert!(reg.list().iter().any(|t| t.name == "Dummy"));
+
+        let r1 = reg.call("Dummy", Some(json!(1)), json!({})).await;
+        assert!(r1.is_some());
+
+        let r2 = reg.call("dummy", Some(json!(2)), json!({})).await;
+        assert!(r2.is_some());
+
+        let r3 = reg.call("d", Some(json!(3)), json!({})).await;
+        assert!(r3.is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_returns_none_for_unknown_tool() {
+        let reg = ToolRegistry::new();
+        let r = reg.call("nope", Some(json!(1)), json!({})).await;
+        assert!(r.is_none());
     }
 }
 

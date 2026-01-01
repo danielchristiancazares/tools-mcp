@@ -298,17 +298,20 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
 
             if let Some(summary) = reindex_summary {
                 let summary_text =
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| summary.to_string());
+                    serde_json::to_string(&summary).unwrap_or_else(|_| summary.to_string());
                 content.push(serde_json::json!({
                     "type": "text",
                     "text": summary_text
                 }));
             }
 
-            crate::RpcResponse::ok(id, serde_json::json!({
-                "content": content,
-                "isError": false
-            }))
+            crate::RpcResponse::ok(
+                id,
+                serde_json::json!({
+                    "content": content,
+                    "isError": false
+                }),
+            )
         }
         Err(e) => {
             let error_message = e.to_string();

@@ -48,8 +48,8 @@
 //!
 //! ## Caching
 //!
-//! Fetched content is cached on disk under the system temp directory (`/tmp/tools-mcp-webfetch`
-//! on Unix, `%TEMP%\tools-mcp-webfetch` on Windows). Cache keys include the rendering method
+//! Fetched content is cached on disk under the system temp directory (`/tmp/tools-webfetch`
+//! on Unix, `%TEMP%\tools-webfetch` on Windows). Cache keys include the rendering method
 //! to keep HTTP and browser-rendered content separate. See [`cache`] for implementation.
 //!
 //! ## Token-Aware Chunking
@@ -168,18 +168,20 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
             let fetched = http::fetch_document(&req)
                 .await
                 .context("fetch remote document")?;
+            // Avoid cloning potentially-large bodies: move into the cache entry, write it,
+            // then destructure the entry to continue processing.
             let entry = cache::CachedFetch {
-                content_type: fetched.content_type.clone(),
-                body: fetched.body.clone(),
+                content_type: fetched.content_type,
+                body: fetched.body,
                 fetched_at: fetched.fetched_at,
             };
             cache::write_cache(&cache_key, &entry).context("write cache")?;
-            (
-                fetched.body,
-                fetched.content_type,
-                fetched.fetched_at,
-                false,
-            )
+            let cache::CachedFetch {
+                body,
+                content_type,
+                fetched_at,
+            } = entry;
+            (body, content_type, fetched_at, false)
         }
     };
 
@@ -264,19 +266,20 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
     // Check browser cache (works even if Chrome isn't installed)
     let cache_key = format!("{}_browser", req.url);
     if !req.no_cache
-        && let Some(entry) = cache::read_cache(&cache_key).context("read browser cache")? {
-            let extracted = extract::extract(&entry.body, entry.content_type.as_deref(), &req.url)
-                .context("extract cached browser-rendered content")?;
+        && let Some(entry) = cache::read_cache(&cache_key).context("read browser cache")?
+    {
+        let extracted = extract::extract(&entry.body, entry.content_type.as_deref(), &req.url)
+            .context("extract cached browser-rendered content")?;
 
-            return build_response(
-                req.url.clone(),
-                entry.fetched_at,
-                extracted,
-                true,
-                "browser".to_string(),
-                req.max_chunk_tokens,
-            );
-        }
+        return build_response(
+            req.url.clone(),
+            entry.fetched_at,
+            extracted,
+            true,
+            "browser".to_string(),
+            req.max_chunk_tokens,
+        );
+    }
 
     // Check if browser is available
     if !browser::BrowserPool::is_available().await {
@@ -296,20 +299,22 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
         .await
         .context("Browser page rendering failed")?;
 
-    // Cache browser-rendered content (cache_key already defined above)
     let fetched_at = Utc::now();
-    if !req.no_cache {
+    // Cache browser-rendered content (cache_key already defined above) without copying
+    // the full HTML buffer.
+    let extracted = if req.no_cache {
+        extract::extract(html.as_bytes(), Some("text/html"), &req.url)
+            .context("extract browser-rendered content")?
+    } else {
         let entry = cache::CachedFetch {
             content_type: Some("text/html".to_string()),
-            body: html.as_bytes().to_vec(),
+            body: html.into_bytes(),
             fetched_at,
         };
         cache::write_cache(&cache_key, &entry).context("write browser cache")?;
-    }
-
-    // Extract content from rendered HTML
-    let extracted = extract::extract(html.as_bytes(), Some("text/html"), &req.url)
-        .context("extract browser-rendered content")?;
+        extract::extract(&entry.body, entry.content_type.as_deref(), &req.url)
+            .context("extract browser-rendered content")?
+    };
 
     build_response(
         req.url.clone(),
@@ -347,14 +352,15 @@ fn build_response(
     let chunks_raw =
         chunker::chunk_markdown(&extracted.markdown, max_chunk_tokens).context("chunk text")?;
 
-    let mut chunks: Vec<FetchChunk> = Vec::new();
-    for (heading, text, tokens) in &chunks_raw {
-        chunks.push(FetchChunk {
-            heading: heading.clone(),
-            text: text.trim().to_string(),
-            token_count: *tokens,
-        });
-    }
+    // Move strings directly to avoid clones.
+    let mut chunks: Vec<FetchChunk> = chunks_raw
+        .into_iter()
+        .map(|(heading, text, token_count)| FetchChunk {
+            heading,
+            text,
+            token_count,
+        })
+        .collect();
 
     // Guarantee at least one chunk so downstream prompts are never empty.
     if chunks.is_empty() && !extracted.markdown.trim().is_empty() {
@@ -408,23 +414,17 @@ pub async fn handle_webfetch(
     };
 
     match run_fetch(request).await {
-        Ok(response) => match serde_json::to_value(&response) {
-            Ok(json_value) => {
-                let json_text = serde_json::to_string_pretty(&json_value)
-                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-                crate::RpcResponse::ok(
-                    id,
-                    serde_json::json!({
-                        "content": [{"type": "text", "text": json_text}],
-                        "isError": false
-                    }),
-                )
-            }
-            Err(e) => crate::RpcResponse::err(
+        Ok(response) => {
+            let json_text = serde_json::to_string(&response)
+                .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+            crate::RpcResponse::ok(
                 id,
-                format!("webfetch succeeded but response serialization failed: {}", e),
-            ),
-        },
+                serde_json::json!({
+                    "content": [{"type": "text", "text": json_text}],
+                    "isError": false
+                }),
+            )
+        }
         Err(e) => crate::RpcResponse::err(id, format!("webfetch error: {:#}", e)),
     }
 }

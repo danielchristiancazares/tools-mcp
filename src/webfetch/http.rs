@@ -42,7 +42,7 @@
 //! The module respects robots.txt directives:
 //!
 //! 1. Fetches and caches robots.txt per domain (up to 1024 domains)
-//! 2. Uses `tools-mcp-webfetch/0.1` as the user agent for matching
+//! 2. Uses `tools-webfetch/0.1` as the user agent for matching
 //! 3. Rejects requests to disallowed paths with an error
 //! 4. Missing robots.txt = allow all (per specification)
 //!
@@ -59,9 +59,9 @@
 //! let body = fetch_document(&request).await?;
 //! ```
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use reqwest::{header, Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 use robotstxt::DefaultMatcher;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -77,7 +77,7 @@ use crate::webfetch::types::FetchRequest;
 // ============================================================================
 
 /// User agent string for HTTP requests and robots.txt matching.
-const USER_AGENT: &str = "tools-mcp-webfetch/0.1";
+const USER_AGENT: &str = "tools-webfetch/0.1";
 
 /// Default timeout for HTTP requests (covers connect + response).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -342,9 +342,10 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
     {
         let cache = ROBOTS_CACHE.read().await;
         if let Some(ref map) = *cache
-            && let Some(cached) = map.get(&domain) {
-                return Ok(cached.clone());
-            }
+            && let Some(cached) = map.get(&domain)
+        {
+            return Ok(cached.clone());
+        }
     }
 
     // Fetch robots.txt
@@ -382,7 +383,7 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
 ///
 /// Uses the `robotstxt` crate's `DefaultMatcher` which implements the
 /// standard robots.txt matching algorithm. Matches against our user agent
-/// (`tools-mcp-webfetch/0.1`).
+/// (`tools-webfetch/0.1`).
 ///
 /// # Returns
 ///
@@ -427,7 +428,7 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
 ///
 /// ## Request Headers
 ///
-/// - `User-Agent`: `tools-mcp-webfetch/0.1`
+/// - `User-Agent`: `tools-webfetch/0.1`
 /// - `Accept`: Prefers HTML, falls back to XML/plain text
 /// - `Cache-Control`/`Pragma`: Set to `no-cache` if `req.no_cache` is true
 ///
@@ -539,4 +540,41 @@ fn build_http_client_with_resolve(resolve: Option<&(String, SocketAddr)>) -> Res
         builder = builder.resolve(host, *addr);
     }
     Ok(builder.build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_non_http_schemes() {
+        let err = validate_url_ssrf("file:///etc/passwd")
+            .await
+            .expect_err("expected SSRF validation to reject file://");
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_localhost_hostname() {
+        let err = validate_url_ssrf("http://localhost:8080/")
+            .await
+            .expect_err("expected SSRF validation to reject localhost");
+        assert!(err.to_string().to_ascii_lowercase().contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_private_ip_literal() {
+        let err = validate_url_ssrf("http://192.168.1.10/")
+            .await
+            .expect_err("expected SSRF validation to reject private IP");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_allows_public_ip_literal_without_dns() {
+        // example.com (93.184.216.34) - using an IP literal avoids DNS in tests.
+        validate_url_ssrf("https://93.184.216.34/")
+            .await
+            .expect("expected public IP literal to pass SSRF validation");
+    }
 }

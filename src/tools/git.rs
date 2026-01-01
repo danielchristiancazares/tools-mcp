@@ -1,5 +1,7 @@
 use crate::define_mcp_tool;
-use crate::git_tools::{handle_git_status, handle_git_diff, handle_git_restore, handle_git_add, handle_git_commit};
+use crate::git::{
+    handle_git_add, handle_git_commit, handle_git_diff, handle_git_restore, handle_git_status,
+};
 
 define_mcp_tool! {
     GitStatusTool,

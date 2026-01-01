@@ -1,8 +1,10 @@
+//! Build/test script runner implementation.
+
+use crate::RpcResponse;
 use crate::config::{DEFAULT_SCRIPT_TIMEOUT_MS, MAX_SCRIPT_STDERR_BYTES, MAX_SCRIPT_STDOUT_BYTES};
 use crate::process_utils;
-use crate::RpcResponse;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{error, info};

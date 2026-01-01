@@ -1,7 +1,13 @@
-use serde_json::{json, Value};
+//! Git operation types and response builders.
+//!
+//! This module contains the core types used by Git tool handlers:
+//! - [`GitExecResult`]: Captures the result of a Git command execution
+//! - [`build_git_response`]: Constructs MCP-compatible response payloads
+
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
-/// Result of executing a Git command via [`run_git`](crate::git_tools::run_git).
+/// Result of executing a Git command via [`super::run_git`].
 ///
 /// Captures all information needed to construct an MCP response, including
 /// the exact command executed, output streams, and execution metadata.
@@ -32,19 +38,18 @@ pub struct GitExecResult {
 
 /// Build a standard MCP-compatible Git response payload.
 ///
-/// This consolidates the repeated response building pattern across all Git tools
-/// (GitStatus, GitDiff, GitRestore, GitAdd, GitCommit) by handling the common
-/// fields and allowing optional extra fields to be added per-tool.
+/// Consolidates the response building pattern across all Git tools by handling
+/// common fields and allowing optional extra fields per-tool.
 ///
 /// # Arguments
 ///
 /// * `exec` - The Git execution result containing output and metadata
 /// * `text` - The human-readable text to include in the response
-/// * `extra_fields` - Optional HashMap of additional fields to include in the response
+/// * `extra_fields` - Optional HashMap of additional fields to include
 ///
 /// # Returns
 ///
-/// A JSON Value representing the complete MCP response payload
+/// A JSON Value representing the complete MCP response payload.
 ///
 /// # Example
 ///
@@ -52,7 +57,7 @@ pub struct GitExecResult {
 /// let payload = build_git_response(
 ///     &exec,
 ///     "Changes staged for commit".to_string(),
-///     Some([("staged_files", json!(5))].iter().cloned().collect())
+///     Some([("staged_files", json!(5))].into_iter().collect())
 /// );
 /// ```
 pub fn build_git_response(
@@ -74,7 +79,6 @@ pub fn build_git_response(
         "stderr": exec.stderr,
     });
 
-    // Add any extra fields provided by the caller
     if let Some(extra) = extra_fields
         && let Some(obj) = payload.as_object_mut()
     {

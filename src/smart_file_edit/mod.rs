@@ -224,25 +224,40 @@ pub async fn handle_smart_file_edit(id: Option<Value>, args: Value) -> RpcRespon
         "get_region" => match serde_json::from_value::<GetRegionRequest>(args) {
             Ok(req) => match handle_get_region(&req) {
                 Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
-                Err(err) => RpcResponse::err(id, format!("smart_file_edit get_region error: {err}")),
+                Err(err) => {
+                    RpcResponse::err(id, format!("smart_file_edit get_region error: {err}"))
+                }
             },
             Err(err) => RpcResponse::err(id, format!("invalid get_region arguments: {err}")),
         },
         "apply_snippet_edit" => match serde_json::from_value::<ApplySnippetEditRequest>(args) {
             Ok(req) => match handle_apply_snippet_edit(&req) {
                 Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
-                Err(err) => RpcResponse::err(id, format!("smart_file_edit apply_snippet_edit error: {err}")),
+                Err(err) => RpcResponse::err(
+                    id,
+                    format!("smart_file_edit apply_snippet_edit error: {err}"),
+                ),
             },
-            Err(err) => RpcResponse::err(id, format!("invalid apply_snippet_edit arguments: {err}")),
+            Err(err) => {
+                RpcResponse::err(id, format!("invalid apply_snippet_edit arguments: {err}"))
+            }
         },
         "apply_unified_diff" => match serde_json::from_value::<ApplyUnifiedDiffRequest>(args) {
             Ok(req) => match handle_apply_unified_diff(&req) {
                 Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
-                Err(err) => RpcResponse::err(id, format!("smart_file_edit apply_unified_diff error: {err}")),
+                Err(err) => RpcResponse::err(
+                    id,
+                    format!("smart_file_edit apply_unified_diff error: {err}"),
+                ),
             },
-            Err(err) => RpcResponse::err(id, format!("invalid apply_unified_diff arguments: {err}")),
+            Err(err) => {
+                RpcResponse::err(id, format!("invalid apply_unified_diff arguments: {err}"))
+            }
         },
-        other => RpcResponse::err(id, format!("smart_file_edit does not support action '{}'", other)),
+        other => RpcResponse::err(
+            id,
+            format!("smart_file_edit does not support action '{}'", other),
+        ),
     }
 }
 
@@ -630,20 +645,21 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
         .as_ref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        && expected_hash != model.hash {
-            return Ok(SnippetResult {
-                status: SnippetStatusKind::StaleFile,
-                payload: json!({
-                    "action": "apply_snippet_edit",
-                    "status": "stale_file",
-                    "message": "file hash mismatch, refresh region before applying changes",
-                    "expected_file_hash": expected_hash,
-                    "current_file_hash": model.hash,
-                }),
-                file_hash_before: Some(model.hash),
-                file_hash_after: None,
-            });
-        }
+        && expected_hash != model.hash
+    {
+        return Ok(SnippetResult {
+            status: SnippetStatusKind::StaleFile,
+            payload: json!({
+                "action": "apply_snippet_edit",
+                "status": "stale_file",
+                "message": "file hash mismatch, refresh region before applying changes",
+                "expected_file_hash": expected_hash,
+                "current_file_hash": model.hash,
+            }),
+            file_hash_before: Some(model.hash),
+            file_hash_after: None,
+        });
+    }
 
     let maybe_offset = compute_match_range(
         &model.canonical,
@@ -777,9 +793,10 @@ fn compute_match_range(
     };
 
     if let Some((start, end)) = search_slice
-        && let Some(rel) = haystack[start..end].find(needle) {
-            return Ok(Some(start + rel));
-        }
+        && let Some(rel) = haystack[start..end].find(needle)
+    {
+        return Ok(Some(start + rel));
+    }
 
     Ok(haystack.find(needle))
 }

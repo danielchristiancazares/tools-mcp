@@ -39,7 +39,19 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 use tracing::warn;
+
+/// In-memory cache of the store-name -> store-id mapping.
+///
+/// This avoids reading/parsing `stores.json` on every CodeQuery invocation in long-running
+/// MCP server processes. Disk persistence is still performed on updates via
+/// [`write_store_cache`].
+static STORE_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
+fn store_cache() -> &'static RwLock<HashMap<String, String>> {
+    STORE_CACHE.get_or_init(|| RwLock::new(load_store_cache()))
+}
 
 /// Retrieves a cached vector store ID by name.
 ///
@@ -72,8 +84,10 @@ use tracing::warn;
 /// }
 /// ```
 pub fn load_store_id_from_cache(name: &str) -> Option<String> {
-    let cache = load_store_cache();
-    cache.get(name).cloned()
+    store_cache()
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(name).cloned())
 }
 
 /// Persists a vector store name-to-ID mapping in the cache.
@@ -105,16 +119,25 @@ pub fn load_store_id_from_cache(name: &str) -> Option<String> {
 /// cache_store_id("my-project", &store_id);
 /// ```
 pub fn cache_store_id(name: &str, id: &str) {
-    let mut cache = load_store_cache();
-    if cache
-        .get(name)
-        .map(|existing| existing == id)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    cache.insert(name.to_string(), id.to_string());
-    if let Err(err) = write_store_cache(&cache) {
+    let snapshot = {
+        let mut cache = match store_cache().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if cache
+            .get(name)
+            .map(|existing| existing == id)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        cache.insert(name.to_string(), id.to_string());
+        cache.clone()
+    };
+
+    if let Err(err) = write_store_cache(&snapshot) {
         warn!("Failed to persist CodeQuery store cache: {}", err);
     }
 }

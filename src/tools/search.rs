@@ -1,11 +1,11 @@
+use super::handlers::handle_ripgrep;
 use crate::define_mcp_tool;
-use crate::ripgrep::handle_ripgrep;
 
 define_mcp_tool! {
     SearchTool,
     name: "Search",
-    aliases: ["search", "RipGrep", "ripgrep", "rg"],
-    description: "Search file contents using ripgrep/ugrep with regex support",
+    aliases: ["search", "ugrep", "ug", "RipGrep", "ripgrep", "rg"],
+    description: "Search file contents using ugrep with regex support",
     schema: {
         "type": "object",
         "properties": {

@@ -30,8 +30,6 @@
 //! - **Next.js**: `__NEXT_DATA__`, `_next/static`
 //! - **Svelte**: `svelte-`, `__SVELTE__`
 
-use scraper::{Html, Selector};
-
 // ============================================================================
 // Configuration Thresholds
 // ============================================================================
@@ -100,9 +98,10 @@ pub fn analyze_js_heavy(
 
     // Skip analysis for non-HTML content (case-insensitive check)
     if let Some(ct) = content_type
-        && !ct.to_ascii_lowercase().contains("text/html") {
-            return result;
-        }
+        && !ct.to_ascii_lowercase().contains("text/html")
+    {
+        return result;
+    }
 
     // Heuristic 1: Empty or minimal body with SPA root divs
     if check_empty_spa_shell(html_body, extracted_markdown, &mut result) {
@@ -182,15 +181,10 @@ fn check_empty_spa_shell(
 
 /// Heuristic 2: Check for high script tag density or bundle patterns
 fn check_script_density(html_body: &str, _result: &mut JsHeuristicResult) -> bool {
-    let html = Html::parse_document(html_body);
-
-    // Count script tags
-    if let Ok(script_selector) = Selector::parse("script[src]") {
-        let script_count = html.select(&script_selector).count();
-
-        if script_count > MAX_SCRIPT_TAGS {
-            return true;
-        }
+    // Count external script tags without building a full DOM.
+    let script_count = count_external_script_tags(html_body.as_bytes(), MAX_SCRIPT_TAGS + 1);
+    if script_count > MAX_SCRIPT_TAGS {
+        return true;
     }
 
     // Check for common bundle naming patterns
@@ -211,6 +205,134 @@ fn check_script_density(html_body: &str, _result: &mut JsHeuristicResult) -> boo
     }
 
     false
+}
+
+fn count_external_script_tags(html: &[u8], limit: usize) -> usize {
+    let mut count = 0usize;
+    let mut i = 0usize;
+
+    while let Some(tag_start) = find_open_tag(html, i, b"script") {
+        // Find end of opening tag
+        let Some(tag_end) = find_byte(html, b'>', tag_start + 1) else {
+            break;
+        };
+
+        if has_src_attribute(&html[tag_start..=tag_end]) {
+            count += 1;
+            if count >= limit {
+                return count;
+            }
+        }
+
+        i = tag_end + 1;
+    }
+
+    count
+}
+
+fn has_src_attribute(tag: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < tag.len() {
+        if tag[i].is_ascii_whitespace() {
+            let mut j = i + 1;
+            while j < tag.len() && tag[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 3 <= tag.len() && starts_with_ignore_ascii_case(&tag[j..], b"src") {
+                let mut k = j + 3;
+                // Ensure this is an attribute boundary, not a substring in a longer name.
+                if k < tag.len() && (tag[k].is_ascii_whitespace() || tag[k] == b'=') {
+                    while k < tag.len() && tag[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < tag.len() && tag[k] == b'=' {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn find_byte(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
+    haystack
+        .iter()
+        .skip(from)
+        .position(|&b| b == needle)
+        .map(|pos| from + pos)
+}
+
+fn find_open_tag(haystack: &[u8], from: usize, tag: &[u8]) -> Option<usize> {
+    let mut i = from;
+    while i < haystack.len() {
+        if haystack[i] == b'<' {
+            let mut j = i + 1;
+            // Skip whitespace after '<' (rare but allowed).
+            while j < haystack.len() && haystack[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < haystack.len() && haystack[j] == b'/' {
+                // Closing tag.
+                i += 1;
+                continue;
+            }
+            if j + tag.len() <= haystack.len()
+                && starts_with_ignore_ascii_case(&haystack[j..], tag)
+                && is_tag_name_boundary(haystack, j + tag.len())
+            {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_close_tag_start(haystack: &[u8], from: usize, tag: &[u8]) -> Option<usize> {
+    let mut i = from;
+    while i + 2 < haystack.len() {
+        if haystack[i] == b'<' {
+            let mut j = i + 1;
+            while j < haystack.len() && haystack[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < haystack.len() && haystack[j] == b'/' {
+                j += 1;
+                while j < haystack.len() && haystack[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j + tag.len() <= haystack.len()
+                    && starts_with_ignore_ascii_case(&haystack[j..], tag)
+                    && is_tag_name_boundary(haystack, j + tag.len())
+                {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_tag_name_boundary(haystack: &[u8], idx: usize) -> bool {
+    if idx >= haystack.len() {
+        return true;
+    }
+    let b = haystack[idx];
+    b.is_ascii_whitespace() || b == b'>' || b == b'/'
+}
+
+fn starts_with_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .iter()
+        .take(needle.len())
+        .zip(needle.iter())
+        .all(|(&a, &b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
 }
 
 /// Heuristic 3: Check for framework-specific attributes and patterns
@@ -265,37 +387,47 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
 fn check_header_hints(content_length: Option<usize>, _result: &mut JsHeuristicResult) -> bool {
     // Small HTML payload (< 5KB) often indicates a shell page
     if let Some(length) = content_length
-        && length < 5000 {
-            return true;
-        }
+        && length < 5000
+    {
+        return true;
+    }
 
     false
 }
 
 /// Heuristic 5: Check for explicit noscript warnings
 fn check_noscript_warnings(html_body: &str, _result: &mut JsHeuristicResult) -> bool {
-    let html = Html::parse_document(html_body);
+    // Quick scan for <noscript>...</noscript> content without a DOM parse.
+    let warning_phrases = [
+        "enable javascript",
+        "requires javascript",
+        "javascript is required",
+        "turn on javascript",
+        "javascript disabled",
+        "needs javascript",
+    ];
 
-    if let Ok(noscript_selector) = Selector::parse("noscript") {
-        for element in html.select(&noscript_selector) {
-            let text = element.text().collect::<String>().to_lowercase();
-
-            // Look for common JavaScript requirement phrases
-            let warning_phrases = [
-                "enable javascript",
-                "requires javascript",
-                "javascript is required",
-                "turn on javascript",
-                "javascript disabled",
-                "needs javascript",
-            ];
-
-            for phrase in &warning_phrases {
-                if text.contains(phrase) {
-                    return true;
-                }
-            }
+    let bytes = html_body.as_bytes();
+    let mut i = 0usize;
+    while let Some(open_start) = find_open_tag(bytes, i, b"noscript") {
+        let Some(open_end) = find_byte(bytes, b'>', open_start + 1) else {
+            break;
+        };
+        let content_start = open_end + 1;
+        let Some(close_start) = find_close_tag_start(bytes, content_start, b"noscript") else {
+            break;
+        };
+        let content = &bytes[content_start..close_start];
+        let text = String::from_utf8_lossy(content).to_lowercase();
+        if warning_phrases.iter().any(|phrase| text.contains(phrase)) {
+            return true;
         }
+
+        // Skip past the closing tag.
+        let Some(close_end) = find_byte(bytes, b'>', close_start + 1) else {
+            break;
+        };
+        i = close_end + 1;
     }
 
     false

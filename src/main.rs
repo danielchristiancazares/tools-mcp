@@ -103,19 +103,18 @@ use tracing::{error, info};
 use mcp_protocol::{read_mcp_message, write_mcp_response};
 
 mod codequery;
-mod mcp_protocol;
 mod config;
-mod git_tools;
-mod git_utils;
+mod git;
+mod mcp_protocol;
 mod process_utils;
-mod read_file;
-mod ripgrep;
-mod script_runner;
+mod response;
 mod smart_file_edit;
 mod tool_registry;
 mod tools;
 mod validation;
 mod webfetch;
+
+pub use response::{RpcError, RpcResponse};
 
 use crate::tool_registry::{ToolDef, ToolRegistry};
 
@@ -136,7 +135,7 @@ use crate::tool_registry::{ToolDef, ToolRegistry};
 /// - `WebFetch` - Fetch and process web content with token-aware chunking
 ///
 /// ## Code Analysis Tools
-/// - `Search` - Ripgrep-based file content search
+/// - `Search` - File content search using ugrep
 /// - `CodeQuery` - Semantic code search via OpenAI vector stores
 /// - `Outline` - Extract structural outline from C++ source files
 ///
@@ -231,252 +230,6 @@ struct RpcRequest {
     /// Method parameters. Defaults to empty object if omitted.
     #[serde(default)]
     params: Value,
-}
-
-/// Outgoing JSON-RPC 2.0 response to an MCP client.
-///
-/// A response contains either a `result` (success) or an `error` (failure),
-/// but never both. The `id` must match the corresponding request.
-///
-/// # MCP Content Format
-///
-/// For tool responses, the `result` field uses the MCP content format:
-///
-/// ```json
-/// {
-///   "content": [{"type": "text", "text": "..."}],
-///   "isError": false
-/// }
-/// ```
-///
-/// This allows tools to return structured content (text, JSON, images) while
-/// signaling success/failure via the `isError` flag.
-#[derive(Debug, Serialize)]
-pub(crate) struct RpcResponse<'a> {
-    /// JSON-RPC version (always "2.0").
-    pub(crate) jsonrpc: &'a str,
-
-    /// Request identifier from the corresponding request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) id: Option<Value>,
-
-    /// Success payload. Mutually exclusive with `error`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) result: Option<Value>,
-
-    /// Error payload for protocol-level failures. Mutually exclusive with `result`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<RpcError>,
-}
-
-/// JSON-RPC 2.0 error object for protocol-level failures.
-///
-/// Used for transport/protocol errors (invalid JSON, unknown method, etc.).
-/// Tool-level errors use the MCP content format with `isError: true` instead.
-///
-/// # Standard Error Codes
-///
-/// | Code   | Meaning              |
-/// |--------|----------------------|
-/// | -32700 | Parse error          |
-/// | -32600 | Invalid request      |
-/// | -32601 | Method not found     |
-/// | -32602 | Invalid params       |
-/// | -32603 | Internal error       |
-#[derive(Debug, Serialize)]
-pub(crate) struct RpcError {
-    /// Numeric error code (see table above).
-    pub(crate) code: i64,
-
-    /// Human-readable error description.
-    pub(crate) message: String,
-
-    /// Optional additional error data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) data: Option<Value>,
-}
-
-impl RpcResponse<'static> {
-    /// Creates a success response with the given result payload.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier to echo back (required for non-notification responses)
-    /// * `result` - The result payload (any JSON value)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// RpcResponse::ok(Some(json!(1)), json!({"status": "ready"}))
-    /// ```
-    pub fn ok(id: Option<Value>, result: Value) -> RpcResponse<'static> {
-        RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    /// Creates an error response using MCP content format.
-    ///
-    /// This is used for tool-level errors (as opposed to protocol errors).
-    /// The error is conveyed via `result` with `isError: true`, allowing
-    /// clients to distinguish between "the tool ran but failed" vs
-    /// "the protocol/transport failed".
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier to echo back
-    /// * `msg` - Human-readable error message
-    ///
-    /// # Output Format
-    ///
-    /// ```json
-    /// {
-    ///   "jsonrpc": "2.0",
-    ///   "id": 1,
-    ///   "result": {
-    ///     "content": [{"type": "text", "text": "error message"}],
-    ///     "isError": true
-    ///   }
-    /// }
-    /// ```
-    pub fn err(id: Option<Value>, msg: impl std::fmt::Display) -> RpcResponse<'static> {
-        RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(serde_json::json!({"content":[{"type":"text","text": msg.to_string()}], "isError": true})),
-            error: None,
-        }
-    }
-
-    /// Creates a success response with text content and additional metadata.
-    ///
-    /// This is a convenience method for tools that return text output with
-    /// extra metadata fields (e.g., `cached`, `rendering_method`).
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier to echo back
-    /// * `text` - Primary text content
-    /// * `extra` - Additional key-value pairs to merge into the response
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// RpcResponse::ok_text_with(
-    ///     req.id,
-    ///     "File contents here",
-    ///     [("cached", json!(true)), ("bytes", json!(1024))]
-    /// )
-    /// ```
-    pub fn ok_text_with(
-        id: Option<Value>,
-        text: impl Into<String>,
-        extra: impl IntoIterator<Item = (&'static str, Value)>,
-    ) -> RpcResponse<'static> {
-        let mut payload = serde_json::json!({
-            "content": [{"type": "text", "text": text.into()}],
-            "isError": false
-        });
-        if let Some(obj) = payload.as_object_mut() {
-            for (k, v) in extra {
-                obj.insert(k.to_string(), v);
-            }
-        }
-        RpcResponse::ok(id, payload)
-    }
-
-    /// Creates a success response with pretty-printed JSON as text content.
-    ///
-    /// Useful for tools that return structured data that should be human-readable
-    /// in the response. The JSON is pretty-printed for readability.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier to echo back
-    /// * `json_value` - The JSON value to serialize and return as text
-    /// * `is_error` - Whether this represents an error condition
-    ///
-    /// # Note
-    ///
-    /// If serialization fails, a fallback error message is returned instead.
-    pub fn ok_json_content(id: Option<Value>, json_value: Value, is_error: bool) -> RpcResponse<'static> {
-        let json_text = serde_json::to_string_pretty(&json_value).unwrap_or_else(|e| {
-            format!("{{\"error\": \"serialization failed: {}\"}}", e)
-        });
-        RpcResponse::ok(
-            id,
-            serde_json::json!({
-                "content": [{"type": "text", "text": json_text}],
-                "isError": is_error
-            }),
-        )
-    }
-
-    /// Parses request arguments into a typed struct.
-    ///
-    /// This is a convenience method for tool implementations that need to
-    /// deserialize their arguments from the generic `Value` passed by the
-    /// dispatcher.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The target type (must implement `DeserializeOwned`)
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier (used in error response if parsing fails)
-    /// * `args` - The raw JSON arguments to parse
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(T)` - Successfully parsed arguments
-    /// * `Err(RpcResponse)` - Pre-built error response ready to return
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let args: MyToolArgs = RpcResponse::parse(id.clone(), args)?;
-    /// ```
-    pub fn parse<T: serde::de::DeserializeOwned>(
-        id: Option<Value>,
-        args: Value,
-    ) -> Result<T, RpcResponse<'static>> {
-        serde_json::from_value::<T>(args)
-            .map_err(|e| RpcResponse::err(id, format!("invalid arguments: {e}")))
-    }
-
-    /// Creates a protocol-level error response.
-    ///
-    /// Unlike [`Self::err`], this uses the JSON-RPC `error` field instead of
-    /// the `result` field. This is appropriate for protocol/transport errors
-    /// (invalid JSON, unknown method, etc.) rather than tool execution failures.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier to echo back
-    /// * `code` - Numeric error code (use standard JSON-RPC codes, see [`RpcError`])
-    /// * `msg` - Human-readable error message
-    ///
-    /// # Standard Error Codes
-    ///
-    /// * `-32601` - Method not found
-    /// * `-32602` - Invalid params
-    /// * `-32603` - Internal error
-    pub fn protocol_error(id: Option<Value>, code: i64, msg: impl Into<String>) -> RpcResponse<'static> {
-        RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: None,
-            error: Some(RpcError {
-                code,
-                message: msg.into(),
-                data: None,
-            }),
-        }
-    }
 }
 
 /// Response payload for the `mcp/initialize` method.
@@ -654,10 +407,13 @@ async fn main() -> Result<()> {
         let (resp, should_exit): (RpcResponse, bool) = match req.method.as_str() {
             // Health check (JSON-RPC method, not a tool)
             "ping" | "mcp/ping" => (
-                RpcResponse::ok(req.id, serde_json::json!({
-                    "content": [{"type": "text", "text": "pong"}],
-                    "isError": false
-                })),
+                RpcResponse::ok(
+                    req.id,
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": "pong"}],
+                        "isError": false
+                    }),
+                ),
                 false,
             ),
 
@@ -741,15 +497,20 @@ async fn main() -> Result<()> {
             }
 
             // Graceful shutdown
-            "mcp/shutdown" | "shutdown" | "server/shutdown" => {
-                (RpcResponse::ok(req.id, serde_json::json!({"ok": true})), true)
-            }
+            "mcp/shutdown" | "shutdown" | "server/shutdown" => (
+                RpcResponse::ok(req.id, serde_json::json!({"ok": true})),
+                true,
+            ),
 
             // Unknown method
             _ => {
                 error!("Unknown method: {}", req.method);
                 (
-                    RpcResponse::protocol_error(req.id, -32601, format!("Method not found: {}", req.method)),
+                    RpcResponse::protocol_error(
+                        req.id,
+                        -32601,
+                        format!("Method not found: {}", req.method),
+                    ),
                     false,
                 )
             }
@@ -772,5 +533,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
-

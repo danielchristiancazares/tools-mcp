@@ -1,3 +1,5 @@
+//! File reading handler implementation.
+
 use crate::RpcResponse;
 use crate::validation;
 use serde::Deserialize;
@@ -40,17 +42,8 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
 
     let text = String::from_utf8_lossy(&data);
 
-    // Handle empty files explicitly to avoid range confusion.
     if text.is_empty() {
-        let payload = json!({
-            "content": [{"type": "text", "text": ""}],
-            "isError": false,
-            "path": path.display().to_string(),
-            "start_line": 0,
-            "end_line": 0,
-            "total_lines": 0
-        });
-        return RpcResponse::ok(id, payload);
+        return RpcResponse::err(id, format!("file is empty: {}", path.display()));
     }
 
     let line_count = text.split_inclusive('\n').count();
@@ -79,7 +72,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
 
     let resolved_end = end.min(line_count);
     let width = resolved_end.max(1).to_string().len();
-    let show_line_numbers = req.show_line_numbers.unwrap_or(false);
+    let show_line_numbers = req.show_line_numbers.unwrap_or(true);
 
     let mut body = String::new();
     for (idx, line) in text.split_inclusive('\n').enumerate() {
