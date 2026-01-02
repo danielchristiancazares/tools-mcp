@@ -1622,6 +1622,38 @@ cargo test -- --nocapture
 cargo test test_name
 ```
 
+### Coverage (Local HTML)
+
+This repo supports local code coverage via `cargo llvm-cov` (HTML output).
+
+Prerequisites:
+- Install the Rust LLVM tools: `rustup component add llvm-tools-preview`
+- Install the cargo subcommand: `cargo install cargo-llvm-cov`
+
+Run (cross-platform):
+```bash
+cargo coverage
+```
+
+Run via scripts (also supports installing missing prerequisites):
+
+Windows (PowerShell):
+```powershell
+.\scripts\coverage.ps1
+# or:
+.\scripts\coverage.ps1 -Install -Open
+```
+
+Unix/macOS:
+```bash
+./scripts/coverage.sh
+# or:
+./scripts/coverage.sh --install
+```
+
+Output:
+- `coverage/index.html`
+
 ### Integration Testing
 
 The server can be tested via stdin/stdout:

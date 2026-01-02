@@ -1,0 +1,4 @@
+[alias]
+# Generates an HTML report in ./coverage/ (requires cargo-llvm-cov + llvm-tools-preview).
+coverage = ["llvm-cov", "--workspace", "--html", "--output-dir", "coverage"]
+

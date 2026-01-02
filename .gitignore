@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Coverage output
+/coverage/
+/tmp/
+
 # Cargo lock file (can be included for binaries)
 Cargo.lock
 
