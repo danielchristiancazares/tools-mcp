@@ -31,7 +31,7 @@
 
 use anyhow::{Context, Result};
 use std::sync::OnceLock;
-use tiktoken_rs::{CoreBPE, cl100k_base};
+use tiktoken_rs::{CoreBPE, Rank, cl100k_base};
 
 /// Default maximum tokens per chunk.
 ///
@@ -108,27 +108,48 @@ pub fn chunk_markdown(
             return Ok(());
         }
 
-        for slice in tokens.chunks(max_tokens) {
-            let decoded = encoder
-                .decode(slice.to_vec())
-                .context("decode cl100k_base token slice")?;
+        // IMPORTANT: `tiktoken-rs` token byte sequences are not guaranteed to align with UTF-8
+        // character boundaries. If we slice the token array at arbitrary indices and decode each
+        // slice independently, we can cut multi-byte UTF-8 sequences in half, producing invalid
+        // UTF-8 and failing with errors like:
+        // "Unable to decode into a valid UTF-8 string: incomplete".
+        //
+        // To make chunking robust, we enforce `max_tokens` while also ensuring each chunk ends on
+        // a token boundary that is also a UTF-8 boundary.
+        let mut start = 0usize;
+        while start < tokens.len() {
+            let window_end = (start + max_tokens).min(tokens.len());
+            let (decoded, used_tokens) =
+                decode_utf8_safe_token_prefix(encoder, &tokens[start..window_end])
+                    .context("decode cl100k_base token slice (utf8-safe)")?;
+
+            // Always make progress, even if the decoded slice is whitespace-only.
+            start += used_tokens;
+
             // Keep the decoded text as-is so token_count stays exact for the returned text.
             // (Trimming here would require re-tokenizing, which is expensive and can also break
             // indentation-sensitive Markdown like code blocks.)
             if decoded.trim().is_empty() {
                 continue;
             }
-            chunks.push((heading.clone(), decoded, slice.len()));
+            chunks.push((heading.clone(), decoded, used_tokens));
         }
 
         Ok(())
     };
 
+    let mut in_code_block = false;
+
     for line in markdown.lines() {
         let trimmed = line.trim();
 
-        // Headings mark natural chunk boundaries
-        if trimmed.starts_with('#') {
+        // Track fenced code blocks (``` or ```language)
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+
+        // Headings mark natural chunk boundaries, but only outside code blocks
+        if !in_code_block && trimmed.starts_with('#') {
             // Flush accumulated content before starting new section
             flush_section(&current_heading, &current_text)?;
             current_text.clear();
@@ -160,6 +181,59 @@ pub fn chunk_markdown(
 pub fn estimate_tokens(text: &str) -> Result<usize> {
     let encoder = get_encoder()?;
     Ok(encoder.encode_ordinary(text).len())
+}
+
+/// Decodes a token slice into a valid UTF-8 `String`.
+///
+/// `CoreBPE::decode(Vec<Rank>)` validates UTF-8 and can fail if the decoded bytes start/end in the
+/// middle of a multi-byte UTF-8 sequence. This can happen when we chunk by tokens: token byte
+/// sequences are not guaranteed to align with UTF-8 character boundaries.
+///
+/// This function decodes the provided token slice to raw bytes first and returns the largest
+/// prefix (measured in whole tokens) that forms valid UTF-8.
+fn decode_utf8_safe_token_prefix(encoder: &CoreBPE, tokens: &[Rank]) -> Result<(String, usize)> {
+    anyhow::ensure!(!tokens.is_empty(), "empty token slice");
+
+    // Fast path: most token windows decode cleanly. Avoid any extra bookkeeping unless we hit a
+    // UTF-8 validation failure.
+    if let Ok(s) = encoder.decode(tokens.to_vec()) {
+        return Ok((s, tokens.len()));
+    }
+
+    // Decode to raw bytes (no UTF-8 validation) and record byte-length boundaries after each token.
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut byte_ends: Vec<usize> = Vec::with_capacity(tokens.len());
+    for token_bytes in encoder._decode_native_and_split(tokens.to_vec()) {
+        bytes.extend_from_slice(&token_bytes);
+        byte_ends.push(bytes.len());
+    }
+
+    let utf8_err = match std::str::from_utf8(&bytes) {
+        Ok(s) => return Ok((s.to_string(), tokens.len())),
+        Err(e) => e,
+    };
+
+    let valid_up_to = utf8_err.valid_up_to();
+
+    // Find the largest token boundary whose byte offset is <= valid_up_to.
+    let keep_tokens = match byte_ends.binary_search(&valid_up_to) {
+        Ok(idx) => idx + 1,
+        Err(pos) => pos,
+    };
+
+    // This should be unreachable if we only start chunks at UTF-8 boundaries, but be defensive:
+    // fall back to a lossy decode of a single token so we always make progress.
+    if keep_tokens == 0 {
+        let first = encoder
+            ._decode_native_and_split(vec![tokens[0]])
+            .next()
+            .unwrap_or_default();
+        return Ok((String::from_utf8_lossy(&first).to_string(), 1));
+    }
+
+    let byte_end = byte_ends[keep_tokens - 1];
+    let s = std::str::from_utf8(&bytes[..byte_end]).context("utf8 prefix")?;
+    Ok((s.to_string(), keep_tokens))
 }
 
 #[cfg(test)]
@@ -220,6 +294,149 @@ Body line 2
                 token_count <= max_tokens,
                 "chunk token_count {token_count} exceeded max_tokens {max_tokens}"
             );
+        }
+    }
+
+    #[test]
+    fn chunk_markdown_does_not_split_inside_code_blocks() {
+        // BUG: The chunker treats `# comment` inside fenced code blocks as headings
+        let md = "# Title\n```python\n# This is a comment\nx = 1\n```";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        // If the bug exists, it splits at "# This is a comment" producing 2 chunks.
+        // Correct behavior: 1 chunk containing the full code block.
+        assert_eq!(
+            chunks.len(),
+            1,
+            "Should not split inside a fenced code block. Got {} chunks: {:?}",
+            chunks.len(),
+            chunks.iter().map(|(h, t, _)| (h, t)).collect::<Vec<_>>()
+        );
+        assert!(
+            chunks[0].1.contains("```python\n# This is a comment"),
+            "Chunk should contain the full code block"
+        );
+    }
+
+    #[test]
+    fn chunk_markdown_is_utf8_safe_for_token_boundaries() {
+        // Regression test for the historical bug where naive token chunking
+        // (`tokens.chunks(max_tokens)`) can split multi-byte UTF-8 sequences.
+        //
+        // Rather than hard-coding a single problematic character (tokenization can differ across
+        // vocab updates), we search a small, fixed set of "PDF-ish" Unicode characters/patterns
+        // until we find one that fails under naive token slicing.
+        let encoder = get_encoder().expect("tokenizer init failed");
+        let max_tokens = 64;
+
+        let candidates: &[char] = &[
+            '\u{00A0}', // NO-BREAK SPACE (common in PDF text)
+            '\u{202F}', // NARROW NO-BREAK SPACE
+            '\u{200B}', // ZERO WIDTH SPACE
+            '\u{2060}', // WORD JOINER
+            '\u{FEFF}', // ZERO WIDTH NO-BREAK SPACE / BOM
+            '€', '—', '…', '漢', '😀',
+        ];
+
+        let mut found: Option<String> = None;
+        'outer: for &ch in candidates {
+            for reps in [128usize, 256, 512] {
+                let md = format!("A{ch}").repeat(reps);
+                let tokens = encoder.encode_ordinary(&md);
+                if tokens.len() <= max_tokens {
+                    continue;
+                }
+
+                // Simulate the buggy behavior: fixed token chunking + UTF-8 validating decode.
+                let naive_fails = tokens
+                    .chunks(max_tokens)
+                    .any(|slice| encoder.decode(slice.to_vec()).is_err());
+                if naive_fails {
+                    found = Some(md);
+                    break 'outer;
+                }
+            }
+        }
+
+        let md = found.expect(
+            "failed to find a deterministic repro for naive token slicing; update candidates",
+        );
+
+        let chunks = chunk_markdown(&md, Some(max_tokens)).expect("chunking failed");
+        assert!(!chunks.is_empty());
+        for (_heading, text, token_count) in chunks {
+            assert!(
+                token_count <= max_tokens,
+                "chunk token_count {token_count} exceeded max_tokens {max_tokens}"
+            );
+            assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_real_website_chunking() {
+        // Fetch a real website with Python code examples
+        // Try multiple sites with code examples
+        let urls = [
+            "https://docs.python.org/3/tutorial/inputoutput.html",
+            "https://realpython.com/python-comments-guide/",
+            "https://www.digitalocean.com/community/tutorials/how-to-write-comments-in-python-3",
+        ];
+
+        for url in urls {
+            eprintln!("\n\n========== TESTING: {} ==========", url);
+            test_url(url).await;
+        }
+    }
+
+    async fn test_url(url: &str) {
+        let request = super::super::types::FetchRequest {
+            url: url.to_string(),
+            max_chunk_tokens: Some(600),
+            no_cache: true,
+            force_browser: false,
+        };
+
+        let response = super::super::run_fetch(request)
+            .await
+            .expect("fetch failed");
+
+        eprintln!("\n=== FETCHED: {} ===", url);
+        eprintln!(
+            "Chunks: {}, Method: {}",
+            response.chunks.len(),
+            response.rendering_method
+        );
+
+        // Find chunks with unbalanced code fences
+        let mut broken = Vec::new();
+        for (i, chunk) in response.chunks.iter().enumerate() {
+            let count = chunk.text.matches("```").count();
+            if count % 2 != 0 {
+                broken.push((i, count, chunk.heading.clone(), chunk.text.clone()));
+            }
+        }
+
+        if !broken.is_empty() {
+            eprintln!("\n=== BROKEN CHUNKS ({}) ===", broken.len());
+            for (i, count, heading, text) in &broken {
+                eprintln!(
+                    "\n--- Chunk {} (heading: {:?}, {} backticks) ---",
+                    i, heading, count
+                );
+                eprintln!("{}", &text[..text.len().min(300)]);
+            }
+        } else {
+            eprintln!("\nNo broken chunks found.");
+            // Show some chunks anyway
+            for (i, chunk) in response.chunks.iter().take(5).enumerate() {
+                eprintln!(
+                    "\n--- Chunk {} ({:?}) ---\n{}",
+                    i,
+                    chunk.heading,
+                    &chunk.text[..chunk.text.len().min(200)]
+                );
+            }
         }
     }
 }
