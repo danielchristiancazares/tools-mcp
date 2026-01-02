@@ -546,6 +546,11 @@ fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value> {
     let mut initial_hash: Option<String> = None;
     let mut final_hash: Option<String> = None;
     let mut applied = Vec::new();
+    // Unified diff hunk headers are expressed in the *original* (old) file's line numbers.
+    // As we apply hunks sequentially, earlier hunks can insert/remove lines, shifting the
+    // subsequent hunk locations. Track the cumulative delta so `match_hint` continues to
+    // point at the intended region in the current file.
+    let mut line_delta: isize = 0;
 
     for (idx, hunk) in hunks.iter().enumerate() {
         let old_snippet = hunk.old_snippet();
@@ -558,20 +563,21 @@ fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value> {
             ));
         }
 
-        let start_hint = if hunk.old_start == 0 {
-            Some(1)
+        let base_start = if hunk.old_start == 0 {
+            1
         } else {
-            Some(hunk.old_start)
+            hunk.old_start
         };
+        let adjusted_start = (base_start as isize + line_delta).max(1) as usize;
         let span = hunk.old_len.max(1);
-        let end_hint = start_hint.map(|start| start + span - 1);
+        let end_hint = Some(adjusted_start + span - 1);
 
         let snippet_req = ApplySnippetEditRequest {
             path: req.path.clone(),
             old_snippet,
             new_snippet,
             match_hint: Some(MatchHint {
-                start_line: start_hint,
+                start_line: Some(adjusted_start),
                 end_line: end_hint,
             }),
             file_hash: expected_hash.clone(),
@@ -590,6 +596,7 @@ fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value> {
                     "hunk_index": idx + 1,
                     "result": result.payload
                 }));
+                line_delta += hunk.new_len as isize - hunk.old_len as isize;
             }
             SnippetStatusKind::NoMatch => {
                 return Ok(json!({
@@ -750,8 +757,8 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
 ///
 /// # Search Strategy
 ///
-/// 1. If `hint` is provided, searches within the specified line range first
-/// 2. If no match in the hint region (or no hint), searches the entire file
+/// 1. If `hint` is provided, searches **only** within the specified line range
+/// 2. If no hint is provided, searches the entire file
 /// 3. Returns the canonical offset of the first match, or `None`
 ///
 /// # Arguments
@@ -792,10 +799,8 @@ fn compute_match_range(
         None
     };
 
-    if let Some((start, end)) = search_slice
-        && let Some(rel) = haystack[start..end].find(needle)
-    {
-        return Ok(Some(start + rel));
+    if let Some((start, end)) = search_slice {
+        return Ok(haystack[start..end].find(needle).map(|rel| start + rel));
     }
 
     Ok(haystack.find(needle))
@@ -1676,6 +1681,25 @@ fn parse_range_component(token: &str, prefix: char) -> Result<(usize, usize)> {
 mod tests {
     use super::*;
 
+    fn assert_no_lone_lf(bytes: &[u8]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                assert!(
+                    i > 0 && bytes[i - 1] == b'\r',
+                    "found LF not preceded by CR at byte offset {i}"
+                );
+            }
+        }
+    }
+
+    fn assert_contains_subslice(haystack: &[u8], needle: &[u8]) {
+        assert!(
+            haystack.windows(needle.len().max(1)).any(|w| w == needle),
+            "expected output to contain {:?}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+
     #[test]
     fn test_split_lines_handles_mixed_newlines() {
         let data = b"foo\r\nbar\nbaz\rqux";
@@ -1753,5 +1777,258 @@ mod tests {
         assert_eq!(response.get("status").and_then(|v| v.as_str()), Some("ok"));
         let contents = std::fs::read_to_string(&path).expect("read file");
         assert_eq!(contents, "alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn apply_snippet_edit_preserves_crlf_newlines_in_replacement_bytes() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("crlf.txt");
+        std::fs::write(&path, b"one\r\ntwo\r\nthree\r\n").expect("write");
+
+        let req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "two\nthree".to_string(),
+            new_snippet: "TWO\nTHREE".to_string(),
+            match_hint: None,
+            file_hash: None,
+            region_id: None,
+        };
+
+        let payload = handle_apply_snippet_edit(&req).expect("apply");
+        assert_eq!(payload["status"].as_str(), Some("ok"));
+        assert_eq!(payload["newline_kind"].as_str(), Some("CRLF"));
+
+        let out = std::fs::read(&path).expect("read");
+        assert_eq!(out, b"one\r\nTWO\r\nTHREE\r\n");
+        assert_no_lone_lf(&out);
+    }
+
+    #[test]
+    fn apply_snippet_edit_preserves_cr_newlines_in_replacement_bytes() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("cr.txt");
+        std::fs::write(&path, b"one\rtwo\rthree\r").expect("write");
+
+        let req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "two\nthree".to_string(),
+            new_snippet: "TWO\nTHREE".to_string(),
+            match_hint: None,
+            file_hash: None,
+            region_id: None,
+        };
+
+        let payload = handle_apply_snippet_edit(&req).expect("apply");
+        assert_eq!(payload["status"].as_str(), Some("ok"));
+        assert_eq!(payload["newline_kind"].as_str(), Some("CR"));
+
+        let out = std::fs::read(&path).expect("read");
+        assert_eq!(out, b"one\rTWO\rTHREE\r");
+        assert!(
+            !out.contains(&b'\n'),
+            "CR-only file should not contain LF bytes"
+        );
+    }
+
+    #[test]
+    fn apply_snippet_edit_uses_dominant_newline_for_mixed_file() {
+        use tempfile::tempdir;
+
+        // 1 LF + 1 CRLF => tie; dominance prefers CRLF.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mixed.txt");
+        std::fs::write(&path, b"one\ntwo\r\nthree").expect("write");
+
+        let req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "two\nthree".to_string(),
+            new_snippet: "TWO\nTHREE".to_string(),
+            match_hint: None,
+            file_hash: None,
+            region_id: None,
+        };
+
+        let payload = handle_apply_snippet_edit(&req).expect("apply");
+        assert_eq!(payload["status"].as_str(), Some("ok"));
+        assert_eq!(payload["newline_kind"].as_str(), Some("CRLF"));
+
+        let out = std::fs::read(&path).expect("read");
+        assert_contains_subslice(&out, b"TWO\r\nTHREE");
+    }
+
+    #[test]
+    fn apply_snippet_edit_rejects_stale_file_hash_and_does_not_modify_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("stale.txt");
+        std::fs::write(&path, b"alpha\nbeta\n").expect("write");
+
+        let original_hash = FileModel::from_path(&path).expect("model").hash;
+
+        // External modification after the hash was computed.
+        std::fs::write(&path, b"alpha\nbeta\nCHANGED\n").expect("rewrite");
+
+        let req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "beta".to_string(),
+            new_snippet: "BETA".to_string(),
+            match_hint: None,
+            file_hash: Some(original_hash.clone()),
+            region_id: None,
+        };
+
+        let payload = handle_apply_snippet_edit(&req).expect("apply");
+        assert_eq!(payload["status"].as_str(), Some("stale_file"));
+        assert_eq!(
+            payload["expected_file_hash"].as_str(),
+            Some(original_hash.as_str())
+        );
+
+        let out = std::fs::read(&path).expect("read");
+        assert_eq!(out, b"alpha\nbeta\nCHANGED\n");
+    }
+
+    #[test]
+    fn match_hint_selects_correct_occurrence_and_is_strict() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("hint.txt");
+        std::fs::write(&path, b"line1\ntarget\nline3\ntarget\nline5\n").expect("write");
+
+        // Replace the second "target" (line 4).
+        let ok_req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "target".to_string(),
+            new_snippet: "TARGET2".to_string(),
+            match_hint: Some(MatchHint {
+                start_line: Some(4),
+                end_line: Some(4),
+            }),
+            file_hash: None,
+            region_id: None,
+        };
+        let ok_payload = handle_apply_snippet_edit(&ok_req).expect("apply");
+        assert_eq!(ok_payload["status"].as_str(), Some("ok"));
+
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(out, "line1\ntarget\nline3\nTARGET2\nline5\n");
+
+        // Now prove strictness: a hint range that does NOT include any match should not fall back
+        // to editing elsewhere.
+        std::fs::write(&path, b"line1\ntarget\nline3\ntarget\nline5\n").expect("reset");
+        let no_req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "target".to_string(),
+            new_snippet: "SHOULD_NOT_APPLY".to_string(),
+            match_hint: Some(MatchHint {
+                start_line: Some(1),
+                end_line: Some(1),
+            }),
+            file_hash: None,
+            region_id: None,
+        };
+        let no_payload = handle_apply_snippet_edit(&no_req).expect("apply");
+        assert_eq!(no_payload["status"].as_str(), Some("no_match"));
+        let out2 = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(out2, "line1\ntarget\nline3\ntarget\nline5\n");
+    }
+
+    #[test]
+    fn apply_unified_diff_applies_multiple_hunks_with_line_delta_tracking() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("multi.txt");
+        std::fs::write(&path, b"a\nb\nc\nd\ne\n").expect("write");
+
+        let diff = "\
+@@ -1,2 +1,3 @@
+ a
+ b
++x
+@@ -3,3 +4,3 @@
+ c
+ d
+-e
++E
+";
+
+        let req = ApplyUnifiedDiffRequest {
+            path: path.to_string_lossy().to_string(),
+            diff: diff.to_string(),
+            file_hash: None,
+        };
+
+        let resp = handle_apply_unified_diff(&req).expect("apply diff");
+        assert_eq!(resp["status"].as_str(), Some("ok"));
+        assert_eq!(resp["hunks_applied"].as_u64(), Some(2));
+
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(out, "a\nb\nx\nc\nd\nE\n");
+    }
+
+    #[test]
+    fn apply_unified_diff_respects_no_newline_at_eof_marker() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("nonewline.txt");
+        std::fs::write(&path, b"alpha\nbeta").expect("write");
+
+        let diff = "\
+@@ -1,2 +1,2 @@
+ alpha
+-beta
+\\ No newline at end of file
++beta2
+\\ No newline at end of file
+";
+
+        let req = ApplyUnifiedDiffRequest {
+            path: path.to_string_lossy().to_string(),
+            diff: diff.to_string(),
+            file_hash: None,
+        };
+
+        let resp = handle_apply_unified_diff(&req).expect("apply diff");
+        assert_eq!(resp["status"].as_str(), Some("ok"));
+
+        let out = std::fs::read(&path).expect("read");
+        assert_eq!(out, b"alpha\nbeta2");
+        assert!(!out.ends_with(b"\n"), "expected no trailing newline at EOF");
+    }
+
+    #[test]
+    fn apply_unified_diff_with_wrong_hash_returns_stale_file_and_does_not_modify() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("stale-diff.txt");
+        std::fs::write(&path, b"alpha\nbeta\n").expect("write");
+
+        let diff = "\
+@@ -1,2 +1,3 @@
+ alpha
+ beta
++gamma
+";
+        let req = ApplyUnifiedDiffRequest {
+            path: path.to_string_lossy().to_string(),
+            diff: diff.to_string(),
+            file_hash: Some("sha256:deadbeef".to_string()),
+        };
+
+        let resp = handle_apply_unified_diff(&req).expect("apply diff");
+        assert_eq!(resp["status"].as_str(), Some("stale_file"));
+        assert_eq!(resp["failed_hunk"].as_u64(), Some(1));
+
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(out, "alpha\nbeta\n");
     }
 }
