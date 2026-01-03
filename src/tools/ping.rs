@@ -1,8 +1,17 @@
 use crate::RpcResponse;
 use crate::define_mcp_tool;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-async fn handle_ping(id: Option<Value>, _args: Value) -> RpcResponse<'static> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PingRequest {}
+
+async fn handle_ping(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+    let _req = match RpcResponse::parse::<PingRequest>(id.clone(), args) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     RpcResponse::ok(
         id,
         json!({

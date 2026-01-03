@@ -13,6 +13,7 @@ use std::path::Path;
 /// so callers can easily reference exact lines. By default, raw content is returned.
 pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct ReadRequest {
         path: String,
         #[serde(default)]

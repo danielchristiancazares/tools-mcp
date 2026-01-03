@@ -6,6 +6,7 @@ use std::path::Path;
 use tree_sitter::{Node, Parser};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OutlineRequest {
     path: String,
     #[serde(default)]

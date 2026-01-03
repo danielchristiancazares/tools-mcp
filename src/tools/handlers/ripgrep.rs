@@ -177,8 +177,9 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
             }
         }
 
-        // Pattern and root path
-        cmd.arg(&req.pattern).arg(root);
+        // End of options marker prevents patterns like "//" or "-foo" from being
+        // interpreted as flags
+        cmd.arg("--").arg(&req.pattern).arg(root);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

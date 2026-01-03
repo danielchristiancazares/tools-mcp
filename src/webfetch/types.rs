@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchRequest {
     /// The URL to fetch. Must be an absolute URL with `http://` or `https://` scheme.
     ///

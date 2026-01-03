@@ -353,6 +353,7 @@ struct ApplyUnifiedDiffRequest {
 ///
 /// Both line numbers are 1-indexed and inclusive.
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct MatchHint {
     /// First line of the search region (1-indexed). Defaults to 1.
     #[serde(default)]

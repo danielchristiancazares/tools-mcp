@@ -74,6 +74,7 @@ fn expand_single_brace(pattern: &str) -> Option<Vec<String>> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GlobRequest {
     pattern: String,
     #[serde(default)]

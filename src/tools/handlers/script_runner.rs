@@ -18,6 +18,7 @@ pub struct ScriptConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScriptRequest {
     #[serde(default)]
     working_dir: Option<String>,

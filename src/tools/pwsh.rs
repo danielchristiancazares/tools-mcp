@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::{error, info};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PwshRequest {
     command: String,
     #[serde(default)]

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteRequest {
     path: String,
 }

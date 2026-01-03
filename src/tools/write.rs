@@ -7,6 +7,7 @@ use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteRequest {
     path: String,
     content: String,
