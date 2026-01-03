@@ -133,38 +133,67 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 ### Module Organization
 
 ```
+build.rs            # Build script for version embedding
 src/
-  main.rs              # MCP server entry point and protocol handling
-  lib.rs               # OpenAI API client (file_search_core library)
-  build.rs             # Build script for version embedding
+  main.rs           # MCP server entry point and protocol handling
+  lib.rs            # OpenAI API client (file_search_core library)
+  config.rs         # Environment/config defaults
+  mcp_protocol.rs   # JSON-RPC framing/parsing
+  process_utils.rs  # Process helpers
+  response.rs       # JSON-RPC response helpers
+  tool_registry.rs  # Tool registration/dispatch
+  validation.rs     # Input validation helpers
 
   codequery/
-    mod.rs             # Semantic search orchestration
-    cache.rs           # Vector store ID caching
+    mod.rs          # Semantic search orchestration
+    cache.rs        # Vector store ID caching
 
-  webfetch/
-    mod.rs             # Web fetching pipeline orchestration
-    types.rs           # Request/response type definitions
-    http.rs            # HTTP client with SSRF protection
-    browser.rs         # Headless Chrome integration
-    cache.rs           # Disk-based response caching
-    extract.rs         # HTML content extraction
-    chunker.rs         # Token-aware text chunking
-    heuristics.rs      # JS-heavy site detection
-    whitelist.rs       # JS-heavy domain whitelist
+  git/
+    mod.rs          # Git command execution core
+    handlers.rs     # Git tool handlers
+    types.rs        # Git result types
+
+  openai/
+    mod.rs          # OpenAI client plumbing
+    types.rs        # OpenAI API types
+    file_ext.rs     # Extension filtering
+    hash.rs         # Content hashing
 
   smart_file_edit/
-    mod.rs             # Newline-aware file editing
+    mod.rs          # Newline-aware file editing
 
-  git_tools.rs         # Git command execution
-  ripgrep.rs           # File search (rg/ugrep)
-  tools/handlers/read_file.rs # File reading
-  write.rs             # File creation
-  delete.rs            # File deletion
-  glob_files.rs        # Glob pattern matching
-  build_tool.rs        # Build script execution
-  test_tool.rs         # Test script execution
-  outline.rs           # C++ structure extraction
+  tools/
+    mod.rs          # Tool exports
+    build.rs        # Build tool
+    codequery.rs    # CodeQuery tool
+    delete.rs       # Delete tool
+    edit.rs         # Edit tool
+    git.rs          # Git tool wrapper
+    glob.rs         # Glob tool
+    outline.rs      # C++ outline tool
+    ping.rs         # Ping tool
+    pwsh.rs         # PowerShell tool
+    read.rs         # Read tool
+    search.rs       # Search tool (ripgrep/ugrep compatibility)
+    test.rs         # Test tool
+    webfetch.rs     # WebFetch tool
+    write.rs        # Write tool
+    handlers/
+      mod.rs        # Tool handler exports
+      read_file.rs  # File reading
+      ripgrep.rs    # Search handler (ugrep backend)
+      script_runner.rs # Build/test script runner
+
+  webfetch/
+    mod.rs          # Web fetching pipeline orchestration
+    types.rs        # Request/response type definitions
+    http.rs         # HTTP client with SSRF protection
+    browser.rs      # Headless Chrome integration
+    cache.rs        # Disk-based response caching
+    extract.rs      # HTML content extraction
+    chunker.rs      # Token-aware text chunking
+    heuristics.rs   # JS-heavy site detection
+    whitelist.rs    # JS-heavy domain whitelist
 ```
 
 ---
@@ -629,9 +658,9 @@ impl NewlineStats {
 
 ---
 
-### git_tools.rs - Git Operations
+### git/mod.rs - Git Operations
 
-**Location**: `src/git_tools.rs`
+**Location**: `src/git/mod.rs`
 
 Provides git command execution with timeout and output management.
 
@@ -716,18 +745,18 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
 
 ---
 
-### ripgrep.rs - File Search
+### tools/handlers/ripgrep.rs - File Search
 
-**Location**: `src/ripgrep.rs`
+**Location**: `src/tools/handlers/ripgrep.rs`
 
-Provides file content search using ripgrep (rg) or ugrep for fuzzy matching.
+Provides file content search using ugrep (tool keeps ripgrep/rg aliases for compatibility).
 
 ```rust
 /// Searches files using regex or fuzzy patterns
 ///
 /// # Backend Selection
-/// - fuzzy parameter absent: Uses ripgrep (rg)
-/// - fuzzy parameter present (1-4): Uses ugrep with -Z<N> flag
+/// - Uses ugrep for all searches
+/// - Fuzzy parameter present (1-4): Adds -Z<N> flag
 ///
 /// # Parameters
 /// - pattern: String (required) - Search pattern (regex by default)
@@ -775,7 +804,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
 
 ### write.rs - File Creation
 
-**Location**: `src/write.rs`
+**Location**: `src/tools/write.rs`
 
 ```rust
 /// Creates a new file
@@ -797,7 +826,7 @@ pub async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static
 
 ### delete.rs - File Deletion
 
-**Location**: `src/delete.rs`
+**Location**: `src/tools/delete.rs`
 
 ```rust
 /// Deletes a file (DESTRUCTIVE)
@@ -813,9 +842,9 @@ pub async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'stati
 
 ---
 
-### glob_files.rs - File Globbing
+### glob.rs - File Globbing
 
-**Location**: `src/glob_files.rs`
+**Location**: `src/tools/glob.rs`
 
 ```rust
 /// Lists files matching a glob pattern
@@ -834,9 +863,9 @@ pub async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static>
 
 ---
 
-### build_tool.rs / test_tool.rs - Script Execution
+### tools/build.rs / tools/test.rs - Script Execution
 
-**Location**: `src/build_tool.rs`, `src/test_tool.rs`
+**Location**: `src/tools/build.rs`, `src/tools/test.rs`
 
 ```rust
 /// Executes build/test script
@@ -861,7 +890,7 @@ pub async fn handle_test(id: Option<Value>, args: Value) -> RpcResponse<'static>
 
 ### outline.rs - C++ Structure Extraction
 
-**Location**: `src/outline.rs`
+**Location**: `src/tools/outline.rs`
 
 ```rust
 /// Extracts C++ structure without implementation bodies

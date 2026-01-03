@@ -62,7 +62,7 @@ This is a **Rust-based MCP (Model Context Protocol) server** that provides file 
    - Chunks text using OpenAI's `cl100k_base` tokenizer for GPT-4 budgets [tiktoken-rs v0.7.0, https://docs.rs/tiktoken-rs/0.7.0/tiktoken_rs/]
    - Produces summaries plus per-section token counts for Codex
 
-4. **Build Script (`src/build.rs`)**
+4. **Build Script (`build.rs`)**
    - Sets `APP_VERSION` environment variable during compilation if provided
 
 ### Protocol Flow

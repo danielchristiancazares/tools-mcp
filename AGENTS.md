@@ -7,7 +7,7 @@ Rust MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for code search (Ope
 - `src/main.rs` — MCP protocol + tool routing.
 - `src/lib.rs` — OpenAI/vector-store client.
 - `src/codequery/`, `src/webfetch/`, `src/smart_file_edit/` — tool implementations.
-- `src/read_file.rs` — raw file reader tool.
+- `src/tools/handlers/read_file.rs` — raw file reader tool.
 - `tests/` — integration tests; `target/` — build output (generated).
 
 ## Commands
