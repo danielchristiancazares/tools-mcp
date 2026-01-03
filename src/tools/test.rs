@@ -19,21 +19,25 @@ define_mcp_tool! {
     TestTool,
     name: "Test",
     aliases: ["test"],
-    description: "Run test.ps1 (Windows) or test.sh (Unix) script",
+    description: "Run tests. Auto-detects build system (Cargo, npm, pnpm, yarn, Make, Just, Go) or runs test.ps1/test.sh if present.",
     schema: {
         "type": "object",
         "properties": {
             "working_dir": {
                 "type": "string",
-                "description": "Directory containing the test script"
+                "description": "Directory to run tests in (default: current directory)"
             },
             "timeout_ms": {
                 "type": "integer",
                 "description": "Timeout in milliseconds (default: 120000)"
+            },
+            "build_system": {
+                "type": "string",
+                "enum": ["cargo", "npm", "pnpm", "yarn", "make", "just", "go", "script"],
+                "description": "Force a specific build system instead of auto-detecting"
             }
         },
-        "required": [],
-        "additionalProperties": false
+        "required": []
     },
     handler: handle_test
 }

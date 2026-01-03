@@ -13,7 +13,10 @@ pub fn validate_non_empty(
     id: Option<Value>,
 ) -> Result<(), RpcResponse<'static>> {
     if value.trim().is_empty() {
-        return Err(RpcResponse::err(id, format!("{} is required", field_name)));
+        return Err(RpcResponse::err(
+            id,
+            format!("{field_name} is required (non-empty string)"),
+        ));
     }
     Ok(())
 }

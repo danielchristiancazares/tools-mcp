@@ -37,7 +37,22 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
     let data = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return RpcResponse::err(id, format!("failed to read {}: {err}", path.display()));
+            let msg = match err.kind() {
+                std::io::ErrorKind::NotFound => format!(
+                    "file not found: {}. Remediation: check the path (paths are resolved relative to the MCP server's working directory) or use Glob/ListDir to locate it.",
+                    path.display()
+                ),
+                std::io::ErrorKind::PermissionDenied => format!(
+                    "permission denied reading {}. Remediation: check file permissions and whether another process is locking the file.",
+                    path.display()
+                ),
+                std::io::ErrorKind::IsADirectory => format!(
+                    "{} is a directory. Remediation: use ListDir to inspect it, or pass a file path.",
+                    path.display()
+                ),
+                _ => format!("failed to read {}: {err}", path.display()),
+            };
+            return RpcResponse::err(id, msg);
         }
     };
 

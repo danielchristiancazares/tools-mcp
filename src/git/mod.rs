@@ -28,6 +28,12 @@
 //! | `GitRestore` | [`handlers::handle_git_restore`] | Discard uncommitted changes (destructive) |
 //! | `GitAdd` | [`handlers::handle_git_add`] | Stage files for commit |
 //! | `GitCommit` | [`handlers::handle_git_commit`] | Create conventional commits |
+//! | `GitLog` | [`handlers::handle_git_log`] | View commit history |
+//! | `GitBranch` | [`handlers::handle_git_branch`] | List, create, or delete branches |
+//! | `GitCheckout` | [`handlers::handle_git_checkout`] | Switch branches or restore files |
+//! | `GitStash` | [`handlers::handle_git_stash`] | Save and restore work in progress |
+//! | `GitShow` | [`handlers::handle_git_show`] | Display commit contents |
+//! | `GitBlame` | [`handlers::handle_git_blame`] | Line-by-line authorship |
 //!
 //! # Configuration
 //!
@@ -42,7 +48,9 @@ mod handlers;
 mod types;
 
 pub use handlers::{
-    handle_git_add, handle_git_commit, handle_git_diff, handle_git_restore, handle_git_status,
+    handle_git_add, handle_git_blame, handle_git_branch, handle_git_checkout, handle_git_commit,
+    handle_git_diff, handle_git_log, handle_git_restore, handle_git_show, handle_git_stash,
+    handle_git_status,
 };
 
 use crate::config::{MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES};

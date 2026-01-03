@@ -180,6 +180,9 @@ fn build_tool_registry() -> ToolRegistry {
     registry.register::<tools::WriteTool>();
     registry.register::<tools::DeleteTool>();
     registry.register::<tools::GlobTool>();
+    registry.register::<tools::MoveTool>();
+    registry.register::<tools::CopyTool>();
+    registry.register::<tools::ListDirTool>();
 
     // Build/test tools
     registry.register::<tools::BuildTool>();
@@ -193,6 +196,12 @@ fn build_tool_registry() -> ToolRegistry {
     registry.register::<tools::GitRestoreTool>();
     registry.register::<tools::GitAddTool>();
     registry.register::<tools::GitCommitTool>();
+    registry.register::<tools::GitLogTool>();
+    registry.register::<tools::GitBranchTool>();
+    registry.register::<tools::GitCheckoutTool>();
+    registry.register::<tools::GitStashTool>();
+    registry.register::<tools::GitShowTool>();
+    registry.register::<tools::GitBlameTool>();
 
     registry
 }
@@ -492,7 +501,14 @@ async fn main() -> Result<()> {
                 let resp = if let Some(result) = registry.call(name, req.id.clone(), args).await {
                     result
                 } else {
-                    RpcResponse::protocol_error(req.id, -32601, format!("Unknown tool: {}", name))
+                    RpcResponse::protocol_error(
+                        req.id,
+                        -32601,
+                        format!(
+                            "Unknown tool: {}. Call mcp/tools/list to see available tool names.",
+                            name
+                        ),
+                    )
                 };
                 (resp, false)
             }

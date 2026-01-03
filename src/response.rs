@@ -142,6 +142,33 @@ impl RpcResponse<'static> {
         }
     }
 
+    /// Creates a tool-level error response with extra structured fields.
+    ///
+    /// This is useful when callers want to attach machine-readable remediation hints
+    /// (e.g., `remediation`, `error_type`, `path`, `command`) while still providing
+    /// a primary human-readable `content[0].text` message.
+    pub fn err_with(
+        id: Option<Value>,
+        msg: impl Into<String>,
+        extra: impl IntoIterator<Item = (&'static str, Value)>,
+    ) -> RpcResponse<'static> {
+        let mut payload = serde_json::json!({
+            "content": [{"type": "text", "text": msg.into()}],
+            "isError": true
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            for (k, v) in extra {
+                obj.insert(k.to_string(), v);
+            }
+        }
+        RpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(payload),
+            error: None,
+        }
+    }
+
     /// Creates a success response with text content and additional metadata.
     ///
     /// This is a convenience method for tools that return text output with
@@ -255,8 +282,21 @@ impl RpcResponse<'static> {
         id: Option<Value>,
         args: Value,
     ) -> Result<T, RpcResponse<'static>> {
-        serde_json::from_value::<T>(args)
-            .map_err(|e| RpcResponse::err(id, format!("invalid arguments: {e}")))
+        serde_json::from_value::<T>(args).map_err(|e| {
+            let msg = e.to_string();
+            // Serde's error strings are informative but not always prescriptive.
+            // Add short remediation hints for the most common failure modes.
+            let hint = if msg.contains("unknown field") {
+                " Unknown fields are not allowed; check argument names against the tool schema."
+            } else if msg.contains("missing field") {
+                " Required fields are missing; provide all required arguments per the tool schema."
+            } else if msg.contains("invalid type") {
+                " One or more arguments has the wrong type; check the tool schema for expected types."
+            } else {
+                ""
+            };
+            RpcResponse::err(id, format!("invalid arguments: {msg}.{hint}"))
+        })
     }
 
     /// Creates a protocol-level error response.

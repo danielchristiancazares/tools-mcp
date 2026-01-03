@@ -159,7 +159,21 @@ pub use cache::{cache_store_id, load_store_id_from_cache};
 pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResponse<'static> {
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        return crate::RpcResponse::err(id, "OPENAI_API_KEY not set");
+        return crate::RpcResponse::err_with(
+            id,
+            "OPENAI_API_KEY is not set. CodeQuery uses the OpenAI API (vector stores) and requires an API key.",
+            [
+                ("error_type", serde_json::json!("missing_env")),
+                ("env_var", serde_json::json!("OPENAI_API_KEY")),
+                (
+                    "remediation",
+                    serde_json::json!([
+                        "Set OPENAI_API_KEY in the environment before starting the MCP server, then retry CodeQuery.",
+                        "If you cannot provide an API key, use Search/Read/Glob for local-only code navigation.",
+                    ]),
+                ),
+            ],
+        );
     }
 
     let vector_store_id_arg = args
@@ -213,7 +227,9 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
                 file_paths.append(&mut discovered);
             }
             Err(err) => {
-                let message = format!("CodeQuery could not discover local files: {}", err);
+                let message = format!(
+                    "CodeQuery could not discover local files: {err}. Remediation: run the server from the repo root or pass file_paths explicitly."
+                );
                 tracing::error!(error = %message);
                 return crate::RpcResponse::err(id, message);
             }
@@ -225,7 +241,12 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .and_then(|v| v.as_u64())
         .unwrap_or(5) as usize;
     if !(1..=20).contains(&concurrent_limit) {
-        return crate::RpcResponse::err(id, "concurrent_limit must be between 1 and 20");
+        return crate::RpcResponse::err(
+            id,
+            format!(
+                "concurrent_limit must be between 1 and 20 (got {concurrent_limit}). Use a smaller value to reduce API concurrency."
+            ),
+        );
     }
 
     let timeout_ms = args
@@ -233,7 +254,12 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .and_then(|v| v.as_u64())
         .unwrap_or(60_000);
     if timeout_ms < 1_000 {
-        return crate::RpcResponse::err(id, "timeout_ms must be at least 1000 milliseconds");
+        return crate::RpcResponse::err(
+            id,
+            format!(
+                "timeout_ms must be at least 1000 milliseconds (got {timeout_ms}). Increase timeout_ms for large repos or slow networks."
+            ),
+        );
     }
 
     let include_results = args
@@ -315,24 +341,71 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         }
         Err(e) => {
             let error_message = e.to_string();
-            let (client_message, log_message) = if error_message
-                .contains("code_query reindex failed")
-            {
-                (
-                    "Codebase indexing failed after 3 attempts. Please try manual searching heuristics."
-                        .to_string(),
-                    format!("CodeQuery reindex failed: {}", error_message),
-                )
+            let lower = error_message.to_ascii_lowercase();
+
+            // Avoid dumping huge server responses into the primary message; keep a bounded
+            // `details` field for debugging while still giving the model actionable hints.
+            const MAX_DETAILS_CHARS: usize = 1200;
+            let details = if error_message.len() > MAX_DETAILS_CHARS {
+                format!("{}…", &error_message[..MAX_DETAILS_CHARS])
             } else {
-                (
-                    format!("CodeQuery failed: {}", error_message),
-                    format!("CodeQuery error: {}", error_message),
-                )
+                error_message.clone()
             };
 
-            tracing::error!(%log_message);
+            let mut remediation: Vec<String> = Vec::new();
+            if lower.contains("http 401")
+                || lower.contains("unauthorized")
+                || lower.contains("invalid api key")
+            {
+                remediation.push(
+                    "Authentication failed. Verify OPENAI_API_KEY is valid, then restart the MCP server and retry."
+                        .to_string(),
+                );
+            }
+            if lower.contains("http 429") || lower.contains("rate limit") {
+                remediation.push(
+                    "You may be rate-limited. Retry later and/or reduce concurrent_limit (e.g., 1-3)."
+                        .to_string(),
+                );
+            }
+            if lower.contains("timeout") {
+                remediation.push(
+                    "Indexing/search timed out. Increase timeout_ms (especially for large repos) and retry."
+                        .to_string(),
+                );
+            }
+            if lower.contains("dns") || lower.contains("connection") || lower.contains("network") {
+                remediation.push("Network/DNS error. Check connectivity and retry.".to_string());
+            }
+            if remediation.is_empty() {
+                remediation.push(
+                    "Retry CodeQuery; transient OpenAI/network errors often resolve.".to_string(),
+                );
+                remediation.push(
+                    "If the repo is large, pass file_paths to limit indexing scope and reduce work."
+                        .to_string(),
+                );
+            }
+            remediation
+                .push("Fallback: use Search/Read/Glob for local-only code navigation.".to_string());
 
-            crate::RpcResponse::err(id, client_message)
+            let headline = if lower.contains("code_query reindex failed") {
+                "CodeQuery indexing failed after multiple attempts."
+            } else {
+                "CodeQuery failed."
+            };
+
+            tracing::error!("CodeQuery error: {}", error_message);
+
+            crate::RpcResponse::err_with(
+                id,
+                headline,
+                [
+                    ("error_type", serde_json::json!("codequery_failure")),
+                    ("details", serde_json::json!(details)),
+                    ("remediation", serde_json::json!(remediation)),
+                ],
+            )
         }
     }
 }

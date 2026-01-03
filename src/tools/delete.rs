@@ -31,7 +31,7 @@ async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         return RpcResponse::err(
             id,
             format!(
-                "cannot delete directory: {}. Only files can be deleted.",
+                "cannot delete directory: {}. This tool only deletes files. Remediation: delete files within the directory first, or use a shell tool carefully if you intend to remove a directory.",
                 path.display()
             ),
         );

@@ -187,7 +187,12 @@ fn test_tools_list() {
     assert_eq!(response["id"], 3);
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18); // ping, WebFetch, Search, CodeQuery, Read, Edit, GitStatus, GitDiff, GitRestore, GitAdd, GitCommit, Write, Delete, Glob, Build, Test, Outline, Pwsh
+    // Tool inventory can grow over time; assert a minimum and validate key tools exist.
+    assert!(
+        tools.len() >= 18,
+        "expected at least 18 tools, got {}",
+        tools.len()
+    );
 
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -565,11 +570,52 @@ fn test_code_query_requires_api_key() {
 
     assert_eq!(json_response["jsonrpc"], "2.0");
     assert_eq!(json_response["id"], 30);
-    assert_eq!(
-        json_response["result"]["content"][0]["text"].as_str(),
-        Some("OPENAI_API_KEY not set")
+
+    let text = json_response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing CodeQuery error text");
+    assert!(
+        text.contains("OPENAI_API_KEY"),
+        "expected error to mention OPENAI_API_KEY, got: {text}"
     );
     assert_eq!(json_response["result"]["isError"].as_bool(), Some(true));
+
+    // Structured hints
+    assert_eq!(json_response["result"]["error_type"], "missing_env");
+    assert_eq!(json_response["result"]["env_var"], "OPENAI_API_KEY");
+    assert!(json_response["result"]["remediation"].is_array());
+}
+
+#[test]
+fn test_webfetch_blocks_localhost_ssrf() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "WebFetch",
+            "arguments": {
+                "url": "http://localhost:1234/"
+            }
+        }
+    });
+
+    let response = send_mcp_message(request).expect("Failed to call WebFetch");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 31);
+    assert_eq!(response["result"]["isError"], true);
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing WebFetch error text");
+    assert!(
+        text.to_ascii_lowercase().contains("ssrf")
+            || text.to_ascii_lowercase().contains("localhost"),
+        "expected WebFetch error to mention SSRF/localhost, got: {text}"
+    );
+
+    assert_eq!(response["result"]["error_type"], "ssrf_blocked");
 }
 
 #[cfg(test)]

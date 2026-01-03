@@ -101,12 +101,21 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
 
     let base = Path::new(base_path);
     if !base.exists() {
-        return RpcResponse::err(id, format!("base path does not exist: {}", base.display()));
+        return RpcResponse::err(
+            id,
+            format!(
+                "base path does not exist: {}. Remediation: set 'path' to an existing directory (or omit it to use '.').",
+                base.display()
+            ),
+        );
     }
     if !base.is_dir() {
         return RpcResponse::err(
             id,
-            format!("base path is not a directory: {}", base.display()),
+            format!(
+                "base path is not a directory: {}. Remediation: pass a directory path to 'path'.",
+                base.display()
+            ),
         );
     }
 
@@ -119,7 +128,12 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     {
         Ok(ps) => ps,
         Err(err) => {
-            return RpcResponse::err(id, format!("invalid glob pattern: {err}"));
+            return RpcResponse::err(
+                id,
+                format!(
+                    "invalid glob pattern: {err}. Remediation: use patterns like '**/*.rs' or 'src/*.{{ts,tsx}}'."
+                ),
+            );
         }
     };
 
@@ -144,7 +158,12 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                return RpcResponse::err(id, format!("glob walk error: {err}"));
+                return RpcResponse::err(
+                    id,
+                    format!(
+                        "glob walk error: {err}. Remediation: check directory permissions or try a narrower 'path'."
+                    ),
+                );
             }
         };
         // Skip directories

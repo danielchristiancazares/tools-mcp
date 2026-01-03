@@ -184,7 +184,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("failed to spawn ugrep. Install: winget install ugrep / brew install ugrep / apt install ugrep. Error: {e}")
+            anyhow::anyhow!("failed to spawn ugrep. Install: winget install Genivia.ugrep / brew install ugrep / apt install ugrep. Error: {e}")
         })?;
 
         let stdout = child

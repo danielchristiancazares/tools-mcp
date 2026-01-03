@@ -500,6 +500,87 @@ pub async fn run_shell_script(
     })
 }
 
+/// Executes an arbitrary command with arguments, timeout enforcement, and output capture.
+///
+/// This is a generic command runner that spawns any executable with the given arguments.
+/// Unlike `run_shell_script` which invokes a shell interpreter, this directly executes
+/// the specified program.
+///
+/// # Arguments
+///
+/// * `program` - The executable to run (e.g., "cargo", "npm", "make")
+/// * `args` - Command-line arguments to pass to the program
+/// * `working_dir` - Directory to run the command in
+/// * `timeout_ms` - Maximum execution time in milliseconds
+/// * `max_stdout_bytes` - Maximum bytes to capture from stdout
+/// * `max_stderr_bytes` - Maximum bytes to capture from stderr
+///
+/// # Returns
+///
+/// A `ProcessResult` containing exit code, success status, output, and truncation flags.
+pub async fn run_command(
+    program: &str,
+    args: &[String],
+    working_dir: &str,
+    timeout_ms: u64,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<ProcessResult, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(working_dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", program))?;
+
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
+
+    let stdout_task =
+        tokio::spawn(async move { read_to_end_limited(stdout, max_stdout_bytes).await });
+    let stderr_task =
+        tokio::spawn(async move { read_to_end_limited(stderr, max_stderr_bytes).await });
+
+    let mut timed_out = false;
+    let status = match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(e)) => return Err(format!("wait failed: {e}")),
+        Err(_) => {
+            timed_out = true;
+            let _ = child.kill().await;
+            let _ = time::timeout(Duration::from_millis(2_000), child.wait()).await;
+            None
+        }
+    };
+
+    let (stdout_bytes, truncated_stdout) = stdout_task
+        .await
+        .unwrap_or_else(|_| Ok((Vec::new(), false)))
+        .unwrap_or((Vec::new(), false));
+    let (stderr_bytes, truncated_stderr) = stderr_task
+        .await
+        .unwrap_or_else(|_| Ok((Vec::new(), false)))
+        .unwrap_or((Vec::new(), false));
+
+    let stdout = strip_ansi_codes(&String::from_utf8_lossy(&stdout_bytes));
+    let stderr = strip_ansi_codes(&String::from_utf8_lossy(&stderr_bytes));
+
+    let exit_code = status.as_ref().and_then(|s| s.code());
+    let success = status.as_ref().is_some_and(|s| s.success()) && !timed_out;
+
+    Ok(ProcessResult {
+        exit_code,
+        success,
+        timed_out,
+        stdout,
+        stderr,
+        truncated_stdout,
+        truncated_stderr,
+    })
+}
+
 /// Executes a PowerShell command string with timeout enforcement and output capture.
 ///
 /// This function runs an inline PowerShell command (not a script file) using

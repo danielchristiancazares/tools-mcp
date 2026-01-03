@@ -2,6 +2,7 @@ mod build;
 mod codequery;
 mod delete;
 mod edit;
+mod fileops;
 mod git;
 mod glob;
 mod handlers;
@@ -18,7 +19,11 @@ pub use build::BuildTool;
 pub use codequery::CodeQueryTool;
 pub use delete::DeleteTool;
 pub use edit::EditTool;
-pub use git::{GitAddTool, GitCommitTool, GitDiffTool, GitRestoreTool, GitStatusTool};
+pub use fileops::{CopyTool, ListDirTool, MoveTool};
+pub use git::{
+    GitAddTool, GitBlameTool, GitBranchTool, GitCheckoutTool, GitCommitTool, GitDiffTool,
+    GitLogTool, GitRestoreTool, GitShowTool, GitStashTool, GitStatusTool,
+};
 pub use glob::GlobTool;
 pub use outline::OutlineTool;
 pub use ping::PingTool;

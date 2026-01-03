@@ -47,7 +47,14 @@ async fn execute_pwsh(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         Ok(r) => r,
         Err(e) => {
             error!("Pwsh tool: {}", e);
-            return RpcResponse::err(id, format!("failed to run pwsh: {e}"));
+            let msg = if e.to_ascii_lowercase().contains("failed to spawn pwsh") {
+                format!(
+                    "failed to run pwsh: {e}. Remediation: install PowerShell 7 (pwsh) and ensure it is on PATH."
+                )
+            } else {
+                format!("failed to run pwsh: {e}")
+            };
+            return RpcResponse::err(id, msg);
         }
     };
 

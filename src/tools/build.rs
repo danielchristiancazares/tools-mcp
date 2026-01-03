@@ -19,21 +19,25 @@ define_mcp_tool! {
     BuildTool,
     name: "Build",
     aliases: ["build"],
-    description: "Run build.ps1 (Windows) or build.sh (Unix) script",
+    description: "Build the project. Auto-detects build system (Cargo, npm, pnpm, yarn, Make, Just, Go, CMake) or runs build.ps1/build.sh if present.",
     schema: {
         "type": "object",
         "properties": {
             "working_dir": {
                 "type": "string",
-                "description": "Directory containing the build script"
+                "description": "Directory to build in (default: current directory)"
             },
             "timeout_ms": {
                 "type": "integer",
                 "description": "Timeout in milliseconds (default: 120000)"
+            },
+            "build_system": {
+                "type": "string",
+                "enum": ["cargo", "npm", "pnpm", "yarn", "make", "just", "go", "cmake", "script"],
+                "description": "Force a specific build system instead of auto-detecting"
             }
         },
-        "required": [],
-        "additionalProperties": false
+        "required": []
     },
     handler: handle_build
 }

@@ -78,72 +78,21 @@
 //!                        +------------------+
 //! ```
 //!
-//! # Supported Actions
+//! # Usage
 //!
-//! The module exposes three operations through [`handle_smart_file_edit`]:
+//! The primary entry point is [`handle_edit`], which replaces an exact substring
+//! (the `old_snippet`) with new content (`new_snippet`). The old snippet must match
+//! exactly in the canonical view. An optional `match_hint` can constrain the search
+//! to specific line ranges for disambiguation.
 //!
-//! ## `get_region`
-//! Retrieves a portion of a file with line numbers and metadata. Returns both the
-//! plain text and a numbered canonical view suitable for display. Also provides
-//! a file hash for staleness detection.
-//!
-//! ## `apply_snippet_edit`
-//! Replaces an exact substring (the `old_snippet`) with new content (`new_snippet`).
-//! The old snippet must match exactly in the canonical view. An optional `match_hint`
-//! can constrain the search to specific line ranges for disambiguation.
-//!
-//! ## `apply_unified_diff`
-//! Applies a unified diff (the format produced by `git diff` or `diff -u`). Each
-//! hunk is converted to a snippet edit and applied sequentially. Supports context
-//! lines and the `\ No newline at end of file` marker.
-//!
-//! # Staleness Detection
-//!
-//! Each file read produces a SHA-256 hash (`file_hash`). Callers can pass this hash
-//! back when applying edits; if the file has changed since the hash was computed,
-//! the edit is rejected with a `stale_file` status. This prevents overwriting
-//! concurrent modifications.
-//!
-//! # Usage Examples
-//!
-//! ## Reading a file region
+//! ## Example
 //!
 //! ```json
 //! {
-//!   "action": "get_region",
-//!   "path": "/path/to/file.rs",
-//!   "start_line": 10,
-//!   "end_line": 20
-//! }
-//! ```
-//!
-//! Response includes:
-//! - `plain_text`: Raw content with original newlines
-//! - `canonical_text`: Numbered lines for display
-//! - `file_hash`: SHA-256 hash for staleness checks
-//! - `newline_style`: Statistics about line endings
-//!
-//! ## Applying a snippet edit
-//!
-//! ```json
-//! {
-//!   "action": "apply_snippet_edit",
 //!   "path": "/path/to/file.rs",
 //!   "old_snippet": "fn old_name(",
 //!   "new_snippet": "fn new_name(",
-//!   "file_hash": "sha256:abc123...",
 //!   "match_hint": { "start_line": 15, "end_line": 25 }
-//! }
-//! ```
-//!
-//! ## Applying a unified diff
-//!
-//! ```json
-//! {
-//!   "action": "apply_unified_diff",
-//!   "path": "/path/to/file.rs",
-//!   "diff": "@@ -1,3 +1,4 @@\n context\n-old line\n+new line\n+added line\n",
-//!   "file_hash": "sha256:abc123..."
 //! }
 //! ```
 //!
@@ -162,120 +111,54 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
-/// Primary entry point for smart file editing operations, invoked by the MCP server.
-///
-/// Routes incoming requests to the appropriate handler based on the `action` field.
-/// All actions operate on a single file and return structured JSON responses.
-///
-/// # Arguments
-///
-/// * `id` - Optional JSON-RPC request ID, included in the response for correlation
-/// * `args` - JSON object containing:
-///   - `action` (required): One of `"get_region"`, `"apply_snippet_edit"`, or `"apply_unified_diff"`
-///   - Additional fields specific to each action (see action handlers for details)
-///
-/// # Returns
-///
-/// An [`RpcResponse`] containing either:
-/// - Success: JSON payload with action results and `"status": "ok"`
-/// - Partial success: JSON payload with `"status": "no_match"` or `"status": "stale_file"`
-/// - Error: Error message describing the failure
-///
-/// # Supported Actions
-///
-/// | Action | Description |
-/// |--------|-------------|
-/// | `get_region` | Read file content with line numbers and metadata |
-/// | `apply_snippet_edit` | Replace exact substring with new content |
-/// | `apply_unified_diff` | Apply a unified diff (multiple hunks) |
-///
-/// # Example Request (JSON-RPC)
-///
-/// ```json
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 1,
-///   "method": "mcp/tools/call",
-///   "params": {
-///     "name": "Edit",
-///     "arguments": {
-///       "action": "get_region",
-///       "path": "/path/to/file.rs",
-///       "start_line": 1,
-///       "end_line": 10
-///     }
-///   }
-/// }
-/// ```
-pub async fn handle_smart_file_edit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-
-    if action.is_empty() {
-        return RpcResponse::err(id, "smart_file_edit requires an 'action' field");
-    }
-
-    match action.as_str() {
-        "get_region" => match serde_json::from_value::<GetRegionRequest>(args) {
-            Ok(req) => match handle_get_region(&req) {
-                Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
-                Err(err) => {
-                    RpcResponse::err(id, format!("smart_file_edit get_region error: {err}"))
-                }
-            },
-            Err(err) => RpcResponse::err(id, format!("invalid get_region arguments: {err}")),
-        },
-        "apply_snippet_edit" => match serde_json::from_value::<ApplySnippetEditRequest>(args) {
-            Ok(req) => match handle_apply_snippet_edit(&req) {
-                Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
-                Err(err) => RpcResponse::err(
-                    id,
-                    format!("smart_file_edit apply_snippet_edit error: {err}"),
-                ),
-            },
-            Err(err) => {
-                RpcResponse::err(id, format!("invalid apply_snippet_edit arguments: {err}"))
-            }
-        },
-        "apply_unified_diff" => match serde_json::from_value::<ApplyUnifiedDiffRequest>(args) {
-            Ok(req) => match handle_apply_unified_diff(&req) {
-                Ok(payload) => RpcResponse::ok_json_content(id, payload, false),
-                Err(err) => RpcResponse::err(
-                    id,
-                    format!("smart_file_edit apply_unified_diff error: {err}"),
-                ),
-            },
-            Err(err) => {
-                RpcResponse::err(id, format!("invalid apply_unified_diff arguments: {err}"))
-            }
-        },
-        other => RpcResponse::err(
-            id,
-            format!("smart_file_edit does not support action '{}'", other),
-        ),
-    }
+/// Edit request - just path, old_snippet, new_snippet.
+#[derive(Deserialize)]
+struct SimpleEditRequest {
+    path: String,
+    old_snippet: String,
+    new_snippet: String,
+    #[serde(default)]
+    match_hint: Option<MatchHint>,
 }
 
-/// Request parameters for the `get_region` action.
+/// Simplified edit handler - replaces old_snippet with new_snippet in a file.
 ///
-/// Retrieves a portion of a file's content with line numbers and metadata.
-/// If line range is not specified, returns the entire file.
-#[derive(Deserialize)]
-struct GetRegionRequest {
-    /// Absolute or relative path to the file to read.
-    path: String,
-    /// First line to include (1-indexed, inclusive). Defaults to 1.
-    #[serde(default)]
-    start_line: Option<usize>,
-    /// Last line to include (1-indexed, inclusive). Defaults to the last line.
-    /// Clamped to total line count if it exceeds file length.
-    #[serde(default)]
-    end_line: Option<usize>,
+/// This is the streamlined interface for the Edit tool. No action field needed.
+pub async fn handle_edit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+    let req = match RpcResponse::parse::<SimpleEditRequest>(id.clone(), args) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    if req.old_snippet.is_empty() {
+        return RpcResponse::err(
+            id,
+            "old_snippet cannot be empty. Remediation: use Read to copy the exact snippet from the file (use LF newlines), then retry Edit.",
+        );
+    }
+
+    let internal_req = ApplySnippetEditRequest {
+        path: req.path,
+        old_snippet: req.old_snippet,
+        new_snippet: req.new_snippet,
+        match_hint: req.match_hint,
+        file_hash: None,
+        region_id: None,
+    };
+
+    match apply_snippet_edit_impl(&internal_req) {
+        Ok(result) => {
+            let is_error = !matches!(result.status, SnippetStatusKind::Ok);
+            RpcResponse::ok_json_content(id, result.payload, is_error)
+        }
+        Err(err) => RpcResponse::err(
+            id,
+            format!(
+                "edit error: {err}. Remediation: ensure 'path' exists and 'old_snippet' matches exactly; if there are multiple matches, provide match_hint."
+            ),
+        ),
+    }
 }
 
 /// Request parameters for the `apply_snippet_edit` action.
@@ -316,35 +199,6 @@ struct ApplySnippetEditRequest {
     region_id: Option<String>,
 }
 
-/// Request parameters for the `apply_unified_diff` action.
-///
-/// Applies a unified diff (the format produced by `git diff` or `diff -u`).
-/// Each hunk in the diff is applied sequentially as a snippet edit.
-///
-/// # Diff Format Requirements
-///
-/// - Must contain at least one `@@ ... @@` hunk header
-/// - Each hunk must have context or removal lines (pure additions not supported)
-/// - Supports the `\ No newline at end of file` marker
-/// - File headers (`---`, `+++`, `diff`) are ignored
-///
-/// # Atomicity
-///
-/// Hunks are applied one at a time. If any hunk fails to match, the operation
-/// stops and returns an error. Previously applied hunks are NOT rolled back.
-#[derive(Deserialize)]
-struct ApplyUnifiedDiffRequest {
-    /// Absolute or relative path to the file to modify.
-    path: String,
-    /// Unified diff content with `@@ ... @@` hunk headers.
-    /// Must not be empty.
-    diff: String,
-    /// Expected file hash before the first hunk is applied.
-    /// Subsequent hunks use the hash from the previous successful application.
-    #[serde(default)]
-    file_hash: Option<String>,
-}
-
 /// Line range hint for disambiguating snippet matches.
 ///
 /// When a file contains multiple occurrences of `old_snippet`, the match hint
@@ -379,253 +233,25 @@ enum SnippetStatusKind {
 
 /// Internal result structure for snippet edit operations.
 ///
-/// Contains both the JSON response payload and metadata for chaining
-/// multiple edits (used by unified diff application).
+/// Contains both the JSON response payload and metadata.
 struct SnippetResult {
     /// Outcome of the edit attempt.
     status: SnippetStatusKind,
     /// JSON response payload to return to the caller.
     payload: Value,
     /// File hash before the edit (always populated).
+    #[allow(dead_code)]
     file_hash_before: Option<String>,
     /// File hash after the edit (only populated on success).
+    #[allow(dead_code)]
     file_hash_after: Option<String>,
 }
 
-/// Handles the `get_region` action: reads a file region with metadata.
-///
-/// # Response Fields
-///
-/// | Field | Type | Description |
-/// |-------|------|-------------|
-/// | `action` | string | Always `"get_region"` |
-/// | `path` | string | Echoed input path |
-/// | `start_line` | number | Actual start line (may differ from request) |
-/// | `end_line` | number | Actual end line (clamped to file length) |
-/// | `total_lines` | number | Total lines in the file |
-/// | `plain_text` | string | Raw content with LF newlines |
-/// | `canonical_text` | string | Line-numbered display format |
-/// | `region_id` | string | UUID for tracking this region |
-/// | `file_hash` | string | SHA-256 hash for staleness detection |
-/// | `canonical_range` | object | `{start, end}` offsets in canonical view |
-/// | `byte_range` | object | `{start, end}` offsets in raw file bytes |
-/// | `newline_style` | object | Line ending statistics |
-/// | `file_size_bytes` | number | Total file size in bytes |
-///
-/// # Errors
-///
-/// - `start_line` is 0 (must be >= 1)
-/// - `start_line` exceeds total lines
-/// - `end_line` < `start_line`
-/// - File cannot be read
-fn handle_get_region(req: &GetRegionRequest) -> Result<Value> {
-    let path = PathBuf::from(&req.path);
-    let model = FileModel::from_path(&path)?;
-
-    let total_lines = model.canonical.line_views.len().max(1);
-    let start_line = req.start_line.unwrap_or(1);
-    if start_line == 0 {
-        return Err(anyhow!("start_line must be >= 1"));
-    }
-    if start_line > total_lines {
-        return Err(anyhow!(
-            "start_line {} exceeds total lines ({})",
-            start_line,
-            total_lines
-        ));
-    }
-
-    let mut end_line = req.end_line.unwrap_or(total_lines);
-    if end_line < start_line {
-        return Err(anyhow!("end_line must be >= start_line"));
-    }
-    if end_line > total_lines {
-        end_line = total_lines;
-    }
-
-    let canonical_range =
-        canonical_range_for_lines(&model.canonical.line_views, start_line, end_line)?;
-    let byte_start = model
-        .canonical
-        .byte_offset(canonical_range.start)
-        .ok_or_else(|| anyhow!("failed to map canonical start to byte offset"))?;
-    let byte_end = model
-        .canonical
-        .byte_offset(canonical_range.end)
-        .ok_or_else(|| anyhow!("failed to map canonical end to byte offset"))?;
-    let plain_text = model
-        .canonical
-        .text
-        .get(canonical_range.clone())
-        .unwrap_or_default()
-        .to_string();
-    let numbered = render_numbered_lines(&model.canonical.line_views, start_line, end_line);
-
-    let newline_payload = model.newline_stats.describe();
-    let region_id = Uuid::new_v4().to_string();
-
-    Ok(json!({
-        "action": "get_region",
-        "path": &req.path,
-        "start_line": start_line,
-        "end_line": end_line,
-        "total_lines": total_lines,
-        "plain_text": plain_text,
-        "canonical_text": numbered,
-        "region_id": region_id,
-        "file_hash": model.hash,
-        "canonical_range": { "start": canonical_range.start, "end": canonical_range.end },
-        "byte_range": { "start": byte_start, "end": byte_end },
-        "newline_style": newline_payload,
-        "file_size_bytes": model.bytes.len()
-    }))
-}
-
-/// Handles the `apply_snippet_edit` action: replaces a snippet in a file.
-///
-/// This is a thin wrapper that delegates to [`apply_snippet_edit_impl`] and
-/// extracts the JSON payload from the result.
-///
-/// # Response Fields (on success)
-///
-/// | Field | Type | Description |
-/// |-------|------|-------------|
-/// | `action` | string | Always `"apply_snippet_edit"` |
-/// | `status` | string | `"ok"`, `"no_match"`, or `"stale_file"` |
-/// | `replaced_byte_range` | array | `[start, end]` byte offsets replaced |
-/// | `lines` | object | `{start, end}` affected line numbers |
-/// | `bytes_written` | number | Size of replacement in bytes |
-/// | `file_hash_before` | string | Hash before modification |
-/// | `file_hash_after` | string | Hash after modification |
-/// | `newline_kind` | string | Line ending style used (`"LF"`, `"CRLF"`, `"CR"`) |
-/// | `region_id` | string | Echoed from request if provided |
+/// Test helper: wraps apply_snippet_edit_impl and returns the JSON payload.
+#[cfg(test)]
 fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value> {
     let result = apply_snippet_edit_impl(req)?;
     Ok(result.payload)
-}
-
-/// Handles the `apply_unified_diff` action: applies a unified diff to a file.
-///
-/// Parses the diff into hunks and applies each sequentially using snippet edits.
-/// Each hunk's context and removal lines form the `old_snippet`, while context
-/// and addition lines form the `new_snippet`.
-///
-/// # Response Fields (on success)
-///
-/// | Field | Type | Description |
-/// |-------|------|-------------|
-/// | `action` | string | Always `"apply_unified_diff"` |
-/// | `status` | string | `"ok"`, `"no_match"`, or `"stale_file"` |
-/// | `hunks_applied` | number | Count of successfully applied hunks |
-/// | `file_hash_before` | string | Hash before first hunk |
-/// | `file_hash_after` | string | Hash after last hunk |
-/// | `results` | array | Per-hunk application details |
-///
-/// # Response Fields (on failure)
-///
-/// | Field | Type | Description |
-/// |-------|------|-------------|
-/// | `failed_hunk` | number | 1-indexed hunk that failed |
-/// | `details` | object | Error details from the failed snippet edit |
-///
-/// # Errors
-///
-/// - Empty diff string
-/// - No `@@ ... @@` hunk headers found
-/// - Hunk with no context or removal lines (pure additions not supported)
-/// - Malformed hunk header syntax
-fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value> {
-    if req.diff.trim().is_empty() {
-        return Err(anyhow!("diff must not be empty"));
-    }
-    let hunks = parse_unified_diff(&req.diff)?;
-    if hunks.is_empty() {
-        return Err(anyhow!("diff does not contain any hunks to apply"));
-    }
-
-    let mut expected_hash = req.file_hash.clone();
-    let mut initial_hash: Option<String> = None;
-    let mut final_hash: Option<String> = None;
-    let mut applied = Vec::new();
-    // Unified diff hunk headers are expressed in the *original* (old) file's line numbers.
-    // As we apply hunks sequentially, earlier hunks can insert/remove lines, shifting the
-    // subsequent hunk locations. Track the cumulative delta so `match_hint` continues to
-    // point at the intended region in the current file.
-    let mut line_delta: isize = 0;
-
-    for (idx, hunk) in hunks.iter().enumerate() {
-        let old_snippet = hunk.old_snippet();
-        let new_snippet = hunk.new_snippet();
-
-        if old_snippet.is_empty() {
-            return Err(anyhow!(
-                "hunk {} has no context or removal lines; zero-context additions are not supported yet",
-                idx + 1
-            ));
-        }
-
-        let base_start = if hunk.old_start == 0 {
-            1
-        } else {
-            hunk.old_start
-        };
-        let adjusted_start = (base_start as isize + line_delta).max(1) as usize;
-        let span = hunk.old_len.max(1);
-        let end_hint = Some(adjusted_start + span - 1);
-
-        let snippet_req = ApplySnippetEditRequest {
-            path: req.path.clone(),
-            old_snippet,
-            new_snippet,
-            match_hint: Some(MatchHint {
-                start_line: Some(adjusted_start),
-                end_line: end_hint,
-            }),
-            file_hash: expected_hash.clone(),
-            region_id: Some(format!("diff-hunk-{}", idx + 1)),
-        };
-
-        let result = apply_snippet_edit_impl(&snippet_req)?;
-        match result.status {
-            SnippetStatusKind::Ok => {
-                if initial_hash.is_none() {
-                    initial_hash = result.file_hash_before.clone();
-                }
-                expected_hash = result.file_hash_after.clone();
-                final_hash = result.file_hash_after.clone();
-                applied.push(json!({
-                    "hunk_index": idx + 1,
-                    "result": result.payload
-                }));
-                line_delta += hunk.new_len as isize - hunk.old_len as isize;
-            }
-            SnippetStatusKind::NoMatch => {
-                return Ok(json!({
-                    "action": "apply_unified_diff",
-                    "status": "no_match",
-                    "failed_hunk": idx + 1,
-                    "details": result.payload
-                }));
-            }
-            SnippetStatusKind::StaleFile => {
-                return Ok(json!({
-                    "action": "apply_unified_diff",
-                    "status": "stale_file",
-                    "failed_hunk": idx + 1,
-                    "details": result.payload
-                }));
-            }
-        }
-    }
-
-    Ok(json!({
-        "action": "apply_unified_diff",
-        "status": "ok",
-        "hunks_applied": applied.len(),
-        "file_hash_before": initial_hash,
-        "file_hash_after": final_hash,
-        "results": applied
-    }))
 }
 
 /// Core implementation of snippet editing logic.
@@ -890,16 +516,6 @@ fn logical_snippet_lines(snippet: &str) -> Vec<&str> {
         parts.push("");
     }
     parts
-}
-
-fn render_numbered_lines(views: &[LineView], start_line: usize, end_line: usize) -> String {
-    let mut buf = String::new();
-    for line_number in start_line..=end_line {
-        if let Some(view) = views.get(line_number - 1) {
-            buf.push_str(&format!("{line_number}: {}\n", view.text));
-        }
-    }
-    buf
 }
 
 fn canonical_range_for_lines(
@@ -1229,17 +845,6 @@ impl NewlineStats {
             other => other,
         }
     }
-
-    fn describe(&self) -> Value {
-        json!({
-            "dominant": self.dominant().label(),
-            "stats": {
-                "LF": self.lf,
-                "CRLF": self.crlf,
-                "CR": self.cr
-            }
-        })
-    }
 }
 
 /// Metadata about a single logical line in the canonical view.
@@ -1450,234 +1055,6 @@ fn compute_hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-/// Classification of a line within a unified diff hunk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HunkLineKind {
-    /// Context line (prefix ` `): unchanged, used for matching.
-    Context,
-    /// Addition line (prefix `+`): present only in new version.
-    Add,
-    /// Removal line (prefix `-`): present only in old version.
-    Remove,
-}
-
-/// A single line from a unified diff hunk.
-#[derive(Clone, Debug)]
-struct HunkLine {
-    /// Whether this line is context, addition, or removal.
-    kind: HunkLineKind,
-    /// Line content (without the prefix character).
-    text: String,
-    /// Whether this line has a trailing newline.
-    /// Set to `false` when followed by `\ No newline at end of file`.
-    has_newline: bool,
-}
-
-/// A parsed hunk from a unified diff.
-///
-/// Represents a contiguous change region with header information
-/// (line numbers and counts) and the actual diff lines.
-#[derive(Clone, Debug)]
-struct UnifiedHunk {
-    /// Starting line number in the old (original) file.
-    old_start: usize,
-    /// Number of lines from the old file in this hunk.
-    old_len: usize,
-    /// Starting line number in the new (modified) file.
-    #[allow(dead_code)] // Parsed from diff header but not currently used
-    new_start: usize,
-    /// Number of lines in the new file in this hunk.
-    #[allow(dead_code)] // Parsed from diff header but not currently used
-    new_len: usize,
-    /// The diff lines (context, additions, removals).
-    lines: Vec<HunkLine>,
-}
-
-impl UnifiedHunk {
-    /// Reconstructs the old (original) text from this hunk.
-    ///
-    /// Combines context lines and removal lines to produce the text
-    /// that should be found in the file before applying the diff.
-    fn old_snippet(&self) -> String {
-        build_snippet(&self.lines, |kind| kind != HunkLineKind::Add)
-    }
-
-    /// Reconstructs the new (modified) text from this hunk.
-    ///
-    /// Combines context lines and addition lines to produce the text
-    /// that should replace the old snippet.
-    fn new_snippet(&self) -> String {
-        build_snippet(&self.lines, |kind| kind != HunkLineKind::Remove)
-    }
-}
-
-/// Builds a snippet string from hunk lines matching a predicate.
-///
-/// Filters lines by the predicate and concatenates their text,
-/// adding newlines where indicated by `has_newline`.
-fn build_snippet<F>(lines: &[HunkLine], predicate: F) -> String
-where
-    F: Fn(HunkLineKind) -> bool,
-{
-    let mut out = String::new();
-    for line in lines.iter().filter(|line| predicate(line.kind)) {
-        out.push_str(&line.text);
-        if line.has_newline {
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Parses a unified diff string into a vector of hunks.
-///
-/// Extracts hunk headers (`@@ -old,len +new,len @@`) and their associated
-/// diff lines. Ignores file headers (`---`, `+++`, `diff`) and other
-/// non-hunk content.
-///
-/// # Arguments
-///
-/// * `diff` - Unified diff content (as produced by `git diff` or `diff -u`)
-///
-/// # Returns
-///
-/// A vector of [`UnifiedHunk`] structs, one per hunk in the diff.
-///
-/// # Errors
-///
-/// - No `@@ ... @@` hunk headers found
-/// - Malformed hunk header (invalid line numbers)
-/// - Empty hunk (header with no diff lines)
-/// - Unexpected diff line prefix (not ` `, `+`, or `-`)
-///
-/// # Example Input
-///
-/// ```text
-/// @@ -1,3 +1,4 @@
-///  context line
-/// -removed line
-/// +added line
-/// +another added line
-/// ```
-fn parse_unified_diff(diff: &str) -> Result<Vec<UnifiedHunk>> {
-    use std::iter::Peekable;
-
-    let mut hunks = Vec::new();
-    let mut iter: Peekable<std::str::Lines<'_>> = diff.lines().peekable();
-
-    while let Some(line) = iter.next() {
-        if !line.starts_with("@@") {
-            continue;
-        }
-
-        let (old_start, old_len, new_start, new_len) = parse_hunk_header(line)?;
-        let mut hunk_lines: Vec<HunkLine> = Vec::new();
-
-        while let Some(peek) = iter.peek() {
-            let next = *peek;
-            if next.starts_with("@@") || next.starts_with("--- ") || next.starts_with("diff ") {
-                break;
-            }
-
-            let raw = iter.next().unwrap();
-            if raw == "\\ No newline at end of file" {
-                if let Some(last) = hunk_lines.last_mut() {
-                    last.has_newline = false;
-                }
-                continue;
-            }
-
-            let mut chars = raw.chars();
-            let prefix = chars
-                .next()
-                .ok_or_else(|| anyhow!("malformed diff line: {raw:?}"))?;
-            let text: String = chars.collect();
-            let kind = match prefix {
-                ' ' => HunkLineKind::Context,
-                '+' => HunkLineKind::Add,
-                '-' => HunkLineKind::Remove,
-                _ => return Err(anyhow!("unexpected diff marker '{}'", prefix)),
-            };
-            hunk_lines.push(HunkLine {
-                kind,
-                text,
-                has_newline: true,
-            });
-        }
-
-        if hunk_lines.is_empty() {
-            return Err(anyhow!(
-                "diff hunk at -{},+{} is empty",
-                old_start,
-                new_start
-            ));
-        }
-
-        hunks.push(UnifiedHunk {
-            old_start,
-            old_len,
-            new_start,
-            new_len,
-            lines: hunk_lines,
-        });
-    }
-
-    if hunks.is_empty() {
-        Err(anyhow!(
-            "diff did not contain any @@ hunk headers; ensure unified diff format"
-        ))
-    } else {
-        Ok(hunks)
-    }
-}
-
-fn parse_hunk_header(line: &str) -> Result<(usize, usize, usize, usize)> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("@@") || !trimmed.ends_with("@@") {
-        return Err(anyhow!("invalid hunk header: {}", line));
-    }
-    let inner = trimmed
-        .trim_start_matches("@@")
-        .trim_end_matches("@@")
-        .trim();
-    let mut parts = inner.split_whitespace();
-    let old_part = parts
-        .next()
-        .ok_or_else(|| anyhow!("missing old range in hunk header: {}", line))?;
-    let new_part = parts
-        .next()
-        .ok_or_else(|| anyhow!("missing new range in hunk header: {}", line))?;
-
-    let (old_start, old_len) = parse_range_component(old_part, '-')?;
-    let (new_start, new_len) = parse_range_component(new_part, '+')?;
-    Ok((old_start, old_len, new_start, new_len))
-}
-
-fn parse_range_component(token: &str, prefix: char) -> Result<(usize, usize)> {
-    if !token.starts_with(prefix) {
-        return Err(anyhow!(
-            "range component {} must start with '{}'",
-            token,
-            prefix
-        ));
-    }
-    let mut parts = token[1..].split(',');
-    let start = parts
-        .next()
-        .ok_or_else(|| anyhow!("missing start in {}", token))?
-        .parse::<usize>()
-        .map_err(|e| anyhow!("invalid start in {}: {}", token, e))?;
-    let len = parts
-        .next()
-        .map(|v| {
-            v.parse::<usize>()
-                .map_err(|e| anyhow!("invalid length in {}: {}", token, e))
-        })
-        .transpose()?
-        .unwrap_or(1);
-    Ok((start, len))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1734,50 +1111,6 @@ mod tests {
         assert_eq!(canonical.byte_offset(newline_start), Some(5));
         let newline_end = canonical.line_views[0].canonical_full_end;
         assert_eq!(canonical.byte_offset(newline_end), Some(7));
-    }
-
-    #[test]
-    fn test_parse_unified_diff_basic() {
-        let diff = "\
-@@ -1,2 +1,3 @@
- line1
--line2
-+line2
-+line3
-";
-        let hunks = parse_unified_diff(diff).expect("parse diff");
-        assert_eq!(hunks.len(), 1);
-        let hunk = &hunks[0];
-        assert_eq!(hunk.old_start, 1);
-        assert_eq!(hunk.old_len, 2);
-        assert_eq!(hunk.old_snippet(), "line1\nline2\n");
-        assert_eq!(hunk.new_snippet(), "line1\nline2\nline3\n");
-    }
-
-    #[test]
-    fn test_apply_unified_diff_simple_flow() {
-        use tempfile::NamedTempFile;
-
-        let mut file = NamedTempFile::new().expect("temp file");
-        std::io::Write::write_all(&mut file, b"alpha\nbeta\n").expect("write");
-        let path = file.path().to_path_buf();
-
-        let diff = "\
-@@ -1,2 +1,3 @@
- alpha
- beta
-+gamma
-";
-        let req = ApplyUnifiedDiffRequest {
-            path: path.to_string_lossy().to_string(),
-            diff: diff.to_string(),
-            file_hash: None,
-        };
-
-        let response = handle_apply_unified_diff(&req).expect("diff apply");
-        assert_eq!(response.get("status").and_then(|v| v.as_str()), Some("ok"));
-        let contents = std::fs::read_to_string(&path).expect("read file");
-        assert_eq!(contents, "alpha\nbeta\ngamma\n");
     }
 
     #[test]
@@ -1938,98 +1271,5 @@ mod tests {
         assert_eq!(no_payload["status"].as_str(), Some("no_match"));
         let out2 = std::fs::read_to_string(&path).expect("read");
         assert_eq!(out2, "line1\ntarget\nline3\ntarget\nline5\n");
-    }
-
-    #[test]
-    fn apply_unified_diff_applies_multiple_hunks_with_line_delta_tracking() {
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("multi.txt");
-        std::fs::write(&path, b"a\nb\nc\nd\ne\n").expect("write");
-
-        let diff = "\
-@@ -1,2 +1,3 @@
- a
- b
-+x
-@@ -3,3 +4,3 @@
- c
- d
--e
-+E
-";
-
-        let req = ApplyUnifiedDiffRequest {
-            path: path.to_string_lossy().to_string(),
-            diff: diff.to_string(),
-            file_hash: None,
-        };
-
-        let resp = handle_apply_unified_diff(&req).expect("apply diff");
-        assert_eq!(resp["status"].as_str(), Some("ok"));
-        assert_eq!(resp["hunks_applied"].as_u64(), Some(2));
-
-        let out = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(out, "a\nb\nx\nc\nd\nE\n");
-    }
-
-    #[test]
-    fn apply_unified_diff_respects_no_newline_at_eof_marker() {
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("nonewline.txt");
-        std::fs::write(&path, b"alpha\nbeta").expect("write");
-
-        let diff = "\
-@@ -1,2 +1,2 @@
- alpha
--beta
-\\ No newline at end of file
-+beta2
-\\ No newline at end of file
-";
-
-        let req = ApplyUnifiedDiffRequest {
-            path: path.to_string_lossy().to_string(),
-            diff: diff.to_string(),
-            file_hash: None,
-        };
-
-        let resp = handle_apply_unified_diff(&req).expect("apply diff");
-        assert_eq!(resp["status"].as_str(), Some("ok"));
-
-        let out = std::fs::read(&path).expect("read");
-        assert_eq!(out, b"alpha\nbeta2");
-        assert!(!out.ends_with(b"\n"), "expected no trailing newline at EOF");
-    }
-
-    #[test]
-    fn apply_unified_diff_with_wrong_hash_returns_stale_file_and_does_not_modify() {
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("stale-diff.txt");
-        std::fs::write(&path, b"alpha\nbeta\n").expect("write");
-
-        let diff = "\
-@@ -1,2 +1,3 @@
- alpha
- beta
-+gamma
-";
-        let req = ApplyUnifiedDiffRequest {
-            path: path.to_string_lossy().to_string(),
-            diff: diff.to_string(),
-            file_hash: Some("sha256:deadbeef".to_string()),
-        };
-
-        let resp = handle_apply_unified_diff(&req).expect("apply diff");
-        assert_eq!(resp["status"].as_str(), Some("stale_file"));
-        assert_eq!(resp["failed_hunk"].as_u64(), Some(1));
-
-        let out = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(out, "alpha\nbeta\n");
     }
 }
