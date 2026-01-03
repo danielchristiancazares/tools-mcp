@@ -66,7 +66,8 @@
 //! Vector store file indexing is asynchronous. The library provides polling utilities:
 //!
 //! - [`wait_for_vector_store_ready`]: Polls aggregate file counts (efficient for batch operations)
-//! - [`wait_for_vector_file_ready`]: Polls individual file status (legacy, per-file)
+//! - [`wait_for_vector_store_file_ready`]: Polls a single vector store file by ID (efficient per-file)
+//! - [`wait_for_vector_file_ready`]: Polls all vector store files (legacy, per-file)
 //!
 //! Both support configurable poll intervals and timeouts, with fail-fast behavior on terminal
 //! error states (failed/cancelled files).
@@ -352,7 +353,7 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
 /// For each file:
 /// 1. Upload to OpenAI's file storage via [`upload_file`]
 /// 2. Attach to vector store via [`add_file_to_vector_store`]
-/// 3. Wait for indexing via [`wait_for_vector_file_ready`] (30s timeout)
+/// 3. Wait for indexing via [`wait_for_vector_store_file_ready`] (30s timeout)
 ///
 /// Files are processed in chunks of `concurrent_limit` with a 1-second delay
 /// between chunks to avoid rate limiting.
@@ -400,17 +401,18 @@ pub async fn upload_files_batch(
     let mut failures = Vec::new();
 
     // Process files in chunks to avoid overwhelming the API
-    let chunks: Vec<_> = file_paths
-        .chunks(concurrent_limit)
-        .map(|c| c.to_vec())
-        .collect();
+    let chunk_count = if file_paths.is_empty() {
+        0
+    } else {
+        (file_paths.len() + concurrent_limit - 1) / concurrent_limit
+    };
 
-    for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        tracing::info!("Processing chunk {}/{}", chunk_idx + 1, chunks.len());
+    for (chunk_idx, chunk) in file_paths.chunks(concurrent_limit).enumerate() {
+        tracing::info!("Processing chunk {}/{}", chunk_idx + 1, chunk_count);
 
-        let results: Vec<_> = stream::iter(chunk.iter())
+        let results: Vec<_> = stream::iter(chunk.iter().cloned())
             .map(|path| async move {
-                let path = path.clone();
+                let path = path;
 
                 // First upload the file
                 let file_id = match upload_file(client, cfg, &path).await {
@@ -422,12 +424,27 @@ pub async fn upload_files_batch(
                 };
 
                 // Then attach it to the vector store
-                match add_file_to_vector_store(client, cfg, vector_store_id, &file_id).await {
-                    Ok(_) => {
-                        // Wait for file to be processed
-                        if let Err(e) =
-                            wait_for_vector_file_ready(client, cfg, vector_store_id, 1000, 30000)
-                                .await
+                match add_file_to_vector_store_with_response(
+                    client,
+                    cfg,
+                    vector_store_id,
+                    &file_id,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(vs_file) => {
+                        // Wait for the specific file to be processed.
+                        if let Err(e) = wait_for_vector_store_file_ready(
+                            client,
+                            cfg,
+                            vector_store_id,
+                            &vs_file.id,
+                            1000,
+                            30000,
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 "File {} uploaded but processing incomplete: {}",
@@ -456,7 +473,7 @@ pub async fn upload_files_batch(
         }
 
         // Small delay between chunks to avoid rate limiting
-        if chunk_idx < chunks.len() - 1 {
+        if chunk_idx + 1 < chunk_count {
             sleep(Duration::from_millis(1000)).await;
         }
     }
@@ -697,10 +714,37 @@ pub async fn wait_for_vector_store_ready(
     }
 }
 
+/// Internal helper that returns the vector store file item created by the API.
+async fn add_file_to_vector_store_with_response(
+    client: &Client,
+    cfg: &ApiConfig,
+    vs_id: &str,
+    file_id: &str,
+    attributes: Option<serde_json::Map<String, serde_json::Value>>,
+    chunking_strategy: Option<serde_json::Value>,
+) -> Result<VectorStoreFileItem> {
+    let url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
+    let res = client
+        .post(url)
+        .bearer_auth(&cfg.api_key)
+        .header("OpenAI-Beta", "assistants=v2")
+        .json(&VectorStoreFileCreate {
+            file_id: file_id.to_string(),
+            attributes,
+            chunking_strategy,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    let item: VectorStoreFileItem = res.json().await?;
+    Ok(item)
+}
+
 /// Attaches a file to a vector store for indexing.
 ///
 /// Once attached, the file will be processed and indexed asynchronously. Use
-/// [`wait_for_vector_store_ready`] or [`wait_for_vector_file_ready`] to wait
+/// [`wait_for_vector_store_ready`], [`wait_for_vector_store_file_ready`], or
+/// [`wait_for_vector_file_ready`] to wait
 /// for indexing to complete.
 ///
 /// # Arguments
@@ -730,19 +774,7 @@ pub async fn add_file_to_vector_store(
     vs_id: &str,
     file_id: &str,
 ) -> Result<()> {
-    let url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
-    client
-        .post(url)
-        .bearer_auth(&cfg.api_key)
-        .header("OpenAI-Beta", "assistants=v2")
-        .json(&VectorStoreFileCreate {
-            file_id: file_id.to_string(),
-            attributes: None,
-            chunking_strategy: None,
-        })
-        .send()
-        .await?
-        .error_for_status()?;
+    add_file_to_vector_store_with_response(client, cfg, vs_id, file_id, None, None).await?;
     Ok(())
 }
 
@@ -788,27 +820,91 @@ pub async fn add_file_to_vector_store_with(
     attributes: Option<serde_json::Map<String, serde_json::Value>>,
     chunking_strategy: Option<serde_json::Value>,
 ) -> Result<()> {
-    let url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
-    client
-        .post(url)
+    add_file_to_vector_store_with_response(
+        client,
+        cfg,
+        vs_id,
+        file_id,
+        attributes,
+        chunking_strategy,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Retrieves a specific file attachment from a vector store.
+///
+/// This endpoint targets the vector store file relationship ID (not the
+/// underlying file ID returned by [`upload_file`]).
+pub async fn get_vector_store_file(
+    client: &Client,
+    cfg: &ApiConfig,
+    vs_id: &str,
+    vector_store_file_id: &str,
+) -> Result<VectorStoreFileItem> {
+    let url = format!(
+        "{}/vector_stores/{}/files/{}",
+        BASE_URL, vs_id, vector_store_file_id
+    );
+    let res = client
+        .get(url)
         .bearer_auth(&cfg.api_key)
         .header("OpenAI-Beta", "assistants=v2")
-        .json(&VectorStoreFileCreate {
-            file_id: file_id.to_string(),
-            attributes,
-            chunking_strategy,
-        })
         .send()
         .await?
         .error_for_status()?;
-    Ok(())
+    let item: VectorStoreFileItem = res.json().await?;
+    Ok(item)
+}
+
+/// Waits for a specific vector store file to finish processing.
+///
+/// Polls the file status until it reaches `completed`, fails/cancels, or times out.
+pub async fn wait_for_vector_store_file_ready(
+    client: &Client,
+    cfg: &ApiConfig,
+    vs_id: &str,
+    vector_store_file_id: &str,
+    poll_ms: u64,
+    timeout_ms: u64,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let file = get_vector_store_file(client, cfg, vs_id, vector_store_file_id).await?;
+        match file.status.as_str() {
+            "completed" => return Ok(()),
+            "failed" | "cancelled" => {
+                anyhow::bail!(
+                    "vector store file {} is in terminal status '{}'",
+                    vector_store_file_id,
+                    file.status
+                );
+            }
+            "in_progress" => {}
+            status => {
+                anyhow::bail!(
+                    "vector store file {} has unexpected status '{}'",
+                    vector_store_file_id,
+                    status
+                );
+            }
+        }
+
+        if start.elapsed() > Duration::from_millis(timeout_ms) {
+            anyhow::bail!(
+                "timeout waiting for vector store file {} to finish indexing",
+                vector_store_file_id
+            );
+        }
+        sleep(Duration::from_millis(poll_ms)).await;
+    }
 }
 
 /// Waits for all files in a vector store to complete indexing (legacy method).
 ///
 /// Polls the file list endpoint until all files have "completed" status.
-/// For new code, prefer [`wait_for_vector_store_ready`] which uses aggregate
-/// file counts and is more efficient.
+/// For new code, prefer [`wait_for_vector_store_file_ready`] for per-file polling
+/// or [`wait_for_vector_store_ready`] for aggregate counts.
 ///
 /// # Arguments
 ///
@@ -1213,8 +1309,9 @@ pub async fn file_search_run(
 ) -> Result<serde_json::Value> {
     let file_id = upload_file(client, cfg, file_path_or_url).await?;
     let vs_id = create_vector_store(client, cfg, "knowledge_base").await?;
-    add_file_to_vector_store(client, cfg, &vs_id, &file_id).await?;
-    wait_for_vector_file_ready(client, cfg, &vs_id, 1000, 60_000).await?;
+    let vs_file =
+        add_file_to_vector_store_with_response(client, cfg, &vs_id, &file_id, None, None).await?;
+    wait_for_vector_store_file_ready(client, cfg, &vs_id, &vs_file.id, 1000, 60_000).await?;
     let resp = responses_with_file_search(
         client,
         cfg,
