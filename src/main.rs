@@ -100,7 +100,7 @@ use serde_json::Value;
 use tokio::io::{self, BufReader};
 use tracing::{error, info};
 
-use mcp_protocol::{read_mcp_message, write_mcp_response};
+use mcp_protocol::{read_mcp_message, should_skip_headers, write_mcp_response_with_mode};
 
 mod codequery;
 mod config;
@@ -365,13 +365,14 @@ async fn main() -> Result<()> {
     let tools = registry.list();
 
     // Main message loop
-    while let Some(line) = match read_mcp_message(&mut reader).await {
+    while let Some(message) = match read_mcp_message(&mut reader).await {
         Ok(v) => v,
         Err(e) => {
             error!("failed to read MCP message: {}", e);
             None
         }
     } {
+        let line = message.body;
         // Skip empty lines (defensive)
         if line.trim().is_empty() {
             continue;
@@ -518,7 +519,12 @@ async fn main() -> Result<()> {
 
         // Send response
         info!("Sending response for request id: {:?}", resp.id);
-        if let Err(e) = write_mcp_response(&mut writer, &resp).await {
+        let skip_headers = if message.has_headers {
+            false
+        } else {
+            should_skip_headers()
+        };
+        if let Err(e) = write_mcp_response_with_mode(&mut writer, &resp, skip_headers).await {
             error!("failed to write MCP response: {}", e);
             break;
         }

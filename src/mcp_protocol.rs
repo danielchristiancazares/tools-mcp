@@ -52,6 +52,15 @@ pub fn should_skip_headers() -> bool {
     })
 }
 
+/// Represents a decoded MCP message and its framing.
+#[derive(Debug, Clone)]
+pub struct McpMessage {
+    /// The JSON message body.
+    pub body: String,
+    /// True when the message used Content-Length headers.
+    pub has_headers: bool,
+}
+
 /// Reads a single MCP message from an async buffered reader.
 ///
 /// Supports two input formats:
@@ -70,13 +79,14 @@ pub fn should_skip_headers() -> bool {
 /// - Consumes trailing newlines after the message body
 /// - Ignores empty lines before headers (for robustness)
 /// - Case-insensitive header name matching
-pub async fn read_mcp_message<R>(reader: &mut R) -> io::Result<Option<String>>
+pub async fn read_mcp_message<R>(reader: &mut R) -> io::Result<Option<McpMessage>>
 where
     R: AsyncBufRead + Unpin,
 {
     use std::io::ErrorKind;
 
     let mut content_length: Option<usize> = None;
+    let mut saw_headers = false;
 
     // Parse headers or detect raw JSON
     loop {
@@ -117,7 +127,10 @@ where
         if content_length.is_none()
             && (trimmed_start.starts_with('{') || trimmed_start.starts_with('['))
         {
-            return Ok(Some(trimmed.to_owned()));
+            return Ok(Some(McpMessage {
+                body: trimmed.to_owned(),
+                has_headers: false,
+            }));
         }
 
         // Parse Content-Length header (case-insensitive)
@@ -134,6 +147,7 @@ where
                 ));
             }
             content_length = Some(len);
+            saw_headers = true;
         }
     }
 
@@ -154,7 +168,10 @@ where
         reader.consume(1);
     }
 
-    Ok(Some(message))
+    Ok(Some(McpMessage {
+        body: message,
+        has_headers: saw_headers,
+    }))
 }
 
 /// Writes an MCP response to the output stream.
@@ -180,6 +197,7 @@ where
 ///
 /// This function always flushes the writer after writing. This is critical
 /// for clients that read responses synchronously.
+#[allow(dead_code)]
 pub async fn write_mcp_response<W>(writer: &mut W, resp: &RpcResponse<'_>) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -238,7 +256,8 @@ mod tests {
         let input = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n";
         let mut reader = BufReader::new(&input[..]);
         let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
-        assert_eq!(msg, r#"{"jsonrpc":"2.0","id":1}"#);
+        assert_eq!(msg.body, r#"{"jsonrpc":"2.0","id":1}"#);
+        assert!(!msg.has_headers);
     }
 
     #[tokio::test]
@@ -247,10 +266,12 @@ mod tests {
         let mut reader = BufReader::new(&input[..]);
 
         let msg1 = read_mcp_message(&mut reader).await.unwrap().unwrap();
-        assert_eq!(msg1, "hello");
+        assert_eq!(msg1.body, "hello");
+        assert!(msg1.has_headers);
 
         let msg2 = read_mcp_message(&mut reader).await.unwrap().unwrap();
-        assert_eq!(msg2, r#"{"ok":true}"#);
+        assert_eq!(msg2.body, r#"{"ok":true}"#);
+        assert!(!msg2.has_headers);
     }
 
     #[tokio::test]
@@ -258,7 +279,8 @@ mod tests {
         let input = b"\n\nContent-Length: 2\n\nhi\n";
         let mut reader = BufReader::new(&input[..]);
         let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
-        assert_eq!(msg, "hi");
+        assert_eq!(msg.body, "hi");
+        assert!(msg.has_headers);
     }
 
     #[tokio::test]
