@@ -4,9 +4,12 @@
 Rust MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for code search (OpenAI vector stores), web fetching, and newline-safe file editing.
 
 ## Project Structure
-- `src/main.rs` — MCP protocol + tool routing.
-- `src/lib.rs` — OpenAI/vector-store client.
-- `src/codequery/`, `src/webfetch/`, `src/smart_file_edit/` — tool implementations.
+- `src/main.rs` — composition root (stdin/stdout loop).
+- `src/adapters/inbound/mcp_server.rs` — JSON-RPC/MCP routing and tool dispatch.
+- `src/application/` — MCP tool use cases (e.g. `codequery_tool`, `webfetch_tool`).
+- `src/ports/` — outbound port traits (e.g. `CodeQueryEngine`).
+- `src/lib.rs` — OpenAI/vector-store client (`file_search_core`).
+- `src/codequery/`, `src/codequery_cache.rs`, `src/webfetch/`, `src/smart_file_edit/` — tool implementations and caches.
 - `src/tools/handlers/read_file.rs` — raw file reader tool.
 - `tests/` — integration tests; `target/` — build output (generated).
 

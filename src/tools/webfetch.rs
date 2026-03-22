@@ -1,5 +1,5 @@
+use crate::application::webfetch_tool::handle_webfetch;
 use crate::define_mcp_tool;
-use crate::webfetch::handle_webfetch;
 
 define_mcp_tool! {
     WebFetchTool,

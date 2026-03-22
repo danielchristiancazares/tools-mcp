@@ -133,67 +133,84 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 ### Module Organization
 
 ```
-build.rs            # Build script for version embedding
+build.rs              # Build script for version embedding
 src/
-  main.rs           # MCP server entry point and protocol handling
-  lib.rs            # OpenAI API client (file_search_core library)
-  config.rs         # Environment/config defaults
-  mcp_protocol.rs   # JSON-RPC framing/parsing
-  process_utils.rs  # Process helpers
-  response.rs       # JSON-RPC response helpers
-  tool_registry.rs  # Tool registration/dispatch
-  validation.rs     # Input validation helpers
+  main.rs             # Composition root and stdin/stdout lifecycle
+  lib.rs              # OpenAI/vector-store client (file_search_core library)
+  config.rs           # Environment/config defaults
+  mcp_protocol.rs     # Message framing/parsing helpers
+  process_utils.rs    # Process helpers
+  response.rs         # JSON-RPC response helpers
+  tool_registry.rs    # Tool metadata + execution registry
+  validation.rs       # Input validation helpers
+  codequery_cache.rs  # Vector store name/id cache
+
+  adapters/
+    mod.rs            # Adapter namespace
+    inbound/
+      mod.rs          # Inbound adapter exports
+      mcp_server.rs   # JSON-RPC/MCP routing + tool registry wiring
+    outbound/
+      mod.rs          # Outbound adapter docs/placeholders
+
+  application/
+    mod.rs            # Application-layer exports
+    codequery_tool.rs # CodeQuery orchestration/use case
+    webfetch_tool.rs  # WebFetch orchestration/use case
+    workspace.rs      # Workspace editing facade
 
   codequery/
-    mod.rs          # Semantic search orchestration
-    cache.rs        # Vector store ID caching
+    mod.rs            # Compatibility facade for CodeQuery
 
   git/
-    mod.rs          # Git command execution core
-    handlers.rs     # Git tool handlers
-    types.rs        # Git result types
+    mod.rs            # Git command execution core
+    handlers.rs       # Git tool handlers
+    types.rs          # Git result types
 
   openai/
-    mod.rs          # OpenAI client plumbing
-    types.rs        # OpenAI API types
-    file_ext.rs     # Extension filtering
-    hash.rs         # Content hashing
+    mod.rs            # OpenAI client plumbing
+    types.rs          # OpenAI API types
+    file_ext.rs       # Extension filtering
+    hash.rs           # Content hashing
+
+  ports/
+    mod.rs            # Outbound port traits
 
   smart_file_edit/
-    mod.rs          # Newline-aware file editing
+    mod.rs            # Newline-aware file editing
 
   tools/
-    mod.rs          # Tool exports
-    build.rs        # Build tool
-    codequery.rs    # CodeQuery tool
-    delete.rs       # Delete tool
-    edit.rs         # Edit tool
-    git.rs          # Git tool wrapper
-    glob.rs         # Glob tool
-    outline.rs      # C++ outline tool
-    ping.rs         # Ping tool
-    pwsh.rs         # PowerShell tool
-    read.rs         # Read tool
-    search.rs       # Search tool (ripgrep/ugrep compatibility)
-    test.rs         # Test tool
-    webfetch.rs     # WebFetch tool
-    write.rs        # Write tool
+    mod.rs            # Tool exports
+    build.rs          # Build tool
+    codequery.rs      # CodeQuery tool wrapper
+    delete.rs         # Delete tool
+    edit.rs           # Edit tool
+    git.rs            # Git tool wrapper
+    glob.rs           # Glob tool
+    outline.rs        # C++ outline tool
+    ping.rs           # Ping tool
+    pwsh.rs           # PowerShell tool
+    read.rs           # Read tool
+    search.rs         # Search tool (ripgrep/ugrep compatibility)
+    test.rs           # Test tool
+    webfetch.rs       # WebFetch tool wrapper
+    write.rs          # Write tool
     handlers/
-      mod.rs        # Tool handler exports
-      read_file.rs  # File reading
-      ripgrep.rs    # Search handler (ugrep backend)
+      mod.rs          # Tool handler exports
+      read_file.rs    # File reading
+      ripgrep.rs      # Search handler (ugrep backend)
       script_runner.rs # Build/test script runner
 
   webfetch/
-    mod.rs          # Web fetching pipeline orchestration
-    types.rs        # Request/response type definitions
-    http.rs         # HTTP client with SSRF protection
-    browser.rs      # Headless Chrome integration
-    cache.rs        # Disk-based response caching
-    extract.rs      # HTML content extraction
-    chunker.rs      # Token-aware text chunking
-    heuristics.rs   # JS-heavy site detection
-    whitelist.rs    # JS-heavy domain whitelist
+    mod.rs            # Web fetching pipeline orchestration
+    types.rs          # Request/response type definitions
+    http.rs           # HTTP client with SSRF protection
+    browser.rs        # Headless Chrome integration
+    cache.rs          # Disk-based response caching
+    extract.rs        # HTML content extraction
+    chunker.rs        # Token-aware text chunking
+    heuristics.rs     # JS-heavy site detection
+    whitelist.rs      # JS-heavy domain whitelist
 ```
 
 ---
@@ -950,19 +967,20 @@ Index code and query an OpenAI vector store in a single call.
 
 #### CodeQuery Architecture
 
-At a high level, CodeQuery is split into a thin MCP handler (`src/codequery/mod.rs`) and a reusable OpenAI/vector-store client layer (`src/lib.rs`, exposed as `crate::core::*`).
+At a high level, CodeQuery is split into an application-layer MCP handler (`src/application/codequery_tool.rs`), a compatibility facade (`src/codequery/mod.rs`), and a reusable OpenAI/vector-store client layer (`src/lib.rs`, exposed as `crate::core::*`).
 
 **Key modules**
-- `src/main.rs`: MCP JSON-RPC plumbing and tool routing; dispatches `CodeQuery` to `codequery::handle_code_query`.
-- `src/codequery/mod.rs`: request validation + defaults, local file discovery, vector-store selection (ID/name), and response shaping.
-- `src/codequery/cache.rs`: tiny on-disk cache mapping `vector_store_name -> vector_store_id` to avoid repeated list/create calls.
+- `src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `src/adapters/inbound/mcp_server.rs`.
+- `src/application/codequery_tool.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `file_search_core` via [`crate::ports::CodeQueryEngine`].
+- `src/codequery/mod.rs`: compatibility re-exports (`handle_code_query`, store cache helpers).
+- `src/codequery_cache.rs`: tiny on-disk cache mapping `vector_store_name -> vector_store_id` to avoid repeated list/create calls.
 - `src/lib.rs` (`crate::core`): OpenAI REST calls (files + vector stores + Responses API), plus the change-based reindexing algorithm.
 
 **Data flow (single CodeQuery call)**
 ```text
 MCP client
-  -> src/main.rs (route tool)
-    -> src/codequery/mod.rs::handle_code_query (validate args, choose store, choose files)
+  -> src/adapters/inbound/mcp_server.rs (route tool)
+    -> src/application/codequery_tool.rs::handle_code_query (validate args, choose store, choose files)
       -> src/lib.rs::code_query (sync files, then query with file_search)
         -> src/lib.rs::reindex_with_retry / reindex_files (optional)
         -> src/lib.rs::wait_for_vector_store_ready (poll once for batch indexing)
@@ -974,7 +992,7 @@ MCP client
 - If `vector_store_id` is provided, CodeQuery uses it directly.
 - Otherwise, it uses `vector_store_name`:
   - If omitted, it defaults to the current directory name (so each repo checkout gets a stable, human-readable store name).
-  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `src/codequery/cache.rs`).
+  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `src/codequery_cache.rs`).
   - If not cached, it lists vector stores and matches by name; if no match exists, it creates a new vector store and caches its ID.
   - Note: the cache path is based on `HOME` (so on Windows you may need `HOME` set for caching to work).
 
