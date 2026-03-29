@@ -270,6 +270,8 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
     if req.old_snippet.is_empty() {
         return Err(anyhow!("old_snippet must not be empty"));
     }
+    let old_snippet = normalize_newlines_to_lf(&req.old_snippet);
+    let new_snippet = normalize_newlines_to_lf(&req.new_snippet);
 
     let path = PathBuf::from(&req.path);
     let model = FileModel::from_path(&path)?;
@@ -298,7 +300,7 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
     let maybe_offset = compute_match_range(
         &model.canonical,
         req.match_hint.as_ref(),
-        req.old_snippet.as_str(),
+        old_snippet.as_str(),
     )?;
 
     let canonical_start = match maybe_offset {
@@ -306,18 +308,14 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
         None => {
             return Ok(SnippetResult {
                 status: SnippetStatusKind::NoMatch,
-                payload: no_match_payload(
-                    &model,
-                    req.old_snippet.as_str(),
-                    req.match_hint.as_ref(),
-                ),
+                payload: no_match_payload(&model, old_snippet.as_str(), req.match_hint.as_ref()),
                 file_hash_before: Some(model.hash),
                 file_hash_after: None,
             });
         }
     };
 
-    let canonical_end = canonical_start + req.old_snippet.len();
+    let canonical_end = canonical_start + old_snippet.len();
     let byte_start = model
         .canonical
         .byte_offset(canonical_start)
@@ -332,14 +330,14 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
         .text
         .get(canonical_start..canonical_end)
         .unwrap_or_default();
-    if old_slice != req.old_snippet {
+    if old_slice != old_snippet {
         return Err(anyhow!(
             "internal invariant violated: canonical slice mismatch"
         ));
     }
 
     let default_newline = model.newline_stats.default_kind();
-    let replacement = build_replacement_bytes(&req.new_snippet, default_newline);
+    let replacement = build_replacement_bytes(&new_snippet, default_newline);
 
     let mut updated =
         Vec::with_capacity(model.bytes.len() - (byte_end - byte_start) + replacement.len());
@@ -378,6 +376,11 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
         file_hash_before: Some(model.hash),
         file_hash_after: Some(new_hash),
     })
+}
+
+/// Converts CRLF/CR newlines to LF.
+fn normalize_newlines_to_lf(input: &str) -> String {
+    input.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Searches for a needle in the canonical text, optionally constrained by a hint.
@@ -1101,6 +1104,11 @@ mod tests {
     }
 
     #[test]
+    fn normalize_newlines_to_lf_handles_crlf_and_cr() {
+        assert_eq!(normalize_newlines_to_lf("a\r\nb\rc\n"), "a\nb\nc\n");
+    }
+
+    #[test]
     fn test_canonical_byte_offsets_cover_line_boundaries() {
         let data = b"line1\r\nline2\n";
         let (lines, _) = split_lines(data);
@@ -1137,6 +1145,30 @@ mod tests {
         let out = std::fs::read(&path).expect("read");
         assert_eq!(out, b"one\r\nTWO\r\nTHREE\r\n");
         assert_no_lone_lf(&out);
+    }
+
+    #[test]
+    fn apply_snippet_edit_accepts_crlf_snippets_from_clients() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("crlf-input.txt");
+        std::fs::write(&path, b"one\r\ntwo\r\nthree\r\n").expect("write");
+
+        let req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "two\r\nthree".to_string(),
+            new_snippet: "TWO\r\nTHREE".to_string(),
+            match_hint: None,
+            file_hash: None,
+            region_id: None,
+        };
+
+        let payload = handle_apply_snippet_edit(&req).expect("apply");
+        assert_eq!(payload["status"].as_str(), Some("ok"));
+
+        let out = std::fs::read(&path).expect("read");
+        assert_eq!(out, b"one\r\nTWO\r\nTHREE\r\n");
     }
 
     #[test]
