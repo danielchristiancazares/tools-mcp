@@ -5,7 +5,7 @@ use crate::define_mcp_tool;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 // ============================================================================
 // Move / Rename
@@ -176,6 +176,21 @@ async fn handle_copy(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         destination.to_path_buf()
     };
 
+    if source.is_dir() && req.recursive.unwrap_or(false) {
+        let source_norm = normalize_absolute_or_cwd(source);
+        let dest_norm = normalize_absolute_or_cwd(&final_dest);
+        if dest_norm.starts_with(&source_norm) {
+            return RpcResponse::err(
+                id,
+                format!(
+                    "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
+                    final_dest.display(),
+                    source.display()
+                ),
+            );
+        }
+    }
+
     if final_dest.exists() && !req.overwrite.unwrap_or(false) {
         return RpcResponse::err(
             id,
@@ -227,6 +242,31 @@ async fn handle_copy(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     )
 }
 
+fn normalize_absolute_or_cwd(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    normalize_path(&absolute)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// Recursively copy a directory.
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     tokio::fs::create_dir_all(dst).await?;
@@ -273,6 +313,37 @@ define_mcp_tool! {
         "required": ["source", "destination"]
     },
     handler: handle_copy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn copy_rejects_recursive_copy_into_own_subdirectory() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let child = src.join("nested");
+        tokio::fs::create_dir_all(&src).await.expect("create src");
+        tokio::fs::write(src.join("file.txt"), "hello")
+            .await
+            .expect("write");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": child.display().to_string(),
+            "recursive": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.result.expect("result payload");
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("destination"));
+        assert!(msg.contains("inside source"));
+    }
 }
 
 // ============================================================================
