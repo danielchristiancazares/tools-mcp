@@ -37,3 +37,21 @@ Env vars:
 ## Security Notes
 - Don’t weaken WebFetch SSRF/robots.txt protections without strong justification and tests.
 - Never commit secrets; use environment variables/local config.
+
+## Cursor Cloud specific instructions
+
+### System dependencies
+The VM needs **Rust stable ≥ 1.85** (edition 2024), **libssl-dev**, and **ugrep**. The update script handles `cargo build --release`; system packages are pre-installed in the snapshot.
+
+### Running the MCP server
+The server is a stdin/stdout binary — pipe JSON-RPC messages into it. Use `MCP_SKIP_HEADERS=true` for raw JSON (no Content-Length framing). Example:
+```
+echo '{"jsonrpc":"2.0","id":1,"method":"mcp/tools/call","params":{"name":"ping","arguments":{}}}' \
+  | MCP_SKIP_HEADERS=true RUST_LOG=error cargo run --release 2>/dev/null
+```
+
+### Testing caveats
+- `cargo test` runs all non-ignored tests (~80 total across unit, integration, and doc tests). No external services required.
+- Tests tagged `#[ignore]` need `OPENAI_API_KEY`; run with `cargo test -- --ignored`.
+- The `Search` tool uses **ugrep** (not ripgrep) as its backend; some integration tests exercise it.
+- The release build is needed by integration tests that spawn the binary; `cargo test` triggers a release build automatically via `build.rs`.
