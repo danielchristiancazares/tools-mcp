@@ -138,18 +138,33 @@ pub fn chunk_markdown(
         Ok(())
     };
 
-    let mut in_code_block = false;
+    // Track fenced code blocks so we don't treat headings inside code as section boundaries.
+    // Markdown allows variable-length fences (>=3) using either backticks or tildes, and the
+    // closing fence must use the same marker with at least the opening length.
+    let mut code_fence: Option<(char, usize)> = None;
 
     for line in markdown.lines() {
         let trimmed = line.trim();
 
-        // Track fenced code blocks (``` or ```language)
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
+        // Track fenced code blocks (` ``` ` / ` ~~~ `), including variable-length fences.
+        if let Some((marker, len)) = parse_fence_marker(trimmed) {
+            match code_fence {
+                None => {
+                    code_fence = Some((marker, len));
+                }
+                Some((open_marker, open_len))
+                    if marker == open_marker
+                        && len >= open_len
+                        && is_closing_fence_line(trimmed) =>
+                {
+                    code_fence = None;
+                }
+                _ => {}
+            }
         }
 
         // Headings mark natural chunk boundaries, but only outside code blocks
-        if !in_code_block && trimmed.starts_with('#') {
+        if code_fence.is_none() && trimmed.starts_with('#') {
             // Flush accumulated content before starting new section
             flush_section(&current_heading, &current_text)?;
             current_text.clear();
@@ -166,6 +181,32 @@ pub fn chunk_markdown(
     flush_section(&current_heading, &current_text)?;
 
     Ok(chunks)
+}
+
+fn parse_fence_marker(trimmed_line: &str) -> Option<(char, usize)> {
+    let mut chars = trimmed_line.chars();
+    let marker = chars.next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let len = trimmed_line.chars().take_while(|&c| c == marker).count();
+    (len >= 3).then_some((marker, len))
+}
+
+fn is_closing_fence_line(trimmed_line: &str) -> bool {
+    // Closing fence line may contain surrounding whitespace but no info string/content.
+    // We call this only after confirming marker + minimum length.
+    let mut chars = trimmed_line.chars();
+    let marker = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let rest = trimmed_line
+        .chars()
+        .skip_while(|&c| c == marker)
+        .collect::<String>();
+    rest.trim().is_empty()
 }
 
 /// Estimates the token count for a text string.
@@ -316,6 +357,34 @@ Body line 2
             chunks[0].1.contains("```python\n# This is a comment"),
             "Chunk should contain the full code block"
         );
+    }
+
+    #[test]
+    fn chunk_markdown_respects_variable_length_fences() {
+        let md =
+            "# Title\n````markdown\n# Not heading\n```\nstill code\n````\n## Real heading\nbody";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Variable-length fences should keep inner content in the same section"
+        );
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
+        assert!(chunks[0].1.contains("# Not heading"));
+        assert!(chunks[0].1.contains("still code"));
+        assert_eq!(chunks[1].0.as_deref(), Some("Real heading"));
+    }
+
+    #[test]
+    fn chunk_markdown_respects_tilde_fences() {
+        let md = "# Title\n~~~python\n# Not heading\n~~~\n## Real heading\nbody";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
+        assert!(chunks[0].1.contains("# Not heading"));
+        assert_eq!(chunks[1].0.as_deref(), Some("Real heading"));
     }
 
     #[test]
