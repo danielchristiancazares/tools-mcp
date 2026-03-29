@@ -87,6 +87,7 @@ where
 
     let mut content_length: Option<usize> = None;
     let mut saw_headers = false;
+    let mut saw_non_empty_non_json_line = false;
 
     // Parse headers or detect raw JSON
     loop {
@@ -114,10 +115,17 @@ where
 
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
 
-        // Empty line signals end of headers (if we have Content-Length)
+        // Empty line signals end of headers. If we've seen header-like lines but no
+        // Content-Length yet, this is a malformed framed message.
         if trimmed.is_empty() {
             if content_length.is_some() {
                 break;
+            }
+            if saw_non_empty_non_json_line {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "missing Content-Length header",
+                ));
             }
             continue; // Skip leading blank lines
         }
@@ -148,7 +156,11 @@ where
             }
             content_length = Some(len);
             saw_headers = true;
+            continue;
         }
+
+        // A non-empty line that is neither raw JSON nor Content-Length indicates header mode.
+        saw_non_empty_non_json_line = true;
     }
 
     // Read the message body using the Content-Length
@@ -281,6 +293,17 @@ mod tests {
         let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
         assert_eq!(msg.body, "hi");
         assert!(msg.has_headers);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_errors_when_headers_end_without_content_length() {
+        let input = b"X-Test: 1\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected missing Content-Length to error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("missing Content-Length"));
     }
 
     #[tokio::test]
