@@ -10,9 +10,10 @@
 //! All Git operations flow through [`run_git`], which:
 //! 1. Spawns `git` (or `git.exe` on Windows) as a child process
 //! 2. Configures deterministic output (`--no-pager`, `color.ui=false`)
-//! 3. Captures stdout/stderr with configurable byte limits
-//! 4. Enforces timeout with graceful kill on expiration
-//! 5. Returns structured results via [`types::GitExecResult`]
+//! 3. Disables config/env-driven external Git helpers for safer execution
+//! 4. Captures stdout/stderr with configurable byte limits
+//! 5. Enforces timeout with graceful kill on expiration
+//! 6. Returns structured results via [`types::GitExecResult`]
 //!
 //! # Module Structure
 //!
@@ -82,11 +83,13 @@ use tokio::time;
 ///
 /// The final command is constructed as:
 /// ```text
-/// git --no-pager -c color.ui=false <subcommand_args...>
+/// git --no-pager -c color.ui=false -c diff.external= -c core.fsmonitor= <subcommand_args...>
 /// ```
 ///
-/// The `--no-pager` flag prevents interactive pagers, and `color.ui=false`
-/// ensures no ANSI escape codes in output, making it safe for machine parsing.
+/// The `--no-pager` flag prevents interactive pagers, `color.ui=false` ensures
+/// no ANSI escape codes, and explicit config/environment overrides disable
+/// external helper execution pathways (for example `diff.external` and
+/// `core.fsmonitor`) for safer machine execution.
 ///
 /// # Timeout Behavior
 ///
@@ -121,13 +124,32 @@ pub(crate) async fn run_git(
         "git".to_string()
     };
 
-    // Force deterministic, non-ANSI output for machine consumption.
-    let mut args: Vec<String> = vec!["--no-pager".into(), "-c".into(), "color.ui=false".into()];
+    // Force deterministic, non-ANSI output and disable config-driven external helpers.
+    let mut args: Vec<String> = vec![
+        "--no-pager".into(),
+        "-c".into(),
+        "color.ui=false".into(),
+        "-c".into(),
+        "diff.external=".into(),
+        "-c".into(),
+        "core.fsmonitor=".into(),
+    ];
     args.extend(subcommand_args);
 
     let mut cmd = Command::new(&git_bin);
     cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(target_os = "windows") {
+            "NUL"
+        } else {
+            "/dev/null"
+        },
+    );
+    cmd.env("GIT_EXTERNAL_DIFF", "");
+    cmd.env_remove("GIT_CONFIG_COUNT");
 
     if let Some(dir) = &working_dir {
         cmd.current_dir(dir);

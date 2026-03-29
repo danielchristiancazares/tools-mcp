@@ -90,6 +90,8 @@ async fn write_patches_to_dir(
     let numstat_args = vec![
         "diff".into(),
         format!("{from_ref}..{to_ref}"),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
         "--numstat".into(),
     ];
     let numstat_exec = run_git(
@@ -134,6 +136,8 @@ async fn write_patches_to_dir(
         let patch_args = vec![
             "diff".into(),
             format!("{from_ref}..{to_ref}"),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
             "--".into(),
             path.clone(),
         ];
@@ -378,7 +382,11 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
     let max_bytes =
         validation::clamp_bytes(req.max_bytes, DEFAULT_GIT_STDOUT_BYTES, MAX_OUTPUT_BYTES);
 
-    let mut cmd_args: Vec<String> = vec!["diff".into()];
+    let mut cmd_args: Vec<String> = vec![
+        "diff".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+    ];
 
     if req.cached.unwrap_or(false) {
         cmd_args.push("--cached".into());
