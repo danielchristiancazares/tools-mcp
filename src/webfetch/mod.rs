@@ -175,7 +175,7 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
                 body: fetched.body,
                 fetched_at: fetched.fetched_at,
             };
-            cache::write_cache(&cache_key, &entry).context("write cache")?;
+            maybe_write_cache(&cache_key, &entry, req.no_cache).context("write cache")?;
             let cache::CachedFetch {
                 body,
                 content_type,
@@ -311,7 +311,7 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
             body: html.into_bytes(),
             fetched_at,
         };
-        cache::write_cache(&cache_key, &entry).context("write browser cache")?;
+        maybe_write_cache(&cache_key, &entry, req.no_cache).context("write browser cache")?;
         extract::extract(&entry.body, entry.content_type.as_deref(), &req.url)
             .context("extract browser-rendered content")?
     };
@@ -401,4 +401,54 @@ fn build_response(
 
 fn format_timestamp(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn maybe_write_cache(key: &str, entry: &cache::CachedFetch, no_cache: bool) -> Result<()> {
+    if no_cache {
+        return Ok(());
+    }
+    cache::write_cache(key, entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn maybe_write_cache_skips_writes_when_no_cache_enabled() {
+        let cache_key = format!("test_{}_http", Uuid::new_v4());
+        let entry = cache::CachedFetch {
+            content_type: Some("text/plain".to_string()),
+            body: b"hello".to_vec(),
+            fetched_at: Utc::now(),
+        };
+
+        maybe_write_cache(&cache_key, &entry, true).expect("helper should succeed");
+
+        let cached = cache::read_cache(&cache_key).expect("cache read should succeed");
+        assert!(
+            cached.is_none(),
+            "no_cache=true should not persist cache entries"
+        );
+    }
+
+    #[test]
+    fn maybe_write_cache_persists_when_cache_enabled() {
+        let cache_key = format!("test_{}_http", Uuid::new_v4());
+        let entry = cache::CachedFetch {
+            content_type: Some("text/plain".to_string()),
+            body: b"hello".to_vec(),
+            fetched_at: Utc::now(),
+        };
+
+        maybe_write_cache(&cache_key, &entry, false).expect("helper should succeed");
+
+        let cached = cache::read_cache(&cache_key).expect("cache read should succeed");
+        assert!(
+            cached.is_some(),
+            "no_cache=false should persist cache entries"
+        );
+    }
 }
