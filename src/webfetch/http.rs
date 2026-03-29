@@ -442,8 +442,9 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
 /// - Too many redirects (> 5)
 pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
     let mut current_url = req.url.clone();
+    let mut redirects_followed = 0usize;
 
-    for _ in 0..=MAX_REDIRECTS {
+    loop {
         // Validate URL for SSRF protection on every hop, and pin a validated address when possible.
         let resolve = validate_url_ssrf_and_resolve(&current_url).await?;
         let pinned_client = build_http_client_with_resolve(resolve.as_ref())?;
@@ -473,6 +474,14 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
 
         // Handle redirects manually
         if status.is_redirection() {
+            if redirects_followed >= MAX_REDIRECTS {
+                return Err(anyhow!(
+                    "Too many redirects (>{}) when fetching {}",
+                    MAX_REDIRECTS,
+                    req.url
+                ));
+            }
+
             let location = response
                 .headers()
                 .get(header::LOCATION)
@@ -487,6 +496,7 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
                 )
             })?;
             current_url = next.to_string();
+            redirects_followed += 1;
             continue;
         }
 
@@ -513,12 +523,6 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
             fetched_at,
         });
     }
-
-    Err(anyhow!(
-        "Too many redirects (>{}) when fetching {}",
-        MAX_REDIRECTS,
-        req.url
-    ))
 }
 
 /// Construct a shared HTTP client configured for MCP WebFetch usage.
