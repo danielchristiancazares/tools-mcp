@@ -117,12 +117,20 @@ fn detect_cargo_workspace(work_dir: &Path) -> Option<CargoWorkspaceInfo> {
     })
 }
 
-/// Check if package.json has a build script.
-fn package_json_has_build_script(work_dir: &Path) -> bool {
+/// Check if package.json has a specific npm script.
+fn package_json_has_script(work_dir: &Path, script_name: &str) -> bool {
     let pkg_json = work_dir.join("package.json");
     if let Ok(content) = std::fs::read_to_string(pkg_json) {
-        // Simple check - look for "build" in scripts
-        content.contains("\"build\"")
+        if let Ok(value) = serde_json::from_str::<Value>(&content)
+            && let Some(scripts) = value.get("scripts").and_then(Value::as_object)
+        {
+            return scripts.contains_key(script_name);
+        }
+
+        // Best-effort fallback for malformed package.json files.
+        // Prefer avoiding false positives by checking for the exact key token.
+        let needle = format!("\"{script_name}\"");
+        content.contains(&needle)
     } else {
         false
     }
@@ -159,7 +167,7 @@ pub fn detect_build_system(
     }
 
     // 3. Check for package.json (JS/TS)
-    if work_dir.join("package.json").exists() && package_json_has_build_script(work_dir) {
+    if work_dir.join("package.json").exists() && package_json_has_script(work_dir, action) {
         // Detect package manager
         if work_dir.join("pnpm-lock.yaml").exists() {
             return Some((
@@ -226,6 +234,37 @@ pub fn detect_build_system(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BuildSystem, detect_build_system};
+
+    #[test]
+    fn detect_build_system_uses_requested_npm_script_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{
+                "name": "demo",
+                "scripts": {
+                    "test": "vitest run"
+                }
+            }"#,
+        )
+        .expect("write package.json");
+
+        let detected_test =
+            detect_build_system(temp.path(), "test").expect("expected npm for test script");
+        assert_eq!(detected_test.0, BuildSystem::Npm);
+        assert_eq!(detected_test.2, vec!["run".to_string(), "test".to_string()]);
+
+        let detected_build = detect_build_system(temp.path(), "build");
+        assert!(
+            detected_build.is_none(),
+            "build should not be detected when only a test script exists"
+        );
+    }
 }
 
 /// Get the command to run for a build system.
