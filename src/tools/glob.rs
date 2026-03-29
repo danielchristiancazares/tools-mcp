@@ -1,4 +1,4 @@
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT};
 use crate::define_mcp_tool;
 use crate::validation;
@@ -85,14 +85,14 @@ struct GlobRequest {
     limit: Option<usize>,
 }
 
-async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<GlobRequest>(id.clone(), args) {
+async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<GlobRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.pattern, "pattern", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.pattern, "pattern", None) {
+        return o;
     }
 
     let base_path = req.path.as_deref().unwrap_or(".");
@@ -101,22 +101,16 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
 
     let base = Path::new(base_path);
     if !base.exists() {
-        return RpcResponse::err(
-            id,
-            format!(
-                "base path does not exist: {}. Remediation: set 'path' to an existing directory (or omit it to use '.').",
-                base.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "base path does not exist: {}. Remediation: set 'path' to an existing directory (or omit it to use '.').",
+            base.display()
+        ));
     }
     if !base.is_dir() {
-        return RpcResponse::err(
-            id,
-            format!(
-                "base path is not a directory: {}. Remediation: pass a directory path to 'path'.",
-                base.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "base path is not a directory: {}. Remediation: pass a directory path to 'path'.",
+            base.display()
+        ));
     }
 
     // Expand brace patterns and parse each
@@ -128,12 +122,9 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     {
         Ok(ps) => ps,
         Err(err) => {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "invalid glob pattern: {err}. Remediation: use patterns like '**/*.rs' or 'src/*.{{ts,tsx}}'."
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "invalid glob pattern: {err}. Remediation: use patterns like '**/*.rs' or 'src/*.{{ts,tsx}}'."
+            ));
         }
     };
 
@@ -158,12 +149,9 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                return RpcResponse::err(
-                    id,
-                    format!(
-                        "glob walk error: {err}. Remediation: check directory permissions or try a narrower 'path'."
-                    ),
-                );
+                return ToolCallOutcome::err(format!(
+                    "glob walk error: {err}. Remediation: check directory permissions or try a narrower 'path'."
+                ));
             }
         };
         // Skip directories
@@ -212,7 +200,7 @@ async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         obj.insert("truncated".to_string(), Value::Bool(true));
     }
 
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 define_mcp_tool! {

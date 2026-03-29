@@ -1,6 +1,6 @@
 //! Build/test script runner implementation with auto-detection.
 
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{DEFAULT_SCRIPT_TIMEOUT_MS, MAX_SCRIPT_STDERR_BYTES, MAX_SCRIPT_STDOUT_BYTES};
 use crate::process_utils;
 use serde::Deserialize;
@@ -303,13 +303,13 @@ struct ScriptRequest {
 /// Generic script runner for build/test style tools.
 /// Auto-detects build system or uses explicit override.
 pub async fn run_script_tool(
-    id: Option<Value>,
+    _id: Option<Value>,
     args: Value,
     config: ScriptConfig,
-) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<ScriptRequest>(id.clone(), args) {
+) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<ScriptRequest>(args) {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let work_dir = req.working_dir.as_deref().unwrap_or(".");
@@ -324,13 +324,10 @@ pub async fn run_script_tool(
 
     if let Some(bs) = &req.build_system {
         if forced_system.is_none() {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "Unknown build_system '{}'. Valid options: cargo, npm, pnpm, yarn, make, just, go, cmake, script",
-                    bs
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "Unknown build_system '{}'. Valid options: cargo, npm, pnpm, yarn, make, just, go, cmake, script",
+                bs
+            ));
         }
     }
 
@@ -362,18 +359,15 @@ pub async fn run_script_tool(
             None => {
                 let is_windows = cfg!(target_os = "windows");
                 let script_ext = if is_windows { ".ps1" } else { ".sh" };
-                return RpcResponse::err(
-                    id,
-                    format!(
-                        "No build system detected in {}. Looked for: {}{}, Cargo.toml, package.json, Makefile, justfile, go.mod, CMakeLists.txt. Remediation: pass working_dir to the project root or set build_system explicitly.",
-                        Path::new(work_dir)
-                            .canonicalize()
-                            .unwrap_or_else(|_| work_dir.into())
-                            .display(),
-                        config.script_base,
-                        script_ext,
-                    ),
-                );
+                return ToolCallOutcome::err(format!(
+                    "No build system detected in {}. Looked for: {}{}, Cargo.toml, package.json, Makefile, justfile, go.mod, CMakeLists.txt. Remediation: pass working_dir to the project root or set build_system explicitly.",
+                    Path::new(work_dir)
+                        .canonicalize()
+                        .unwrap_or_else(|_| work_dir.into())
+                        .display(),
+                    config.script_base,
+                    script_ext,
+                ));
             }
         }
     };
@@ -414,7 +408,7 @@ pub async fn run_script_tool(
                         ". Remediation: ensure the script runner is installed and on PATH (PowerShell on Windows, bash/sh on Unix), and that the script file exists.",
                     );
                 }
-                return RpcResponse::err(id, msg);
+                return ToolCallOutcome::err(msg);
             }
         };
 
@@ -430,7 +424,7 @@ pub async fn run_script_tool(
         extra.insert("script", json!(script_name));
         extra.insert("working_dir", json!(effective_dir.to_string_lossy()));
         let payload = process_utils::build_process_result_response(&result, Some(extra));
-        return RpcResponse::ok_json_content(id, payload, !result.success);
+        return ToolCallOutcome::ok_json_content(payload, !result.success);
     }
 
     // Run the detected build command
@@ -463,7 +457,7 @@ pub async fn run_script_tool(
                     ". Remediation: ensure the command is installed and on PATH for the host running the MCP server.",
                 );
             }
-            return RpcResponse::err(id, msg);
+            return ToolCallOutcome::err(msg);
         }
     };
 
@@ -480,5 +474,5 @@ pub async fn run_script_tool(
     extra.insert("args", json!(args));
     extra.insert("working_dir", json!(effective_dir.to_string_lossy()));
     let payload = process_utils::build_process_result_response(&result, Some(extra));
-    RpcResponse::ok_json_content(id, payload, !result.success)
+    ToolCallOutcome::ok_json_content(payload, !result.success)
 }

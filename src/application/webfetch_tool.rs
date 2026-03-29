@@ -1,39 +1,37 @@
-//! MCP WebFetch tool handler (application layer); delegates to [`crate::webfetch::run_fetch`].
+//! MCP WebFetch tool handler (application layer); delegates to [`crate::ports::WebFetcher`].
 
-use crate::webfetch::{FetchRequest, run_fetch};
+use crate::services::default_web_fetcher;
+use crate::tool_outcome::ToolCallOutcome;
+use crate::webfetch::FetchRequest;
 
 /// MCP tool handler for WebFetch
 pub async fn handle_webfetch(
-    id: Option<serde_json::Value>,
+    _id: Option<serde_json::Value>,
     args: serde_json::Value,
-) -> crate::RpcResponse<'static> {
-    let request = match crate::RpcResponse::parse::<FetchRequest>(id.clone(), args) {
+) -> ToolCallOutcome {
+    let request = match ToolCallOutcome::parse_args::<FetchRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let url = request.url.clone();
     let force_browser = request.force_browser;
 
-    match run_fetch(request).await {
+    match default_web_fetcher().fetch(request).await {
         Ok(response) => {
             let json_text = serde_json::to_string(&response)
                 .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-            crate::RpcResponse::ok(
-                id,
-                serde_json::json!({
-                    "content": [{"type": "text", "text": json_text}],
-                    "isError": false
-                }),
-            )
+            ToolCallOutcome::ok(serde_json::json!({
+                "content": [{"type": "text", "text": json_text}],
+                "isError": false
+            }))
         }
         Err(e) => {
             let details_full = format!("{:#}", e);
             let (message, error_type, remediation) =
                 classify_webfetch_error(&details_full, force_browser);
 
-            crate::RpcResponse::err_with(
-                id,
+            ToolCallOutcome::err_with(
                 message,
                 [
                     ("error_type", serde_json::json!(error_type)),

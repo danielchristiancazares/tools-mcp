@@ -1,5 +1,5 @@
-use crate::RpcResponse;
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -7,18 +7,15 @@ use serde_json::{Value, json};
 #[serde(deny_unknown_fields)]
 struct PingRequest {}
 
-async fn handle_ping(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let _req = match RpcResponse::parse::<PingRequest>(id.clone(), args) {
+async fn handle_ping(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let _req = match ToolCallOutcome::parse_args::<PingRequest>(args) {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
-    RpcResponse::ok(
-        id,
-        json!({
-            "content": [{"type": "text", "text": "pong"}],
-            "isError": false
-        }),
-    )
+    ToolCallOutcome::ok(json!({
+        "content": [{"type": "text", "text": "pong"}],
+        "isError": false
+    }))
 }
 
 define_mcp_tool! {

@@ -3,20 +3,19 @@
 //! Provides reusable validators and clamping helpers for MCP tool parameters,
 //! reducing duplication across tool implementations.
 
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use serde_json::Value;
 
 /// Validate that a string is not empty after trimming whitespace.
 pub fn validate_non_empty(
     value: &str,
     field_name: &str,
-    id: Option<Value>,
-) -> Result<(), RpcResponse<'static>> {
+    _id: Option<Value>,
+) -> Result<(), ToolCallOutcome> {
     if value.trim().is_empty() {
-        return Err(RpcResponse::err(
-            id,
-            format!("{field_name} is required (non-empty string)"),
-        ));
+        return Err(ToolCallOutcome::err(format!(
+            "{field_name} is required (non-empty string)"
+        )));
     }
     Ok(())
 }

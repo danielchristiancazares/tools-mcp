@@ -1,6 +1,6 @@
 //! ugrep search handler implementation.
 
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -64,7 +64,7 @@ fn classify_success(
 /// - This tool executes `ugrep` directly (no shell).
 /// - Uses text output with -n -H for simpler parsing.
 /// - Exit code semantics: 0 = matches found, 1 = no matches, 2 = error.
-pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct RgRequest {
         /// Regex (or literal if `fixed_strings=true`).
@@ -107,18 +107,18 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         fuzzy: Option<u8>,
     }
 
-    let req = match RpcResponse::parse::<RgRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<RgRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.pattern, "pattern", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.pattern, "pattern", None) {
+        return o;
     }
 
     let root = req.path.as_deref().unwrap_or(".");
-    if let Err(resp) = validation::validate_non_empty(root, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(root, "path", None) {
+        return o;
     }
 
     let max_results = validation::clamp_limit(req.max_results, 200, 1, 10_000);
@@ -333,9 +333,9 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
                 obj.insert("stderr".to_string(), Value::String(stderr_text));
             }
 
-            RpcResponse::ok(id, payload)
+            ToolCallOutcome::ok(payload)
         }
-        Err(e) => RpcResponse::err(id, format!("ugrep error: {e:#}")),
+        Err(e) => ToolCallOutcome::err(format!("ugrep error: {e:#}")),
     }
 }
 

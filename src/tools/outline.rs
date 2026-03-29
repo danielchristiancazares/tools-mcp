@@ -1,4 +1,4 @@
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::define_mcp_tool;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,21 +13,21 @@ struct OutlineRequest {
     include_private: Option<bool>,
 }
 
-async fn handle_outline(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<OutlineRequest>(id.clone(), args) {
+async fn handle_outline(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<OutlineRequest>(args) {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let path = Path::new(&req.path);
     if !path.exists() {
-        return RpcResponse::err(id, format!("file not found: {}", path.display()));
+        return ToolCallOutcome::err(format!("file not found: {}", path.display()));
     }
 
     let source = match tokio::fs::read_to_string(path).await {
         Ok(s) => s,
         Err(e) => {
-            return RpcResponse::err(id, format!("failed to read file: {e}"));
+            return ToolCallOutcome::err(format!("failed to read file: {e}"));
         }
     };
 
@@ -36,13 +36,13 @@ async fn handle_outline(id: Option<Value>, args: Value) -> RpcResponse<'static> 
     let mut parser = Parser::new();
     let language = tree_sitter_cpp::LANGUAGE;
     if let Err(e) = parser.set_language(&language.into()) {
-        return RpcResponse::err(id, format!("failed to set language: {e}"));
+        return ToolCallOutcome::err(format!("failed to set language: {e}"));
     }
 
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
         None => {
-            return RpcResponse::err(id, "failed to parse file");
+            return ToolCallOutcome::err("failed to parse file");
         }
     };
 
@@ -63,7 +63,7 @@ async fn handle_outline(id: Option<Value>, args: Value) -> RpcResponse<'static> 
         "outline_bytes": output.len(),
     });
 
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 struct OutlineContext<'a> {

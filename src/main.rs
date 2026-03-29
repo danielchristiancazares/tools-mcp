@@ -7,20 +7,24 @@ use anyhow::Result;
 use tokio::io::{self, BufReader};
 use tracing::{error, info};
 
-use crate::adapters::inbound::{RpcRequest, build_tool_registry, dispatch_jsonrpc_request};
+use crate::adapters::inbound::{RpcRequest, dispatch_jsonrpc_request};
+use crate::composition::build_tool_registry;
 use mcp_protocol::{read_mcp_message, should_skip_headers, write_mcp_response_with_mode};
 
 mod adapters;
 mod application;
 mod codequery;
 mod codequery_cache;
+mod composition;
 mod config;
 mod git;
 mod mcp_protocol;
 mod ports;
 mod process_utils;
 mod response;
+mod services;
 mod smart_file_edit;
+mod tool_outcome;
 mod tool_registry;
 mod tools;
 mod validation;

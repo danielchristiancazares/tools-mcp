@@ -1,5 +1,5 @@
-use crate::RpcResponse;
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,14 +13,14 @@ struct WriteRequest {
     content: String,
 }
 
-async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<WriteRequest>(id.clone(), args) {
+async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<WriteRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.path, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.path, "path", None) {
+        return o;
     }
 
     let path = Path::new(&req.path);
@@ -31,13 +31,10 @@ async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         && !parent.exists()
         && let Err(err) = tokio::fs::create_dir_all(parent).await
     {
-        return RpcResponse::err(
-            id,
-            format!(
-                "failed to create parent directories for {}: {err}",
-                path.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "failed to create parent directories for {}: {err}",
+            path.display()
+        ));
     }
 
     // Write the file
@@ -50,25 +47,27 @@ async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "file already exists: {}. Use Edit to modify existing files.",
-                    path.display()
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "file already exists: {}. Use Edit to modify existing files.",
+                path.display()
+            ));
         }
         Err(err) => {
-            return RpcResponse::err(id, format!("failed to create {}: {err}", path.display()));
+            return ToolCallOutcome::err(format!(
+                "failed to create {}: {err}",
+                path.display()
+            ));
         }
     };
 
     if let Err(err) = file.write_all(bytes).await {
-        return RpcResponse::err(id, format!("failed to write {}: {err}", path.display()));
+        return ToolCallOutcome::err(format!(
+            "failed to write {}: {err}",
+            path.display()
+        ));
     }
 
-    RpcResponse::ok_text_with(
-        id,
+    ToolCallOutcome::ok_text_with(
         format!("Created {} ({} bytes)", path.display(), bytes.len()),
         [
             ("path", json!(path.display().to_string())),

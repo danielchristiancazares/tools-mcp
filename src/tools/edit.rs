@@ -1,5 +1,5 @@
+use crate::application::workspace::handle_edit;
 use crate::define_mcp_tool;
-use crate::smart_file_edit::handle_edit;
 
 define_mcp_tool! {
     EditTool,

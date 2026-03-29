@@ -1,4 +1,4 @@
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{
     DEFAULT_PWSH_TIMEOUT_MS, MAX_PWSH_STDERR_BYTES, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_TIMEOUT_MS,
 };
@@ -19,10 +19,10 @@ struct PwshRequest {
     timeout_ms: Option<u64>,
 }
 
-async fn execute_pwsh(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<PwshRequest>(id.clone(), args) {
+async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<PwshRequest>(args) {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let work_dir = req.working_dir.as_deref().unwrap_or(".");
@@ -54,7 +54,7 @@ async fn execute_pwsh(id: Option<Value>, args: Value) -> RpcResponse<'static> {
             } else {
                 format!("failed to run pwsh: {e}")
             };
-            return RpcResponse::err(id, msg);
+            return ToolCallOutcome::err(msg);
         }
     };
 
@@ -66,7 +66,7 @@ async fn execute_pwsh(id: Option<Value>, args: Value) -> RpcResponse<'static> {
     }
 
     let payload = process_utils::build_process_result_response(&result, None);
-    RpcResponse::ok_json_content(id, payload, !result.success)
+    ToolCallOutcome::ok_json_content(payload, !result.success)
 }
 
 define_mcp_tool! {

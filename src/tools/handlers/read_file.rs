@@ -1,6 +1,6 @@
 //! File reading handler implementation.
 
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,7 +11,7 @@ use std::path::Path;
 ///
 /// When `show_line_numbers` is true, output is line-numbered (similar to `nl -ba` / `cat -n`)
 /// so callers can easily reference exact lines. By default, raw content is returned.
-pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ReadRequest {
@@ -24,13 +24,13 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
         show_line_numbers: Option<bool>,
     }
 
-    let req = match RpcResponse::parse::<ReadRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<ReadRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.path, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.path, "path", None) {
+        return o;
     }
 
     let path = Path::new(&req.path);
@@ -52,14 +52,14 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
                 ),
                 _ => format!("failed to read {}: {err}", path.display()),
             };
-            return RpcResponse::err(id, msg);
+            return ToolCallOutcome::err(msg);
         }
     };
 
     let text = String::from_utf8_lossy(&data);
 
     if text.is_empty() {
-        return RpcResponse::err(id, format!("file is empty: {}", path.display()));
+        return ToolCallOutcome::err(format!("file is empty: {}", path.display()));
     }
 
     let line_count = text.split_inclusive('\n').count();
@@ -68,22 +68,21 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
     let end = req.end_line.unwrap_or(line_count);
 
     if start == 0 {
-        return RpcResponse::err(id, "start_line must be >= 1");
+        return ToolCallOutcome::err("start_line must be >= 1");
     }
 
     if end == 0 {
-        return RpcResponse::err(id, "end_line must be >= 1");
+        return ToolCallOutcome::err("end_line must be >= 1");
     }
 
     if start > end {
-        return RpcResponse::err(id, "start_line cannot be greater than end_line");
+        return ToolCallOutcome::err("start_line cannot be greater than end_line");
     }
 
     if start > line_count {
-        return RpcResponse::err(
-            id,
-            format!("start_line {start} exceeds file line count {line_count}"),
-        );
+        return ToolCallOutcome::err(format!(
+            "start_line {start} exceeds file line count {line_count}"
+        ));
     }
 
     let resolved_end = end.min(line_count);
@@ -117,5 +116,5 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
         "total_lines": line_count
     });
 
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }

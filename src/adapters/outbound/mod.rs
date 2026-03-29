@@ -1,3 +1,7 @@
-//! Outbound adapters implementing [`crate::ports`] and other infrastructure.
-//!
-//! The default OpenAI vector-store engine is [`crate::ports::FileSearchCoreEngine`].
+//! Outbound adapters implementing [`crate::ports`].
+
+pub mod file_search_engine;
+pub mod webfetch_default;
+
+pub use file_search_engine::FileSearchCoreEngine;
+pub use webfetch_default::RunFetchWebFetcher;
