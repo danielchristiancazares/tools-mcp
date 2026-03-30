@@ -8,10 +8,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
+const MAX_BRACE_ALTERNATIVES: usize = 64;
+const MAX_EXPANDED_PATTERNS: usize = 1024;
+
 /// Expands brace patterns like `{a,b,c}` into multiple alternatives.
 /// Handles nested braces and multiple brace groups.
 /// Example: `**/*.{cpp,h}` -> `["**/*.cpp", "**/*.h"]`
-fn expand_braces(pattern: &str) -> Vec<String> {
+fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
     let mut results = vec![pattern.to_string()];
 
     loop {
@@ -19,11 +22,17 @@ fn expand_braces(pattern: &str) -> Vec<String> {
         let mut new_results = Vec::new();
 
         for pat in &results {
-            if let Some(expansion) = expand_single_brace(pat) {
+            if let Some(expansion) = expand_single_brace(pat)? {
                 new_results.extend(expansion);
                 expanded = true;
             } else {
                 new_results.push(pat.clone());
+            }
+
+            if new_results.len() > MAX_EXPANDED_PATTERNS {
+                return Err(format!(
+                    "brace expansion exceeded maximum of {MAX_EXPANDED_PATTERNS} patterns"
+                ));
             }
         }
 
@@ -33,12 +42,12 @@ fn expand_braces(pattern: &str) -> Vec<String> {
         }
     }
 
-    results
+    Ok(results)
 }
 
 /// Expands the first (innermost) brace group found in the pattern.
 /// Returns None if no braces found.
-fn expand_single_brace(pattern: &str) -> Option<Vec<String>> {
+fn expand_single_brace(pattern: &str) -> Result<Option<Vec<String>>, String> {
     // Find innermost brace group (one without nested braces)
     let bytes = pattern.as_bytes();
     let mut brace_start = None;
@@ -55,22 +64,30 @@ fn expand_single_brace(pattern: &str) -> Option<Vec<String>> {
 
                 // Split by comma (handling escaped commas would be complex, skip for now)
                 let parts: Vec<&str> = alternatives.split(',').collect();
+                if parts.len() > MAX_BRACE_ALTERNATIVES {
+                    return Err(format!(
+                        "brace group exceeded maximum of {MAX_BRACE_ALTERNATIVES} alternatives"
+                    ));
+                }
 
                 if parts.len() > 1 {
-                    return Some(
+                    return Ok(Some(
                         parts
                             .into_iter()
                             .map(|p| format!("{prefix}{p}{suffix}"))
                             .collect(),
-                    );
+                    ));
                 }
                 // Single item in braces, just remove the braces
-                return Some(vec![format!("{prefix}{}{suffix}", &pattern[start + 1..i])]);
+                return Ok(Some(vec![format!(
+                    "{prefix}{}{suffix}",
+                    &pattern[start + 1..i]
+                )]));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 #[derive(Deserialize)]
@@ -114,7 +131,17 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     // Expand brace patterns and parse each
-    let expanded = expand_braces(&req.pattern);
+    let expanded = match expand_braces(&req.pattern) {
+        Ok(expanded) => expanded,
+        Err(err) => {
+            return RpcResponse::err(
+                id,
+                format!(
+                    "invalid glob pattern: {err}. Remediation: reduce brace groups/options or use a simpler pattern."
+                ),
+            );
+        }
+    };
     let patterns: Vec<Pattern> = match expanded
         .iter()
         .map(|p| Pattern::new(p))
@@ -232,4 +259,26 @@ define_mcp_tool! {
         "additionalProperties": false
     },
     handler: handle_glob
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_EXPANDED_PATTERNS, expand_braces};
+
+    #[test]
+    fn expands_common_brace_patterns() {
+        let expanded = expand_braces("src/*.{ts,tsx}").expect("valid expansion");
+        assert_eq!(expanded, vec!["src/*.ts", "src/*.tsx"]);
+    }
+
+    #[test]
+    fn rejects_excessive_expansion_growth() {
+        let mut pattern = String::new();
+        for _ in 0..12 {
+            pattern.push_str("{a,b}");
+        }
+
+        let err = expand_braces(&pattern).expect_err("expected expansion limit failure");
+        assert!(err.contains(&MAX_EXPANDED_PATTERNS.to_string()));
+    }
 }
