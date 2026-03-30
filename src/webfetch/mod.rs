@@ -258,6 +258,18 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 /// - Browser navigation times out (15s limit)
 /// - Page content extraction fails
 async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
+    // SECURITY: Fail closed for browser rendering until subresource requests
+    // are SSRF-filtered inside the browser path.
+    if std::env::var("WEBFETCH_ENABLE_BROWSER_UNSAFE")
+        .ok()
+        .as_deref()
+        != Some("true")
+    {
+        return Err(anyhow::anyhow!(
+            "Browser rendering disabled for SSRF hardening; set WEBFETCH_ENABLE_BROWSER_UNSAFE=true to override"
+        ));
+    }
+
     // SECURITY: Validate SSRF before cache to prevent cache poisoning attacks
     http::validate_url_ssrf(&req.url)
         .await
