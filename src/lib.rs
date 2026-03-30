@@ -1325,6 +1325,24 @@ pub async fn file_search_run(
     Ok(serde_json::json!({"file_id": file_id, "vector_store_id": vs_id, "response": resp}))
 }
 
+fn normalize_indexed_path(path: &str) -> String {
+    let path_buf = std::path::PathBuf::from(path);
+    if !path_buf.is_absolute() {
+        return path.to_string();
+    }
+
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(relative) = path_buf.strip_prefix(cwd)
+    {
+        return relative.to_string_lossy().to_string();
+    }
+
+    path_buf
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Synchronizes local files with a vector store using hash-based change detection.
 ///
 /// This is the core reindexing function that intelligently syncs local files to a
@@ -1374,7 +1392,7 @@ pub async fn file_search_run(
 /// # File Attributes
 ///
 /// Uploaded files are tagged with attributes for future reindexing:
-/// - `path`: Original file path
+/// - `path`: Normalized path (relative to current working directory when possible)
 /// - `hash`: SHA256 hash of file contents
 /// - `indexed_at`: ISO 8601 timestamp
 ///
@@ -1428,7 +1446,7 @@ pub async fn reindex_files(
 
         // Primary key is path attribute if present
         if let Some(ref p) = path_attr {
-            path_map.insert(p.clone(), (file.id.clone(), hash.clone()));
+            path_map.insert(normalize_indexed_path(p), (file.id.clone(), hash.clone()));
         }
 
         // Also track by filename for legacy file matching
@@ -1483,12 +1501,13 @@ pub async fn reindex_files(
                 continue;
             }
         };
+        let indexed_path = normalize_indexed_path(&path);
 
         // Check by path first (highest priority - exact match)
-        if let Some((file_id, store_hash)) = path_map.get(&path).cloned() {
+        if let Some((file_id, store_hash)) = path_map.get(&indexed_path).cloned() {
             if store_hash.as_ref() == Some(&local_hash) {
                 // Path and hash both match - skip upload
-                path_map.remove(&path);
+                path_map.remove(&indexed_path);
                 hash_map.remove(&local_hash);
                 if let Some(ref fname) = filename {
                     filename_map.remove(fname);
@@ -1497,7 +1516,7 @@ pub async fn reindex_files(
             } else {
                 // Same path, different hash - content changed
                 to_delete.insert(file_id.clone(), format!("content changed: {}", path));
-                path_map.remove(&path);
+                path_map.remove(&indexed_path);
                 if let Some(old_hash) = store_hash {
                     hash_map.remove(&old_hash);
                 }
@@ -1572,7 +1591,10 @@ pub async fn reindex_files(
 
                 // Create attributes with path, hash, and timestamp for future reindexing
                 let mut attributes = serde_json::Map::new();
-                attributes.insert("path".to_string(), serde_json::Value::String(path.clone()));
+                attributes.insert(
+                    "path".to_string(),
+                    serde_json::Value::String(normalize_indexed_path(&path)),
+                );
                 attributes.insert("hash".to_string(), serde_json::Value::String(hash.clone()));
                 attributes.insert(
                     "indexed_at".to_string(),
