@@ -18,8 +18,6 @@ pub fn build_tool_registry() -> ToolRegistry {
     registry.register::<crate::tools::MoveTool>();
     registry.register::<crate::tools::CopyTool>();
     registry.register::<crate::tools::ListDirTool>();
-    registry.register::<crate::tools::BuildTool>();
-    registry.register::<crate::tools::TestTool>();
     registry.register::<crate::tools::OutlineTool>();
     registry.register::<crate::tools::PwshTool>();
     registry.register::<crate::tools::GitStatusTool>();

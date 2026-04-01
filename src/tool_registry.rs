@@ -88,50 +88,6 @@ impl Default for ToolRegistry {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::define_mcp_tool;
-    use serde_json::json;
-
-    async fn ok_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
-        ToolCallOutcome::ok(json!({
-            "content": [{"type": "text", "text": "ok"}],
-            "isError": false
-        }))
-    }
-
-    define_mcp_tool! {
-        DummyTool,
-        name: "Dummy",
-        description: "dummy tool for registry tests",
-        schema: {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        },
-        handler: ok_tool
-    }
-
-    #[tokio::test]
-    async fn registry_dispatches_by_name() {
-        let mut reg = ToolRegistry::new();
-        reg.register::<DummyTool>();
-
-        assert!(reg.list().iter().any(|t| t.name == "Dummy"));
-
-        let r1 = reg.call("Dummy", Some(json!(1)), json!({})).await;
-        assert!(r1.is_some());
-    }
-
-    #[tokio::test]
-    async fn registry_returns_none_for_unknown_tool() {
-        let reg = ToolRegistry::new();
-        let r = reg.call("nope", Some(json!(1)), json!({})).await;
-        assert!(r.is_none());
-    }
-}
-
 /// Macro to define an MCP tool with reduced boilerplate.
 ///
 /// # Syntax
@@ -194,4 +150,47 @@ macro_rules! define_mcp_tool {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn ok_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
+        ToolCallOutcome::ok(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "isError": false
+        }))
+    }
+
+    define_mcp_tool! {
+        DummyTool,
+        name: "Dummy",
+        description: "dummy tool for registry tests",
+        schema: {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        handler: ok_tool
+    }
+
+    #[tokio::test]
+    async fn registry_dispatches_by_name() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert!(reg.list().iter().any(|t| t.name == "Dummy"));
+
+        let r1 = reg.call("Dummy", Some(json!(1)), json!({})).await;
+        assert!(r1.is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_returns_none_for_unknown_tool() {
+        let reg = ToolRegistry::new();
+        let r = reg.call("nope", Some(json!(1)), json!({})).await;
+        assert!(r.is_none());
+    }
 }

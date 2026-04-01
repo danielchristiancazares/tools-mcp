@@ -135,7 +135,12 @@ fn golden_unknown_method_returns_protocol_error() {
     assert!(response["result"].is_null());
     let err = response["error"].as_object().expect("protocol error");
     assert_eq!(err["code"], -32601);
-    assert!(err["message"].as_str().unwrap().contains("Method not found"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("Method not found")
+    );
 }
 
 #[test]

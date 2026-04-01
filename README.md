@@ -31,7 +31,6 @@
 - **Git Integration**: Execute git commands (status, diff, restore, add, commit)
 - **Code Search**: Regex and fuzzy file search using ugrep
 - **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
-- **Build/Test Automation**: Execute project build and test scripts
 
 ### Highlights
 
@@ -105,8 +104,6 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 | Stage files | GitAdd |
 | Commit changes | GitCommit |
 | Extract C++ structure | Outline |
-| Run build script | Build |
-| Run tests | Test |
 
 ---
 
@@ -181,7 +178,6 @@ src/
 
   tools/
     mod.rs            # Tool exports
-    build.rs          # Build tool
     codequery.rs      # CodeQuery tool wrapper
     delete.rs         # Delete tool
     edit.rs           # Edit tool
@@ -192,14 +188,12 @@ src/
     pwsh.rs           # PowerShell tool
     read.rs           # Read tool
     search.rs         # Search tool
-    test.rs           # Test tool
     webfetch.rs       # WebFetch tool wrapper
     write.rs          # Write tool
     handlers/
       mod.rs          # Tool handler exports
       read_file.rs    # File reading
       ripgrep.rs      # Search handler (ugrep backend)
-      script_runner.rs # Build/test script runner
 
   webfetch/
     mod.rs            # Web fetching pipeline orchestration
@@ -880,31 +874,6 @@ pub async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static>
 
 ---
 
-### tools/build.rs / tools/test.rs - Script Execution
-
-**Location**: `src/tools/build.rs`, `src/tools/test.rs`
-
-```rust
-/// Executes build/test script
-///
-/// # Script Discovery
-/// - Windows: build.ps1 / test.ps1 (via pwsh.exe)
-/// - Unix: build.sh / test.sh (via bash)
-///
-/// # Parameters
-/// - working_dir: String (default: ".") - Script directory
-/// - timeout_ms: u64 (default: 120000) - Execution timeout
-///
-/// # Response
-/// - success: bool - Script exit status
-/// - exit_code: i32? - Process exit code
-/// - stdout/stderr: Script output
-pub async fn handle_build(id: Option<Value>, args: Value) -> RpcResponse<'static>
-pub async fn handle_test(id: Option<Value>, args: Value) -> RpcResponse<'static>
-```
-
----
-
 ### outline.rs - C++ Structure Extraction
 
 **Location**: `src/tools/outline.rs`
@@ -948,9 +917,9 @@ Index code and query an OpenAI vector store in a single call.
 - **Vector store selection**:
   - `vector_store_id` – use an existing store by ID, or
   - `vector_store_name` – use or create a store with this name, or
-  - omit both – default to the current directory name as `vector_store_name`. If the name cannot be inferred, the call returns an error.
+  - omit both – default to the git top-level directory name plus a workspace fingerprint, such as `tools-mcp [1a2b3c4d]`. If the name cannot be inferred, the call returns an error.
 - **Optional**:
-  - `file_paths` (string[]) - explicit local file paths to sync before querying. If omitted, CodeQuery auto-discovers indexable files under the current directory (respecting `.gitignore`, skipping `target/`, `node_modules/`, VCS dirs, etc.). CodeQuery only indexes source code files; docs (e.g. `.md`), config (e.g. `.toml`/`.yaml`), and binary/media files (e.g. images/archives) are filtered out even if explicitly listed.
+  - `file_paths` (string[]) - explicit local file paths to sync before querying. If omitted, CodeQuery auto-discovers indexable files under the git top level when inside a repository, otherwise under the current directory (respecting `.gitignore`, skipping `target/`, `node_modules/`, VCS dirs, etc.). CodeQuery only indexes source code files; docs (e.g. `.md`), config (e.g. `.toml`/`.yaml`), and binary/media files (e.g. images/archives) are filtered out even if explicitly listed.
   - `concurrent_limit` (integer, 1-20, default 5) - maximum concurrent upload/delete operations.
   - `timeout_ms` (integer, ≥1000, default 60000) – overall indexing + query timeout in milliseconds.
   - `model` (string) – override the default OpenAI model (defaults to `gpt-4o`).
@@ -973,7 +942,7 @@ At a high level, CodeQuery is split into an application-layer MCP handler (`src/
 - `src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `src/adapters/inbound/mcp_server.rs`.
 - `src/application/codequery_tool.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `file_search_core` via [`crate::ports::CodeQueryEngine`].
 - `src/codequery/mod.rs`: compatibility re-exports (`handle_code_query`, store cache helpers).
-- `src/codequery_cache.rs`: tiny on-disk cache mapping `vector_store_name -> vector_store_id` to avoid repeated list/create calls.
+- `src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
 - `src/lib.rs` (`crate::core`): OpenAI REST calls (files + vector stores + Responses API), plus the change-based reindexing algorithm.
 
 **Data flow (single CodeQuery call)**
@@ -991,13 +960,13 @@ MCP client
 **Vector store selection**
 - If `vector_store_id` is provided, CodeQuery uses it directly.
 - Otherwise, it uses `vector_store_name`:
-  - If omitted, it defaults to the current directory name (so each repo checkout gets a stable, human-readable store name).
+  - If omitted, it defaults to the git top-level directory name plus a workspace fingerprint (so same-named repos do not collide).
   - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `src/codequery_cache.rs`).
   - If not cached, it lists vector stores and matches by name; if no match exists, it creates a new vector store and caches its ID.
   - Note: the cache path is based on `HOME` (so on Windows you may need `HOME` set for caching to work).
 
 **Local file discovery and filtering**
-- If `file_paths` is omitted/empty, CodeQuery walks the current directory recursively and collects indexable files.
+- If `file_paths` is omitted/empty, CodeQuery walks the git top level recursively when inside a repository, otherwise the current directory, and collects indexable files.
 - It skips common "noise" directories (e.g., `.git/`, `node_modules/`, `target/`, `dist/`) and hidden directories.
 - It indexes:
   - source code files with allowed extensions (see `src/lib.rs` `is_codequery_indexable_ext`).
@@ -1263,28 +1232,6 @@ List files matching a glob pattern.
   - `limit` (integer, default: 1000, max: 10000) - maximum files to return
 - **Response**:
   - Returns array of matching file paths.
-
-### Build
-
-Run build script.
-
-- **Tool name**: `Build`
-- **Optional**:
-  - `working_dir` (string) - directory containing build script
-  - `timeout_ms` (integer, default: 120000) - execution timeout
-- **Response**:
-  - Returns build output and exit status.
-
-### Test
-
-Run test script.
-
-- **Tool name**: `Test`
-- **Optional**:
-  - `working_dir` (string) - directory containing test script
-  - `timeout_ms` (integer, default: 120000) - execution timeout
-- **Response**:
-  - Returns test output and exit status.
 
 ### Outline
 
@@ -1749,7 +1696,6 @@ APP_VERSION="1.0.0" cargo build --release
 - ripgrep (`rg`) for Search tool
 - ugrep for fuzzy search
 - Git for git tools
-- PowerShell Core (pwsh.exe) on Windows for Build/Test tools
 
 ---
 

@@ -55,35 +55,35 @@ fn expand_single_brace(pattern: &str) -> Result<Option<Vec<String>>, String> {
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'{' {
             brace_start = Some(i);
-        } else if b == b'}' {
-            if let Some(start) = brace_start {
-                // Found a complete brace group from start to i
-                let prefix = &pattern[..start];
-                let suffix = &pattern[i + 1..];
-                let alternatives = &pattern[start + 1..i];
+        } else if b == b'}'
+            && let Some(start) = brace_start
+        {
+            // Found a complete brace group from start to i
+            let prefix = &pattern[..start];
+            let suffix = &pattern[i + 1..];
+            let alternatives = &pattern[start + 1..i];
 
-                // Split by comma (handling escaped commas would be complex, skip for now)
-                let parts: Vec<&str> = alternatives.split(',').collect();
-                if parts.len() > MAX_BRACE_ALTERNATIVES {
-                    return Err(format!(
-                        "brace group exceeded maximum of {MAX_BRACE_ALTERNATIVES} alternatives"
-                    ));
-                }
-
-                if parts.len() > 1 {
-                    return Ok(Some(
-                        parts
-                            .into_iter()
-                            .map(|p| format!("{prefix}{p}{suffix}"))
-                            .collect(),
-                    ));
-                }
-                // Single item in braces, just remove the braces
-                return Ok(Some(vec![format!(
-                    "{prefix}{}{suffix}",
-                    &pattern[start + 1..i]
-                )]));
+            // Split by comma (handling escaped commas would be complex, skip for now)
+            let parts: Vec<&str> = alternatives.split(',').collect();
+            if parts.len() > MAX_BRACE_ALTERNATIVES {
+                return Err(format!(
+                    "brace group exceeded maximum of {MAX_BRACE_ALTERNATIVES} alternatives"
+                ));
             }
+
+            if parts.len() > 1 {
+                return Ok(Some(
+                    parts
+                        .into_iter()
+                        .map(|p| format!("{prefix}{p}{suffix}"))
+                        .collect(),
+                ));
+            }
+            // Single item in braces, just remove the braces
+            return Ok(Some(vec![format!(
+                "{prefix}{}{suffix}",
+                &pattern[start + 1..i]
+            )]));
         }
     }
 

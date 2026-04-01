@@ -1,14 +1,5 @@
 //! Shared configuration constants across tools.
 
-/// Default timeout for script execution (build, test).
-pub const DEFAULT_SCRIPT_TIMEOUT_MS: u64 = 120_000;
-
-/// Maximum stdout capture for script execution.
-pub const MAX_SCRIPT_STDOUT_BYTES: usize = 1_000_000;
-
-/// Maximum stderr capture for script execution.
-pub const MAX_SCRIPT_STDERR_BYTES: usize = 1_000_000;
-
 /// Default timeout for git commands.
 pub const DEFAULT_GIT_TIMEOUT_MS: u64 = 30_000;
 

@@ -42,7 +42,8 @@
 //!
 //! When `file_paths` is not provided, CodeQuery auto-discovers indexable files:
 //!
-//! 1. Walks from current directory using the `ignore` crate
+//! 1. Walks from the git top level when inside a repository, otherwise the current directory
+//!    using the `ignore` crate
 //! 2. Respects `.gitignore`, `.git/info/exclude`, and global git ignores
 //! 3. Skips common non-code directories (`.git`, `node_modules`, `target`, etc.)
 //! 4. Filters to indexable code extensions (`.rs`, `.py`, `.js`, `.ts`, etc.)
@@ -50,7 +51,8 @@
 //!
 //! ## Vector Store Lifecycle
 //!
-//! 1. **Name derivation**: Defaults to current directory name if not specified
+//! 1. **Name derivation**: Defaults to the git top-level directory name plus a workspace
+//!    fingerprint if not specified
 //! 2. **Cache lookup**: Checks `~/.codex/mcp/stores.json` for known store ID
 //! 3. **API fallback**: Lists stores via OpenAI API if cache misses
 //! 4. **Auto-creation**: Creates new store if none exists with the given name
@@ -94,12 +96,20 @@ use anyhow::{Result, anyhow};
 use ignore::{DirEntry, WalkBuilder};
 use reqwest::Client;
 use serde_json::Value;
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 use crate::adapters::outbound::FileSearchCoreEngine;
 use crate::codequery_cache::{cache_store_id, load_store_id_from_cache};
 use crate::ports::CodeQueryEngine;
 use crate::validation;
+
+#[derive(Debug, Clone)]
+struct WorkspaceScope {
+    root: PathBuf,
+    cache_key: String,
+    default_store_name: String,
+}
 
 /// Handles the CodeQuery MCP tool invocation.
 ///
@@ -116,7 +126,7 @@ use crate::validation;
 /// |-----------|------|----------|---------|-------------|
 /// | `query` | string | **Yes** | - | Natural language search query |
 /// | `vector_store_id` | string | No* | - | OpenAI vector store ID |
-/// | `vector_store_name` | string | No* | cwd name | Human-readable store name |
+/// | `vector_store_name` | string | No* | git top-level name + fingerprint | Human-readable store name |
 /// | `file_paths` | string[] | No | auto-discover | Files to index |
 /// | `concurrent_limit` | integer | No | 5 | Max concurrent uploads (1-20) |
 /// | `timeout_ms` | integer | No | 60000 | Indexing timeout in milliseconds |
@@ -125,7 +135,8 @@ use crate::validation;
 /// | `include_results` | boolean | No | false | Include raw search results |
 ///
 /// *At least one of `vector_store_id` or `vector_store_name` should be provided,
-/// otherwise the current directory name is used as `vector_store_name`.
+/// otherwise the git top-level directory name plus a workspace fingerprint is used
+/// as `vector_store_name`.
 ///
 /// # Response Format
 ///
@@ -183,29 +194,41 @@ pub async fn handle_code_query(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let mut vector_store_name = args
+    let explicit_vector_store_name = args
         .get("vector_store_name")
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let mut vector_store_name = explicit_vector_store_name.clone();
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
     if let Err(o) = validation::validate_non_empty(query, "query", None) {
         return o;
     }
 
-    if vector_store_id_arg.is_none() && vector_store_name.is_none() {
+    let default_workspace_scope = if vector_store_id_arg.is_none() && vector_store_name.is_none() {
         // We default the store name to the repository directory so every checkout gets a stable
         // vector store without extra MCP arguments. This keeps agent UX simple while still letting
         // advanced callers override via vector_store_name when needed.
-        vector_store_name = default_vector_store_name();
+        let workspace_scope = match default_workspace_scope() {
+            Ok(scope) => scope,
+            Err(err) => {
+                return crate::tool_outcome::ToolCallOutcome::err(format!(
+                    "CodeQuery could not infer a vector store name: {err}. Provide vector_store_name explicitly."
+                ));
+            }
+        };
+        vector_store_name = Some(workspace_scope.default_store_name.clone());
         if vector_store_name.is_none() {
             return crate::tool_outcome::ToolCallOutcome::err(
                 "CodeQuery could not infer a vector store name. Provide vector_store_name explicitly.",
             );
         }
-    }
+        Some(workspace_scope)
+    } else {
+        None
+    };
 
     let mut file_paths: Vec<String> = args
         .get("file_paths")
@@ -218,7 +241,8 @@ pub async fn handle_code_query(
         .unwrap_or_default();
 
     if file_paths.is_empty() {
-        match discover_default_file_paths() {
+        match discover_default_file_paths(default_workspace_scope.as_ref().map(|scope| &scope.root))
+        {
             Ok(mut discovered) => {
                 tracing::info!(
                     "CodeQuery auto-discovered {} file(s) for indexing",
@@ -281,7 +305,12 @@ pub async fn handle_code_query(
                 );
             };
 
-            match resolve_vector_store_id(&client, &cfg, name).await {
+            let cache_lookup_key = default_workspace_scope
+                .as_ref()
+                .map(|scope| scope.cache_key.as_str())
+                .unwrap_or(name);
+
+            match resolve_vector_store_id(&client, &cfg, cache_lookup_key, name).await {
                 Ok(id) => id,
                 Err(e) => {
                     return crate::tool_outcome::ToolCallOutcome::err(format!(
@@ -439,9 +468,10 @@ pub async fn handle_code_query(
 async fn resolve_vector_store_id(
     client: &Client,
     cfg: &crate::core::ApiConfig,
-    name: &str,
+    cache_lookup_key: &str,
+    remote_name: &str,
 ) -> Result<String> {
-    if let Some(id) = load_store_id_from_cache(name) {
+    if let Some(id) = load_store_id_from_cache(cache_lookup_key) {
         return Ok(id);
     }
 
@@ -450,39 +480,48 @@ async fn resolve_vector_store_id(
     let stores = crate::core::list_vector_stores(client, cfg).await?;
     if let Some(entry) = stores
         .into_iter()
-        .find(|entry| entry.name.as_deref() == Some(name))
+        .find(|entry| entry.name.as_deref() == Some(remote_name))
     {
-        cache_store_id(name, &entry.id);
+        cache_store_id(cache_lookup_key, &entry.id);
         return Ok(entry.id);
     }
 
     // Absent a matching store we create one automatically so new clones come online without
     // manual setup. This favors seamless agent startup over requiring explicit provisioning.
-    let new_id = crate::core::create_vector_store(client, cfg, name).await?;
-    cache_store_id(name, &new_id);
+    let new_id = crate::core::create_vector_store(client, cfg, remote_name).await?;
+    cache_store_id(cache_lookup_key, &new_id);
     Ok(new_id)
 }
 
-/// Derives a default vector store name from the current working directory.
-///
-/// Uses the final component of the current directory path as the store name.
-/// This provides stable, predictable naming across sessions without requiring
-/// explicit configuration.
-///
-/// # Returns
-///
-/// - `Some(name)` - The directory name as a string
-/// - `None` - If the current directory cannot be determined or has no name
-///   (e.g., the root directory `/`)
-///
-/// # Example
-///
-/// If the current directory is `/home/user/my-project`, returns `Some("my-project")`.
-fn default_vector_store_name() -> Option<String> {
-    std::env::current_dir().ok().and_then(|path| {
-        path.file_name()
-            .and_then(|os| os.to_str())
-            .map(|s| s.to_string())
+fn discover_workspace_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    for ancestor in cwd.ancestors() {
+        if ancestor.join(".git").exists() {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+    Ok(cwd)
+}
+
+fn workspace_fingerprint(root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(root.as_os_str().to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn default_workspace_scope() -> Result<WorkspaceScope> {
+    let root = discover_workspace_root()?;
+    let base_name = root
+        .file_name()
+        .and_then(|os| os.to_str())
+        .map(|name| name.to_string())
+        .ok_or_else(|| anyhow!("workspace root {} has no usable name", root.display()))?;
+    let fingerprint = workspace_fingerprint(&root);
+    let short = &fingerprint[..8];
+    Ok(WorkspaceScope {
+        root,
+        cache_key: format!("auto::{fingerprint}"),
+        default_store_name: format!("{base_name} [{short}]"),
     })
 }
 
@@ -512,7 +551,7 @@ const SKIP_DIRS: &[&str] = &[
     "tmp",
 ];
 
-/// Discovers indexable source files in the current directory tree.
+/// Discovers indexable source files in the workspace tree.
 ///
 /// Performs a recursive walk from the current working directory, respecting
 /// gitignore rules and filtering to code files suitable for semantic search.
@@ -520,7 +559,7 @@ const SKIP_DIRS: &[&str] = &[
 /// # Discovery Pipeline
 ///
 /// ```text
-/// Current Directory
+/// Workspace Root
 ///        |
 ///        v
 /// +------------------+
@@ -563,8 +602,11 @@ const SKIP_DIRS: &[&str] = &[
 /// - Parent directory ignore files
 ///
 /// Gitignore rules are applied even in non-git directories (e.g., exported archives).
-fn discover_default_file_paths() -> Result<Vec<String>> {
-    let root = std::env::current_dir()?;
+fn discover_default_file_paths(root_override: Option<&PathBuf>) -> Result<Vec<String>> {
+    let root = match root_override {
+        Some(root) => root.clone(),
+        None => discover_workspace_root()?,
+    };
     let mut results = Vec::new();
 
     // Use `ignore`'s walker so `.gitignore` (plus global/exclude rules) are respected by default.
@@ -682,7 +724,7 @@ mod tests {
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp.path()).unwrap();
 
-        let discovered = discover_default_file_paths().unwrap();
+        let discovered = discover_default_file_paths(None).unwrap();
 
         std::env::set_current_dir(original).unwrap();
 
@@ -691,5 +733,58 @@ mod tests {
         assert!(!discovered_joined.contains("ignored.rs"));
         assert!(!discovered_joined.contains("README.md"));
         assert!(!discovered_joined.contains("logo.png"));
+    }
+
+    #[test]
+    fn default_workspace_scope_uses_git_top_level() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git init")
+            .success()
+            .then_some(())
+            .expect("git init should succeed");
+        fs::create_dir_all(temp.path().join("nested/deeper")).expect("nested dirs");
+
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(temp.path().join("nested/deeper")).expect("chdir");
+
+        let scope = default_workspace_scope().expect("scope");
+
+        std::env::set_current_dir(original).expect("restore cwd");
+
+        assert_eq!(
+            scope.root,
+            temp.path().canonicalize().expect("canonical root")
+        );
+        assert!(scope.default_store_name.contains('['));
+        assert!(scope.default_store_name.contains(']'));
+    }
+
+    #[test]
+    fn discover_default_file_paths_walks_git_top_level() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git init")
+            .success()
+            .then_some(())
+            .expect("git init should succeed");
+        fs::write(temp.path().join("root.rs"), b"fn root_level() {}\n").expect("root file");
+        fs::create_dir_all(temp.path().join("nested/deeper")).expect("nested dirs");
+
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(temp.path().join("nested/deeper")).expect("chdir");
+
+        let discovered = discover_default_file_paths(None).expect("discover");
+
+        std::env::set_current_dir(original).expect("restore cwd");
+
+        let discovered_joined = discovered.join("\n");
+        assert!(discovered_joined.contains("root.rs"));
     }
 }

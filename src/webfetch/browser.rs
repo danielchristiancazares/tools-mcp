@@ -277,25 +277,6 @@ impl BrowserPool {
         }
     }
 
-    /// Forces an immediate browser restart, bypassing normal lifecycle checks.
-    ///
-    /// Useful for recovery after errors that may have corrupted browser state.
-    /// The next `render_page` call will spawn a fresh browser instance.
-    #[allow(dead_code)]
-    pub async fn force_restart(&self) {
-        let mut guard = self.browser.lock().await;
-        if let Some(mut instance) = guard.take() {
-            info!("Force restarting browser");
-            if let Some(browser) = Arc::get_mut(&mut instance.browser) {
-                if let Err(e) = browser.close().await {
-                    warn!("Error closing browser during force restart: {}", e);
-                }
-            } else {
-                warn!("Cannot close browser: multiple references exist");
-            }
-        }
-    }
-
     /// Checks if a Chrome/Chromium browser is available on the system.
     ///
     /// This is a synchronous check that searches for Chrome binaries in:

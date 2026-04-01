@@ -231,10 +231,7 @@ impl RpcResponse<'static> {
         static PRETTY_JSON: OnceLock<bool> = OnceLock::new();
         let pretty = *PRETTY_JSON.get_or_init(|| {
             std::env::var("TOOLS_PRETTY_JSON")
-                .map(|v| match v.to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => true,
-                    _ => false,
-                })
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false)
         });
 
@@ -271,7 +268,7 @@ impl RpcResponse<'static> {
     /// # Returns
     ///
     /// * `Ok(T)` - Successfully parsed arguments
-    /// * `Err(RpcResponse)` - Pre-built error response ready to return
+    /// * `Err(Box<RpcResponse>)` - Pre-built error response ready to return
     ///
     /// # Example
     ///
@@ -281,7 +278,7 @@ impl RpcResponse<'static> {
     pub fn parse<T: serde::de::DeserializeOwned>(
         id: Option<Value>,
         args: Value,
-    ) -> Result<T, RpcResponse<'static>> {
+    ) -> Result<T, Box<RpcResponse<'static>>> {
         serde_json::from_value::<T>(args).map_err(|e| {
             let msg = e.to_string();
             // Serde's error strings are informative but not always prescriptive.
@@ -295,7 +292,7 @@ impl RpcResponse<'static> {
             } else {
                 ""
             };
-            RpcResponse::err(id, format!("invalid arguments: {msg}.{hint}"))
+            Box::new(RpcResponse::err(id, format!("invalid arguments: {msg}.{hint}")))
         })
     }
 

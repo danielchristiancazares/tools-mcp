@@ -532,13 +532,6 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
     }
 }
 
-/// Construct a shared HTTP client configured for MCP WebFetch usage.
-/// Redirects are disabled - they're followed manually in fetch_document for SSRF protection.
-#[allow(dead_code)]
-pub fn build_http_client() -> Result<Client> {
-    build_http_client_with_resolve(None)
-}
-
 fn build_http_client_with_resolve(resolve: Option<&(String, SocketAddr)>) -> Result<Client> {
     let mut builder = Client::builder()
         .user_agent(USER_AGENT)

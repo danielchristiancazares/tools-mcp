@@ -54,22 +54,221 @@ struct DiffStats {
     deletions: u32,
 }
 
-/// Parse a line from `git diff --numstat` output.
-/// Format: "<insertions>\t<deletions>\t<path>" or "-\t-\t<path>" for binary.
-fn parse_numstat_line(line: &str) -> Option<(u32, u32, String, bool)> {
-    let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() < 3 {
-        return None;
+#[derive(Debug, Clone)]
+struct DiffManifestEntry {
+    path: String,
+    status: String,
+    old_path: Option<String>,
+    insertions: u32,
+    deletions: u32,
+    binary: bool,
+}
+
+fn diff_manifest_key(path: &str, old_path: Option<&str>) -> String {
+    match old_path {
+        Some(old_path) => format!("{old_path}\0{path}"),
+        None => path.to_string(),
     }
-    let path = parts[2..].join("\t"); // Handle paths with tabs
-    if parts[0] == "-" && parts[1] == "-" {
-        // Binary file
-        Some((0, 0, path, true))
-    } else {
-        let ins = parts[0].parse().ok()?;
-        let del = parts[1].parse().ok()?;
-        Some((ins, del, path, false))
+}
+
+fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
+    let tokens: Vec<&str> = stdout
+        .split('\0')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut idx = 0usize;
+    let mut entries = Vec::new();
+
+    while idx < tokens.len() {
+        let status_token = tokens[idx];
+        idx += 1;
+        let Some(status_code) = status_token.chars().next() else {
+            return Err("git diff --name-status returned an empty status token".to_string());
+        };
+
+        match status_code {
+            'A' | 'D' | 'M' | 'T' => {
+                let path = tokens.get(idx).ok_or_else(|| {
+                    format!("git diff --name-status missing path for status {status_token}")
+                })?;
+                idx += 1;
+                let status = match status_code {
+                    'A' => "added",
+                    'D' => "deleted",
+                    _ => "modified",
+                };
+                entries.push(DiffManifestEntry {
+                    path: (*path).to_string(),
+                    status: status.to_string(),
+                    old_path: None,
+                    insertions: 0,
+                    deletions: 0,
+                    binary: false,
+                });
+            }
+            'R' => {
+                let old_path = tokens.get(idx).ok_or_else(|| {
+                    format!("git diff --name-status missing old path for status {status_token}")
+                })?;
+                let new_path = tokens.get(idx + 1).ok_or_else(|| {
+                    format!("git diff --name-status missing new path for status {status_token}")
+                })?;
+                idx += 2;
+                entries.push(DiffManifestEntry {
+                    path: (*new_path).to_string(),
+                    status: "renamed".to_string(),
+                    old_path: Some((*old_path).to_string()),
+                    insertions: 0,
+                    deletions: 0,
+                    binary: false,
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "git diff --name-status returned unsupported status token {status_token}"
+                ));
+            }
+        }
     }
+
+    Ok(entries)
+}
+
+fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<(), String> {
+    let mut entry_index: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            (
+                diff_manifest_key(&entry.path, entry.old_path.as_deref()),
+                idx,
+            )
+        })
+        .collect();
+    let tokens: Vec<&str> = stdout
+        .split('\0')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let stats = tokens[idx];
+        idx += 1;
+        let parts: Vec<&str> = stats.split('\t').collect();
+        if parts.len() < 3 {
+            return Err(format!(
+                "git diff --numstat returned malformed record: {stats:?}"
+            ));
+        }
+
+        let binary = parts[0] == "-" && parts[1] == "-";
+        let insertions = if binary {
+            0
+        } else {
+            parts[0].parse::<u32>().map_err(|err| {
+                format!(
+                    "git diff --numstat invalid insertions value {:?}: {err}",
+                    parts[0]
+                )
+            })?
+        };
+        let deletions = if binary {
+            0
+        } else {
+            parts[1].parse::<u32>().map_err(|err| {
+                format!(
+                    "git diff --numstat invalid deletions value {:?}: {err}",
+                    parts[1]
+                )
+            })?
+        };
+
+        let raw_path = parts[2..].join("\t");
+        let (path, old_path) = if raw_path.is_empty() {
+            let old_path = tokens.get(idx).ok_or_else(|| {
+                "git diff --numstat missing old path for rename record".to_string()
+            })?;
+            let new_path = tokens.get(idx + 1).ok_or_else(|| {
+                "git diff --numstat missing new path for rename record".to_string()
+            })?;
+            idx += 2;
+            ((*new_path).to_string(), Some((*old_path).to_string()))
+        } else {
+            (raw_path, None)
+        };
+
+        let key = diff_manifest_key(&path, old_path.as_deref());
+        let Some(entry_pos) = entry_index.remove(&key) else {
+            return Err(format!(
+                "git diff --numstat returned a path not present in --name-status: {}",
+                path
+            ));
+        };
+        let entry = &mut entries[entry_pos];
+        entry.insertions = insertions;
+        entry.deletions = deletions;
+        entry.binary = binary;
+    }
+
+    Ok(())
+}
+
+async fn collect_ref_diff_manifest(
+    working_dir: Option<&str>,
+    from_ref: &str,
+    to_ref: &str,
+    timeout_ms: u64,
+) -> Result<Vec<DiffManifestEntry>, String> {
+    let common_args = vec![
+        "diff".into(),
+        format!("{from_ref}..{to_ref}"),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "--find-renames".into(),
+    ];
+
+    let mut name_status_args = common_args.clone();
+    name_status_args.push("--name-status".into());
+    name_status_args.push("-z".into());
+    let name_status_exec = run_git(
+        working_dir.map(|s| s.to_string()),
+        name_status_args,
+        timeout_ms,
+        MAX_OUTPUT_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
+    )
+    .await
+    .map_err(|e| format!("git diff --name-status error: {e:#}"))?;
+    if !name_status_exec.success {
+        return Err(format!(
+            "git diff --name-status failed: {}",
+            name_status_exec.stderr.trim()
+        ));
+    }
+
+    let mut entries = parse_name_status_z(&name_status_exec.stdout)?;
+
+    let mut numstat_args = common_args;
+    numstat_args.push("--numstat".into());
+    numstat_args.push("-z".into());
+    let numstat_exec = run_git(
+        working_dir.map(|s| s.to_string()),
+        numstat_args,
+        timeout_ms,
+        MAX_OUTPUT_BYTES,
+        DEFAULT_GIT_STDERR_BYTES,
+    )
+    .await
+    .map_err(|e| format!("git diff --numstat error: {e:#}"))?;
+    if !numstat_exec.success {
+        return Err(format!(
+            "git diff --numstat failed: {}",
+            numstat_exec.stderr.trim()
+        ));
+    }
+
+    apply_numstat_z(&mut entries, &numstat_exec.stdout)?;
+    Ok(entries)
 }
 
 /// Write per-file patches to a directory and generate _summary.json.
@@ -86,61 +285,31 @@ async fn write_patches_to_dir(
         .await
         .map_err(|e| format!("Failed to create output directory: {e}"))?;
 
-    // Get file list with numstat
-    let numstat_args = vec![
-        "diff".into(),
-        format!("{from_ref}..{to_ref}"),
-        "--no-ext-diff".into(),
-        "--no-textconv".into(),
-        "--numstat".into(),
-    ];
-    let numstat_exec = run_git(
-        working_dir.map(|s| s.to_string()),
-        numstat_args,
-        timeout_ms,
-        MAX_OUTPUT_BYTES,
-        DEFAULT_GIT_STDERR_BYTES,
-    )
-    .await
-    .map_err(|e| format!("git numstat error: {e:#}"))?;
-
-    if !numstat_exec.success {
-        return Err(format!(
-            "git diff --numstat failed: {}",
-            numstat_exec.stderr.trim()
-        ));
-    }
+    let entries = collect_ref_diff_manifest(working_dir, from_ref, to_ref, timeout_ms).await?;
 
     let mut files: Vec<FileDiffEntry> = Vec::new();
     let mut total_insertions: u32 = 0;
     let mut total_deletions: u32 = 0;
 
-    // Parse numstat output and get patches for each file
-    for line in numstat_exec.stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    for entry in entries {
+        total_insertions += entry.insertions;
+        total_deletions += entry.deletions;
 
-        let Some((ins, del, path, is_binary)) = parse_numstat_line(line) else {
-            continue;
-        };
-
-        total_insertions += ins;
-        total_deletions += del;
-
-        let patch_filename = format!("{}.patch", sanitize_path_for_filename(&path));
+        let patch_filename = format!("{}.patch", sanitize_path_for_filename(&entry.path));
         let patch_path = out_path.join(&patch_filename);
 
-        // Get the patch for this file
-        let patch_args = vec![
+        let mut patch_args = vec![
             "diff".into(),
             format!("{from_ref}..{to_ref}"),
             "--no-ext-diff".into(),
             "--no-textconv".into(),
+            "--find-renames".into(),
             "--".into(),
-            path.clone(),
         ];
+        if let Some(old_path) = &entry.old_path {
+            patch_args.push(old_path.clone());
+        }
+        patch_args.push(entry.path.clone());
         let patch_exec = run_git(
             working_dir.map(|s| s.to_string()),
             patch_args,
@@ -149,49 +318,33 @@ async fn write_patches_to_dir(
             DEFAULT_GIT_STDERR_BYTES,
         )
         .await
-        .map_err(|e| format!("git diff error for {path}: {e:#}"))?;
+        .map_err(|e| format!("git diff error for {}: {e:#}", entry.path))?;
+        if !patch_exec.success {
+            return Err(format!(
+                "git diff failed for {}: {}",
+                entry.path,
+                patch_exec.stderr.trim()
+            ));
+        }
 
-        let patch_content = if is_binary {
-            format!("Binary file: {path}\n")
+        let patch_content = if patch_exec.stdout.is_empty() && entry.binary {
+            format!("Binary file: {}\n", entry.path)
         } else {
-            patch_exec.stdout.clone()
+            patch_exec.stdout
         };
 
-        // Write patch file
         fs::write(&patch_path, &patch_content)
             .await
             .map_err(|e| format!("Failed to write {}: {e}", patch_path.display()))?;
 
-        // Determine status from diff header
-        let status = if patch_exec.stdout.contains("new file mode") {
-            "added"
-        } else if patch_exec.stdout.contains("deleted file mode") {
-            "deleted"
-        } else if patch_exec.stdout.contains("rename from") {
-            "renamed"
-        } else {
-            "modified"
-        };
-
-        // Extract old path for renames
-        let old_path = if status == "renamed" {
-            patch_exec
-                .stdout
-                .lines()
-                .find(|l| l.starts_with("rename from "))
-                .map(|l| l.strip_prefix("rename from ").unwrap_or("").to_string())
-        } else {
-            None
-        };
-
         files.push(FileDiffEntry {
-            path,
-            status: status.to_string(),
-            old_path,
-            insertions: ins,
-            deletions: del,
+            path: entry.path,
+            status: entry.status,
+            old_path: entry.old_path,
+            insertions: entry.insertions,
+            deletions: entry.deletions,
             patch_file: patch_filename,
-            binary: is_binary,
+            binary: entry.binary,
         });
     }
 
@@ -912,13 +1065,13 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
         cmd_args.push(commit.clone());
     }
 
-    if let Some(paths) = &req.paths {
-        if !paths.is_empty() {
-            cmd_args.push("--".into());
-            for p in paths {
-                if !p.trim().is_empty() {
-                    cmd_args.push(p.clone());
-                }
+    if let Some(paths) = &req.paths
+        && !paths.is_empty()
+    {
+        cmd_args.push("--".into());
+        for p in paths {
+            if !p.trim().is_empty() {
+                cmd_args.push(p.clone());
             }
         }
     }
@@ -1228,4 +1381,31 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_numstat_z, parse_name_status_z};
+
+    #[test]
+    fn parse_name_status_z_handles_rename_entries() {
+        let entries = parse_name_status_z("R100\0src/old.txt\0src/new.txt\0")
+            .expect("rename entry should parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "renamed");
+        assert_eq!(entries[0].old_path.as_deref(), Some("src/old.txt"));
+        assert_eq!(entries[0].path, "src/new.txt");
+    }
+
+    #[test]
+    fn apply_numstat_z_populates_rename_counts() {
+        let mut entries = parse_name_status_z("R100\0src/old.txt\0src/new.txt\0")
+            .expect("rename entry should parse");
+        apply_numstat_z(&mut entries, "0\t0\t\0src/old.txt\0src/new.txt\0")
+            .expect("rename numstat should parse");
+        assert_eq!(entries[0].insertions, 0);
+        assert_eq!(entries[0].deletions, 0);
+        assert_eq!(entries[0].old_path.as_deref(), Some("src/old.txt"));
+        assert_eq!(entries[0].path, "src/new.txt");
+    }
 }

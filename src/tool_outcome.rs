@@ -85,10 +85,7 @@ impl ToolCallOutcome {
         static PRETTY_JSON: OnceLock<bool> = OnceLock::new();
         let pretty = *PRETTY_JSON.get_or_init(|| {
             std::env::var("TOOLS_PRETTY_JSON")
-                .map(|v| match v.to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => true,
-                    _ => false,
-                })
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false)
         });
 

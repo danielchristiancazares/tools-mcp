@@ -7,7 +7,6 @@
   - Registered runtime tools with local side effects or external egress: filesystem tools, git tools, `Pwsh`, `WebFetch`, and `CodeQuery`.
   - Local caches and browser subprocesses used by `WebFetch` and `CodeQuery`.
 - Out of scope:
-  - `Build` and `Test` tools, per user instruction, even though they are still registered in the current codebase.
   - CI/release processes and external wrappers not present in this repo.
   - Standalone third-party use of the `file_search_core` library outside this MCP server.
 - Validated assumptions:
@@ -189,7 +188,7 @@ flowchart LR
 | Path | Why it matters | Related Threat IDs |
 | --- | --- | --- |
 | `src/adapters/inbound/mcp_server.rs` | Single tool-call control plane without internal authz gates. | TM-001, TM-002, TM-007 |
-| `src/composition.rs` | Enumerates every registered runtime capability and confirms `Build`/`Test` remain live until removed. | TM-001, TM-002, TM-003 |
+| `src/composition.rs` | Enumerates every registered runtime capability exposed to callers. | TM-001, TM-002, TM-003 |
 | `src/tools/pwsh.rs` | Exposes arbitrary PowerShell execution to MCP callers. | TM-001 |
 | `src/process_utils.rs` | Core subprocess execution layer for PowerShell and other commands. | TM-001, TM-005 |
 | `src/tools/write.rs` | Creates caller-chosen files without cwd confinement. | TM-002 |
@@ -206,8 +205,8 @@ flowchart LR
 | `src/webfetch/extract.rs` | Output sanitization is content-cleaning, not a true prompt-injection control. | TM-007 |
 
 ## Quality check
-- Covered all primary entry points discovered in the registered runtime tool set, excluding `Build` and `Test` by validated user scope.
+- Covered all primary entry points discovered in the registered runtime tool set.
 - Represented each major trust boundary in at least one threat: MCP caller, local filesystem, git/process execution, remote web content, browser subprocess, OpenAI egress, and local caches.
 - Separated runtime behavior from tests and build/dev tooling; tests were used only as evidence of intended behavior.
-- Reflected user clarifications: local trusted deployment, OpenAI egress allowed, external `Pwsh` env gate, `Build`/`Test` ignored, and desired cwd-only modification policy.
+- Reflected user clarifications: local trusted deployment, OpenAI egress allowed, external `Pwsh` env gate, and desired cwd-only modification policy.
 - Kept explicit assumptions and residual open questions visible where they materially affect ranking.

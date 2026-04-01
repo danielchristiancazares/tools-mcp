@@ -1,4 +1,4 @@
-//! Process execution utilities for running shell scripts and commands with timeout control.
+//! Process execution utilities with timeout control and bounded output capture.
 //!
 //! This module provides a set of utilities for spawning and managing external processes
 //! in an async context. Key features include:
@@ -9,8 +9,8 @@
 //!   byte limits to prevent memory exhaustion from runaway processes.
 //! - **ANSI code stripping**: Terminal escape sequences are automatically removed from
 //!   captured output for clean text processing.
-//! - **Cross-platform support**: Shell script execution adapts to the host OS, using
-//!   PowerShell on Windows and Bash on Unix-like systems.
+//! - **Cross-platform support**: PowerShell execution uses `pwsh`/`pwsh.exe` across
+//!   supported platforms.
 //!
 //! # Error Handling
 //!
@@ -25,27 +25,9 @@
 //! # Examples
 //!
 //! ```no_run
-//! use std::path::Path;
-//! use tools_mcp::process_utils::{run_shell_script, run_pwsh_command};
+//! use tools_mcp::process_utils::run_pwsh_command;
 //!
 //! # async fn example() -> Result<(), String> {
-//! // Run a shell script with 30-second timeout
-//! let result = run_shell_script(
-//!     Path::new("./build.sh"),
-//!     ".",
-//!     30_000,        // 30 second timeout
-//!     1_000_000,     // 1MB stdout limit
-//!     1_000_000,     // 1MB stderr limit
-//! ).await?;
-//!
-//! if result.success {
-//!     println!("Build succeeded: {}", result.stdout);
-//! } else if result.timed_out {
-//!     eprintln!("Build timed out after 30 seconds");
-//! } else {
-//!     eprintln!("Build failed with code {:?}: {}", result.exit_code, result.stderr);
-//! }
-//!
 //! // Run a PowerShell command
 //! let result = run_pwsh_command(
 //!     "Get-Process | Select-Object -First 5",
@@ -59,7 +41,6 @@
 //! ```
 
 use std::io;
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -173,11 +154,11 @@ pub fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
-/// Result of running a shell script or external process.
+/// Result of running an external process.
 ///
 /// This struct captures comprehensive information about a process execution,
 /// including its exit status, captured output, and whether any limits were
-/// exceeded. It is returned by [`run_shell_script`] and [`run_pwsh_command`].
+/// exceeded. It is returned by process execution helpers such as [`run_pwsh_command`].
 ///
 /// # Determining Execution Outcome
 ///
@@ -200,7 +181,7 @@ pub fn strip_ansi_codes(s: &str) -> String {
 /// # Examples
 ///
 /// ```no_run
-/// # use tools_mcp::process_utils::{run_shell_script, ProcessResult};
+/// # use tools_mcp::process_utils::ProcessResult;
 /// # async fn example() {
 /// # let result: ProcessResult = todo!();
 /// // Check for successful completion
@@ -343,254 +324,11 @@ where
     Ok((out, truncated))
 }
 
-/// Executes a shell script with timeout enforcement and bounded output capture.
-///
-/// This function spawns the appropriate shell interpreter for the host OS and
-/// runs the specified script file. Output is captured asynchronously with
-/// configurable byte limits to prevent memory exhaustion.
-///
-/// # Platform Behavior
-///
-/// - **Windows**: Runs `pwsh.exe -NoLogo -ExecutionPolicy Bypass -File <script>`
-/// - **Unix/Linux/macOS**: Runs `bash <script>`
-///
-/// # Arguments
-///
-/// * `script_path` - Path to the script file to execute. On Windows, this should
-///   be a `.ps1` file; on Unix, a shell script (typically `.sh`).
-/// * `working_dir` - Working directory for the child process. The script runs
-///   with this as its current directory.
-/// * `timeout_ms` - Maximum execution time in milliseconds. If exceeded, the
-///   process is forcibly killed.
-/// * `max_stdout_bytes` - Maximum bytes to capture from stdout. Additional
-///   output is discarded (but still drained to prevent blocking).
-/// * `max_stderr_bytes` - Maximum bytes to capture from stderr.
-///
-/// # Returns
-///
-/// - `Ok(ProcessResult)` - Process was spawned successfully. Check the result
-///   fields for exit status, timeout, and captured output.
-/// - `Err(String)` - Failed to spawn the process or wait on it.
-///
-/// # Timeout Handling
-///
-/// When a timeout occurs:
-/// 1. The process is killed immediately via `SIGKILL` (Unix) or `TerminateProcess` (Windows)
-/// 2. A 2-second grace period allows pipe buffers to drain
-/// 3. The returned `ProcessResult` has `timed_out = true` and `exit_code = None`
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::path::Path;
-/// use tools_mcp::process_utils::run_shell_script;
-///
-/// # async fn example() -> Result<(), String> {
-/// let result = run_shell_script(
-///     Path::new("./build.sh"),
-///     "/project",
-///     60_000,      // 1 minute timeout
-///     1_000_000,   // 1MB stdout limit
-///     1_000_000,   // 1MB stderr limit
-/// ).await?;
-///
-/// if result.success {
-///     println!("Build output:\n{}", result.stdout);
-/// } else if result.timed_out {
-///     eprintln!("Build timed out!");
-/// } else {
-///     eprintln!("Build failed (exit {}): {}",
-///         result.exit_code.unwrap_or(-1),
-///         result.stderr);
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// # Errors
-///
-/// Returns an error string if:
-/// - The shell interpreter cannot be spawned (e.g., `pwsh.exe` or `bash` not found)
-/// - Pipe setup fails
-/// - The `wait()` syscall fails unexpectedly
-pub async fn run_shell_script(
-    script_path: &Path,
-    working_dir: &str,
-    timeout_ms: u64,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-) -> Result<ProcessResult, String> {
-    let is_windows = cfg!(target_os = "windows");
-
-    // Build the command based on the host platform
-    let mut cmd = if is_windows {
-        let mut c = Command::new("pwsh.exe");
-        // -NoLogo: suppress PowerShell banner
-        // -ExecutionPolicy Bypass: allow script execution without policy restrictions
-        // -File: execute script file (vs -Command for inline code)
-        c.args(["-NoLogo", "-ExecutionPolicy", "Bypass", "-File"]);
-        c.arg(script_path);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg(script_path);
-        c
-    };
-
-    cmd.current_dir(working_dir);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
-
-    // Take ownership of stdout/stderr handles for async reading
-    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
-    let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
-
-    // Spawn concurrent tasks to drain both pipes simultaneously
-    // This prevents deadlock if the child fills one pipe buffer while we read the other
-    let stdout_task =
-        tokio::spawn(async move { read_to_end_limited(stdout, max_stdout_bytes).await });
-    let stderr_task =
-        tokio::spawn(async move { read_to_end_limited(stderr, max_stderr_bytes).await });
-
-    // Wait for process completion with timeout enforcement
-    let mut timed_out = false;
-    let status = match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(e)) => return Err(format!("wait failed: {e}")),
-        Err(_) => {
-            // Timeout elapsed - forcibly terminate the process
-            timed_out = true;
-            let _ = child.kill().await;
-            // Allow 2 seconds for zombie cleanup and pipe buffer drain
-            let _ = time::timeout(Duration::from_millis(2_000), child.wait()).await;
-            None
-        }
-    };
-
-    // Collect output from the reader tasks, defaulting to empty on failure
-    // Double unwrap handles: JoinError (task panic) -> io::Error (read failure)
-    let (stdout_bytes, truncated_stdout) = stdout_task
-        .await
-        .unwrap_or_else(|_| Ok((Vec::new(), false)))
-        .unwrap_or((Vec::new(), false));
-    let (stderr_bytes, truncated_stderr) = stderr_task
-        .await
-        .unwrap_or_else(|_| Ok((Vec::new(), false)))
-        .unwrap_or((Vec::new(), false));
-
-    // Convert raw bytes to clean strings: lossy UTF-8 decode + ANSI stripping
-    let stdout = strip_ansi_codes(&String::from_utf8_lossy(&stdout_bytes));
-    let stderr = strip_ansi_codes(&String::from_utf8_lossy(&stderr_bytes));
-
-    // Extract exit code (None if killed by signal or timeout)
-    let exit_code = status.as_ref().and_then(|s| s.code());
-
-    // Success requires both: exit code 0 AND no timeout
-    let success = status.as_ref().is_some_and(|s| s.success()) && !timed_out;
-
-    Ok(ProcessResult {
-        exit_code,
-        success,
-        timed_out,
-        stdout,
-        stderr,
-        truncated_stdout,
-        truncated_stderr,
-    })
-}
-
-/// Executes an arbitrary command with arguments, timeout enforcement, and output capture.
-///
-/// This is a generic command runner that spawns any executable with the given arguments.
-/// Unlike `run_shell_script` which invokes a shell interpreter, this directly executes
-/// the specified program.
-///
-/// # Arguments
-///
-/// * `program` - The executable to run (e.g., "cargo", "npm", "make")
-/// * `args` - Command-line arguments to pass to the program
-/// * `working_dir` - Directory to run the command in
-/// * `timeout_ms` - Maximum execution time in milliseconds
-/// * `max_stdout_bytes` - Maximum bytes to capture from stdout
-/// * `max_stderr_bytes` - Maximum bytes to capture from stderr
-///
-/// # Returns
-///
-/// A `ProcessResult` containing exit code, success status, output, and truncation flags.
-pub async fn run_command(
-    program: &str,
-    args: &[String],
-    working_dir: &str,
-    timeout_ms: u64,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-) -> Result<ProcessResult, String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    cmd.current_dir(working_dir);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn {}: {e}", program))?;
-
-    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
-    let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
-
-    let stdout_task =
-        tokio::spawn(async move { read_to_end_limited(stdout, max_stdout_bytes).await });
-    let stderr_task =
-        tokio::spawn(async move { read_to_end_limited(stderr, max_stderr_bytes).await });
-
-    let mut timed_out = false;
-    let status = match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(e)) => return Err(format!("wait failed: {e}")),
-        Err(_) => {
-            timed_out = true;
-            let _ = child.kill().await;
-            let _ = time::timeout(Duration::from_millis(2_000), child.wait()).await;
-            None
-        }
-    };
-
-    let (stdout_bytes, truncated_stdout) = stdout_task
-        .await
-        .unwrap_or_else(|_| Ok((Vec::new(), false)))
-        .unwrap_or((Vec::new(), false));
-    let (stderr_bytes, truncated_stderr) = stderr_task
-        .await
-        .unwrap_or_else(|_| Ok((Vec::new(), false)))
-        .unwrap_or((Vec::new(), false));
-
-    let stdout = strip_ansi_codes(&String::from_utf8_lossy(&stdout_bytes));
-    let stderr = strip_ansi_codes(&String::from_utf8_lossy(&stderr_bytes));
-
-    let exit_code = status.as_ref().and_then(|s| s.code());
-    let success = status.as_ref().is_some_and(|s| s.success()) && !timed_out;
-
-    Ok(ProcessResult {
-        exit_code,
-        success,
-        timed_out,
-        stdout,
-        stderr,
-        truncated_stdout,
-        truncated_stderr,
-    })
-}
-
 /// Executes a PowerShell command string with timeout enforcement and output capture.
 ///
 /// This function runs an inline PowerShell command (not a script file) using
 /// PowerShell Core (`pwsh`). It is cross-platform: PowerShell Core runs on
 /// Windows, macOS, and Linux when installed.
-///
-/// # Difference from `run_shell_script`
-///
-/// - `run_shell_script`: Executes a script **file** via the native shell (Bash/PowerShell)
-/// - `run_pwsh_command`: Executes a command **string** via PowerShell Core only
 ///
 /// Use this function when you need PowerShell-specific features (cmdlets, pipeline,
 /// object handling) or cross-platform consistency with PowerShell syntax.
@@ -742,7 +480,7 @@ pub async fn run_pwsh_command(
 /// Build a standard MCP-compatible process result response payload.
 ///
 /// This consolidates the repeated pattern of building JSON responses from
-/// ProcessResult structs across tools/pwsh.rs and script_runner.rs. It handles
+/// ProcessResult structs across tools such as `Pwsh`. It handles
 /// the common fields (exit_code, success, timed_out, truncated flags, stdout, stderr)
 /// and allows optional extra fields to be added per-tool.
 ///

@@ -57,13 +57,30 @@ async fn main() -> Result<()> {
     let registry = build_tool_registry();
     let tools = registry.list();
 
-    while let Some(message) = match read_mcp_message(&mut reader).await {
-        Ok(v) => v,
-        Err(e) => {
-            error!("failed to read MCP message: {}", e);
-            None
-        }
-    } {
+    loop {
+        let message = match read_mcp_message(&mut reader).await {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            Err(read_err) => {
+                error!("failed to read MCP message: {}", read_err.error);
+                let parse_error = RpcResponse::protocol_error(None, -32700, "Parse error");
+                let skip_headers = if read_err.response_has_headers {
+                    false
+                } else {
+                    should_skip_headers()
+                };
+                if let Err(write_err) =
+                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await
+                {
+                    error!("failed to write parse error response: {}", write_err);
+                    break;
+                }
+                if read_err.should_continue {
+                    continue;
+                }
+                break;
+            }
+        };
         let line = message.body;
         if line.trim().is_empty() {
             continue;

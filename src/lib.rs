@@ -404,7 +404,7 @@ pub async fn upload_files_batch(
     let chunk_count = if file_paths.is_empty() {
         0
     } else {
-        (file_paths.len() + concurrent_limit - 1) / concurrent_limit
+        file_paths.len().div_ceil(concurrent_limit)
     };
 
     for (chunk_idx, chunk) in file_paths.chunks(concurrent_limit).enumerate() {

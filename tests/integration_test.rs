@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::Once;
 
@@ -17,6 +17,38 @@ fn setup() {
             panic!("Build failed: {}", String::from_utf8_lossy(&output.stderr));
         }
     });
+}
+
+fn read_server_response<R: BufRead>(reader: &mut R) -> Result<String, Box<dyn std::error::Error>> {
+    let mut content_length = None;
+    let mut line_response = None;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>()?);
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            if let Some(len) = content_length {
+                let mut buffer = vec![0u8; len];
+                reader.read_exact(&mut buffer)?;
+                return Ok(String::from_utf8(buffer)?);
+            }
+            continue;
+        }
+
+        line_response = Some(line);
+        break;
+    }
+
+    line_response.ok_or_else(|| "No response received".into())
 }
 
 /// Helper function to send a message to the MCP server and get response
@@ -44,36 +76,14 @@ fn send_mcp_message(message: Value) -> Result<Value, Box<dyn std::error::Error>>
 
     // Read response with timeout
     let mut reader = BufReader::new(stdout);
-    let mut response = String::new();
-
-    // Read until we get a complete JSON response
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        // Skip Content-Length headers if present
-        if line.starts_with("Content-Length:") || line.trim().is_empty() {
-            continue;
-        }
-
-        response = line;
-        break;
-    }
+    let response = read_server_response(&mut reader)?;
 
     // Kill the child process (in case it hasn't exited)
     let _ = child.kill();
     let _ = child.wait(); // Clean up zombie
 
     // Parse and return the JSON response
-    if response.is_empty() {
-        Err("No response received".into())
-    } else {
-        Ok(serde_json::from_str(&response)?)
-    }
+    Ok(serde_json::from_str(&response)?)
 }
 
 /// Helper to send message with Content-Length header
@@ -102,33 +112,7 @@ fn send_mcp_message_with_headers(message: Value) -> Result<Value, Box<dyn std::e
 
     // Read response with headers
     let mut reader = BufReader::new(stdout);
-    let mut content_length = 0;
-
-    // Read headers
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-
-        if bytes == 0 {
-            break; // EOF
-        }
-
-        if line.starts_with("Content-Length:") {
-            content_length = line
-                .trim()
-                .strip_prefix("Content-Length:")
-                .unwrap()
-                .trim()
-                .parse()?;
-        } else if line.trim().is_empty() && content_length > 0 {
-            break;
-        }
-    }
-
-    // Read body based on Content-Length
-    let mut buffer = vec![0u8; content_length];
-    reader.read_exact(&mut buffer)?;
-    let response_str = String::from_utf8(buffer)?;
+    let response_str = read_server_response(&mut reader)?;
 
     // Kill the child process and clean up
     let _ = child.kill();
@@ -211,8 +195,6 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"Write"));
     assert!(tool_names.contains(&"Delete"));
     assert!(tool_names.contains(&"Glob"));
-    assert!(tool_names.contains(&"Build"));
-    assert!(tool_names.contains(&"Test"));
     assert!(tool_names.contains(&"Outline"));
 }
 
@@ -427,6 +409,115 @@ fn test_git_status_tool_call_if_git_installed() {
 }
 
 #[test]
+fn test_git_diff_ref_export_preserves_rename_metadata() {
+    let git_bin = if cfg!(target_os = "windows") {
+        "git.exe"
+    } else {
+        "git"
+    };
+
+    let git_available = Command::new(git_bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !git_available {
+        eprintln!("Skipping GitDiff test: {git_bin} not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let patches_dir = tempfile::tempdir().expect("failed to create patch dir");
+
+    let init_status = Command::new(git_bin)
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .expect("git init");
+    assert!(init_status.success(), "git init failed");
+
+    let email_status = Command::new(git_bin)
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(dir.path())
+        .status()
+        .expect("git config email");
+    assert!(email_status.success(), "git config email failed");
+
+    let name_status = Command::new(git_bin)
+        .args(["config", "user.name", "Test User"])
+        .current_dir(dir.path())
+        .status()
+        .expect("git config name");
+    assert!(name_status.success(), "git config name failed");
+
+    std::fs::create_dir_all(dir.path().join("src")).expect("src dir");
+    std::fs::write(dir.path().join("src/old.txt"), "hello\n").expect("write old");
+
+    let add_status = Command::new(git_bin)
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .status()
+        .expect("git add");
+    assert!(add_status.success(), "git add failed");
+
+    let first_commit = Command::new(git_bin)
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(dir.path())
+        .status()
+        .expect("first commit");
+    assert!(first_commit.success(), "first commit failed");
+
+    let mv_status = Command::new(git_bin)
+        .args(["mv", "src/old.txt", "src/new.txt"])
+        .current_dir(dir.path())
+        .status()
+        .expect("git mv");
+    assert!(mv_status.success(), "git mv failed");
+
+    let second_commit = Command::new(git_bin)
+        .args(["commit", "-q", "-m", "rename"])
+        .current_dir(dir.path())
+        .status()
+        .expect("second commit");
+    assert!(second_commit.success(), "second commit failed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 420,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "GitDiff",
+            "arguments": {
+                "working_dir": dir.path().to_string_lossy().to_string(),
+                "from_ref": "HEAD~1",
+                "to_ref": "HEAD",
+                "output_dir": patches_dir.path().to_string_lossy().to_string()
+            }
+        }
+    });
+
+    let response = send_mcp_message(request).expect("Failed to call GitDiff");
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 420);
+    assert_eq!(response["result"]["isError"], false);
+
+    let files = response["result"]["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["status"], "renamed");
+    assert_eq!(files[0]["old_path"], "src/old.txt");
+    assert_eq!(files[0]["path"], "src/new.txt");
+
+    let patch_file = files[0]["patch_file"].as_str().expect("patch file");
+    let patch_text =
+        std::fs::read_to_string(patches_dir.path().join(patch_file)).expect("read patch");
+    assert!(patch_text.contains("rename from src/old.txt"));
+    assert!(patch_text.contains("rename to src/new.txt"));
+}
+
+#[test]
 fn test_error_handling_unknown_method() {
     let request = json!({
         "jsonrpc": "2.0",
@@ -578,6 +669,58 @@ fn test_content_length_headers() {
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 7);
     assert!(response["result"]["content"][0]["text"].as_str() == Some("pong"));
+}
+
+#[test]
+fn test_header_framing_invalid_utf8_returns_parse_error_and_server_recovers() {
+    setup();
+
+    let mut child = Command::new("cargo")
+        .args(["run", "--release", "--quiet"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to spawn");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    stdin
+        .write_all(b"Content-Length: 2\r\n\r\n\xff\xff")
+        .expect("write invalid utf8 frame");
+    stdin.flush().expect("flush invalid utf8");
+
+    let parse_error = read_server_response(&mut reader).expect("parse error response");
+    let parse_error_json: Value = serde_json::from_str(&parse_error).expect("parse error json");
+    assert_eq!(parse_error_json["jsonrpc"], "2.0");
+    assert_eq!(parse_error_json["id"], Value::Null);
+    assert_eq!(parse_error_json["error"]["code"], -32700);
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 701,
+        "method": "ping",
+        "params": {}
+    });
+    let request_str = request.to_string();
+    let header = format!("Content-Length: {}\r\n\r\n", request_str.len());
+    stdin.write_all(header.as_bytes()).expect("write header");
+    stdin
+        .write_all(request_str.as_bytes())
+        .expect("write request body");
+    stdin.flush().expect("flush valid request");
+    drop(stdin);
+
+    let response = read_server_response(&mut reader).expect("ping response");
+    let response_json: Value = serde_json::from_str(&response).expect("ping json");
+    assert_eq!(response_json["jsonrpc"], "2.0");
+    assert_eq!(response_json["id"], 701);
+    assert_eq!(response_json["result"]["content"][0]["text"], "pong");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

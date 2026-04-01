@@ -235,12 +235,6 @@ struct SnippetResult {
     status: SnippetStatusKind,
     /// JSON response payload to return to the caller.
     payload: Value,
-    /// File hash before the edit (always populated).
-    #[allow(dead_code)]
-    file_hash_before: Option<String>,
-    /// File hash after the edit (only populated on success).
-    #[allow(dead_code)]
-    file_hash_after: Option<String>,
 }
 
 /// Test helper: wraps apply_snippet_edit_impl and returns the JSON payload.
@@ -288,8 +282,6 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
                 "expected_file_hash": expected_hash,
                 "current_file_hash": model.hash,
             }),
-            file_hash_before: Some(model.hash),
-            file_hash_after: None,
         });
     }
 
@@ -305,8 +297,6 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
             return Ok(SnippetResult {
                 status: SnippetStatusKind::NoMatch,
                 payload: no_match_payload(&model, old_snippet.as_str(), req.match_hint.as_ref()),
-                file_hash_before: Some(model.hash),
-                file_hash_after: None,
             });
         }
     };
@@ -369,8 +359,6 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
             "newline_kind": default_newline.label(),
             "region_id": req.region_id,
         }),
-        file_hash_before: Some(model.hash),
-        file_hash_after: Some(new_hash),
     })
 }
 

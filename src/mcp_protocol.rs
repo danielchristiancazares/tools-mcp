@@ -61,6 +61,14 @@ pub struct McpMessage {
     pub has_headers: bool,
 }
 
+/// Additional metadata for failures while decoding an MCP message.
+#[derive(Debug)]
+pub struct McpReadError {
+    pub error: io::Error,
+    pub response_has_headers: bool,
+    pub should_continue: bool,
+}
+
 /// Reads a single MCP message from an async buffered reader.
 ///
 /// Supports two input formats:
@@ -79,7 +87,9 @@ pub struct McpMessage {
 /// - Consumes trailing newlines after the message body
 /// - Ignores empty lines before headers (for robustness)
 /// - Case-insensitive header name matching
-pub async fn read_mcp_message<R>(reader: &mut R) -> io::Result<Option<McpMessage>>
+pub async fn read_mcp_message<R>(
+    reader: &mut R,
+) -> std::result::Result<Option<McpMessage>, McpReadError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -92,25 +102,40 @@ where
     // Parse headers or detect raw JSON
     loop {
         let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
+        let bytes_read = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|err| McpReadError {
+                error: err,
+                response_has_headers: saw_headers || saw_non_empty_non_json_line,
+                should_continue: false,
+            })?;
 
         // Clean EOF - no more messages
         if bytes_read == 0 {
             if content_length.is_some() {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading headers",
-                ));
+                return Err(McpReadError {
+                    error: io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading headers",
+                    ),
+                    response_has_headers: saw_headers || saw_non_empty_non_json_line,
+                    should_continue: false,
+                });
             }
             return Ok(None);
         }
 
         // DoS protection: reject oversized lines
         if line.len() > MAX_MCP_MESSAGE_BYTES {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "message line exceeds maximum allowed size",
-            ));
+            return Err(McpReadError {
+                error: io::Error::new(
+                    ErrorKind::InvalidData,
+                    "message line exceeds maximum allowed size",
+                ),
+                response_has_headers: saw_headers || saw_non_empty_non_json_line,
+                should_continue: false,
+            });
         }
 
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
@@ -122,10 +147,11 @@ where
                 break;
             }
             if saw_non_empty_non_json_line {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "missing Content-Length header",
-                ));
+                return Err(McpReadError {
+                    error: io::Error::new(ErrorKind::InvalidData, "missing Content-Length header"),
+                    response_has_headers: true,
+                    should_continue: false,
+                });
             }
             continue; // Skip leading blank lines
         }
@@ -145,14 +171,20 @@ where
         if let Some((name, value)) = trimmed.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
         {
-            let len = value.trim().parse::<usize>().map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header")
+            let len = value.trim().parse::<usize>().map_err(|_| McpReadError {
+                error: io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header"),
+                response_has_headers: true,
+                should_continue: false,
             })?;
             if len > MAX_MCP_MESSAGE_BYTES {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "Content-Length exceeds maximum allowed size",
-                ));
+                return Err(McpReadError {
+                    error: io::Error::new(
+                        ErrorKind::InvalidData,
+                        "Content-Length exceeds maximum allowed size",
+                    ),
+                    response_has_headers: true,
+                    should_continue: false,
+                });
             }
             content_length = Some(len);
             saw_headers = true;
@@ -164,16 +196,33 @@ where
     }
 
     // Read the message body using the Content-Length
-    let len = content_length
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing Content-Length header"))?;
+    let len = content_length.ok_or_else(|| McpReadError {
+        error: io::Error::new(ErrorKind::InvalidData, "missing Content-Length header"),
+        response_has_headers: true,
+        should_continue: false,
+    })?;
 
     let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    let message = String::from_utf8(buf)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "message body not valid UTF-8"))?;
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|err| McpReadError {
+            error: err,
+            response_has_headers: true,
+            should_continue: false,
+        })?;
+    let message = String::from_utf8(buf).map_err(|_| McpReadError {
+        error: io::Error::new(ErrorKind::InvalidData, "message body not valid UTF-8"),
+        response_has_headers: true,
+        should_continue: true,
+    })?;
 
     // Consume optional trailing newline after message body
-    let trailing = reader.fill_buf().await?;
+    let trailing = reader.fill_buf().await.map_err(|err| McpReadError {
+        error: err,
+        response_has_headers: true,
+        should_continue: false,
+    })?;
     if trailing.starts_with(b"\r\n") {
         reader.consume(2);
     } else if trailing.starts_with(b"\n") {
@@ -204,23 +253,10 @@ where
 /// ```text
 /// {"jsonrpc":"2.0","id":1,"result":{...}}\n
 /// ```
-///
-/// # Important
-///
-/// This function always flushes the writer after writing. This is critical
-/// for clients that read responses synchronously.
-#[allow(dead_code)]
-pub async fn write_mcp_response<W>(writer: &mut W, resp: &RpcResponse<'_>) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_mcp_response_with_mode(writer, resp, should_skip_headers()).await
-}
-
 /// Writes an MCP response to the output stream with an explicit framing mode.
 ///
-/// This is primarily used for deterministic tests; production code should prefer
-/// [`write_mcp_response`], which consults `MCP_SKIP_HEADERS`.
+/// This is used by the runtime when the framing mode is already known and by
+/// deterministic tests that need explicit header control.
 pub async fn write_mcp_response_with_mode<W>(
     writer: &mut W,
     resp: &RpcResponse<'_>,
@@ -302,8 +338,10 @@ mod tests {
         let err = read_mcp_message(&mut reader)
             .await
             .expect_err("expected missing Content-Length to error");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("missing Content-Length"));
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.error.to_string().contains("missing Content-Length"));
+        assert!(err.response_has_headers);
+        assert!(!err.should_continue);
     }
 
     #[tokio::test]
@@ -313,7 +351,9 @@ mod tests {
         let err = read_mcp_message(&mut reader)
             .await
             .expect_err("expected invalid Content-Length to error");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.response_has_headers);
+        assert!(!err.should_continue);
     }
 
     #[tokio::test]
@@ -323,7 +363,9 @@ mod tests {
         let err = read_mcp_message(&mut reader)
             .await
             .expect_err("expected invalid UTF-8 body to error");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.response_has_headers);
+        assert!(err.should_continue);
     }
 
     #[tokio::test]
@@ -349,7 +391,7 @@ mod tests {
             .parse()
             .expect("invalid length");
 
-        assert_eq!(body.as_bytes().len(), len);
+        assert_eq!(body.len(), len);
         assert!(body.ends_with('\n'), "payload should end with newline");
 
         // Validate JSON parses (strip trailing newline).

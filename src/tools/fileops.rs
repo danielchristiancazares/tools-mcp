@@ -6,6 +6,7 @@ use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Move / Rename
@@ -59,12 +60,11 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     // Create parent directories if needed
-    if let Some(parent) = final_dest.parent() {
-        if !parent.exists() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
-            }
-        }
+    if let Some(parent) = final_dest.parent()
+        && !parent.exists()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
     }
 
     if let Err(err) = tokio::fs::rename(source, &final_dest).await {
@@ -156,8 +156,12 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("source not found: {}", source.display()));
     }
 
-    // If destination is a directory, copy into it with same filename
-    let final_dest = if destination.is_dir() {
+    let overwrite = req.overwrite.unwrap_or(false);
+
+    // Existing directories act as container targets in the default cp-like mode.
+    // When overwrite=true, treat the provided destination path literally so the
+    // replacement semantics apply to that path instead of creating a nested copy.
+    let final_dest = if destination.is_dir() && !overwrite {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
@@ -179,7 +183,7 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         }
     }
 
-    if final_dest.exists() && !req.overwrite.unwrap_or(false) {
+    if final_dest.exists() && !overwrite {
         return ToolCallOutcome::err(format!(
             "destination already exists: {}. Use overwrite: true to replace.",
             final_dest.display()
@@ -187,16 +191,15 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     // Create parent directories if needed
-    if let Some(parent) = final_dest.parent() {
-        if !parent.exists() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
-            }
-        }
+    if let Some(parent) = final_dest.parent()
+        && !parent.exists()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
     }
 
     if source.is_file() {
-        if let Err(err) = tokio::fs::copy(source, &final_dest).await {
+        if let Err(err) = copy_file_with_overwrite(source, &final_dest, overwrite).await {
             return ToolCallOutcome::err(format!("failed to copy {}: {err}", source.display()));
         }
     } else if source.is_dir() {
@@ -206,7 +209,7 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
                 source.display()
             ));
         }
-        if let Err(err) = copy_dir_recursive(source, &final_dest).await {
+        if let Err(err) = copy_directory_with_overwrite(source, &final_dest, overwrite).await {
             return ToolCallOutcome::err(format!(
                 "failed to copy directory {}: {err}",
                 source.display()
@@ -280,10 +283,87 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn replacement_stage_path(dst: &Path) -> PathBuf {
+    let file_name = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("replacement");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    dst.with_file_name(format!(
+        ".{file_name}.codex-tmp-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+async fn remove_existing_path(path: &Path) -> std::io::Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    }
+}
+
+async fn copy_file_with_overwrite(src: &Path, dst: &Path, overwrite: bool) -> std::io::Result<u64> {
+    if !overwrite || !dst.exists() {
+        return tokio::fs::copy(src, dst).await;
+    }
+
+    let staged = replacement_stage_path(dst);
+    if staged.exists() {
+        remove_existing_path(&staged).await?;
+    }
+
+    let bytes = tokio::fs::copy(src, &staged).await?;
+    if let Err(err) = remove_existing_path(dst).await {
+        let _ = remove_existing_path(&staged).await;
+        return Err(err);
+    }
+    if let Err(err) = tokio::fs::rename(&staged, dst).await {
+        let _ = remove_existing_path(&staged).await;
+        return Err(err);
+    }
+
+    Ok(bytes)
+}
+
+async fn copy_directory_with_overwrite(
+    src: &Path,
+    dst: &Path,
+    overwrite: bool,
+) -> std::io::Result<()> {
+    if !overwrite || !dst.exists() {
+        return copy_dir_recursive(src, dst).await;
+    }
+
+    let staged = replacement_stage_path(dst);
+    if staged.exists() {
+        remove_existing_path(&staged).await?;
+    }
+
+    if let Err(err) = copy_dir_recursive(src, &staged).await {
+        let _ = remove_existing_path(&staged).await;
+        return Err(err);
+    }
+    if let Err(err) = remove_existing_path(dst).await {
+        let _ = remove_existing_path(&staged).await;
+        return Err(err);
+    }
+    if let Err(err) = tokio::fs::rename(&staged, dst).await {
+        let _ = remove_existing_path(&staged).await;
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 define_mcp_tool! {
     CopyTool,
     name: "Copy",
-    description: "Copy a file or directory.",
+    description: "Copy a file or directory, replacing the destination when overwrite is true.",
     schema: {
         "type": "object",
         "properties": {
@@ -371,6 +451,59 @@ mod tests {
         assert_eq!(result["isError"], true);
         let msg = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(msg.contains("symlink"));
+    }
+
+    #[tokio::test]
+    async fn copy_overwrite_replaces_existing_directory_contents() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        tokio::fs::create_dir_all(&src).await.expect("create src");
+        tokio::fs::create_dir_all(&dst).await.expect("create dst");
+        tokio::fs::write(src.join("fresh.txt"), "fresh")
+            .await
+            .expect("write fresh");
+        tokio::fs::write(dst.join("stale.txt"), "stale")
+            .await
+            .expect("write stale");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string(),
+            "recursive": true,
+            "overwrite": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], false);
+        assert!(dst.join("fresh.txt").exists());
+        assert!(!dst.join("stale.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn copy_overwrite_replaces_destination_type_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        tokio::fs::create_dir_all(&src).await.expect("create src");
+        tokio::fs::write(src.join("inside.txt"), "content")
+            .await
+            .expect("write src");
+        tokio::fs::write(&dst, "old file").await.expect("write dst");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string(),
+            "recursive": true,
+            "overwrite": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], false);
+        assert!(dst.is_dir());
+        assert!(dst.join("inside.txt").exists());
     }
 }
 

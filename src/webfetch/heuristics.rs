@@ -332,7 +332,7 @@ fn starts_with_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
         .iter()
         .take(needle.len())
         .zip(needle.iter())
-        .all(|(&a, &b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        .all(|(&a, &b)| a.eq_ignore_ascii_case(&b))
 }
 
 /// Heuristic 3: Check for framework-specific attributes and patterns
