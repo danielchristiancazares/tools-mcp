@@ -398,17 +398,12 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
         Some(txt) => {
             let mut matcher = DefaultMatcher::default();
             let parsed = Url::parse(url)?;
-            let path_with_query = robots_match_path(&parsed);
-            Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, &path_with_query))
+            let path = robots_match_path(&parsed);
+            Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, &path))
         }
     }
 }
 
-/// Builds the robots.txt match input from a URL path and optional query.
-///
-/// Some robots rules intentionally target query-string URLs (for example,
-/// `Disallow: /*?print=1`). Matching only on `Url::path()` silently bypasses
-/// those rules, so we include `?query` when present.
 fn robots_match_path(parsed: &Url) -> String {
     match parsed.query() {
         Some(query) => format!("{}?{}", parsed.path(), query),
@@ -561,6 +556,7 @@ fn build_http_client_with_resolve(resolve: Option<&(String, SocketAddr)>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use robotstxt::DefaultMatcher;
 
     #[tokio::test]
     async fn validate_url_ssrf_blocks_non_http_schemes() {
@@ -604,5 +600,22 @@ mod tests {
     fn robots_match_path_without_query_is_path_only() {
         let parsed = Url::parse("https://example.com/docs/page").expect("url");
         assert_eq!(robots_match_path(&parsed), "/docs/page");
+      
+    #[test]  
+    fn robots_match_path_includes_query() {
+        let parsed = Url::parse("https://example.com/search?q=secret").expect("valid URL");
+        assert_eq!(robots_match_path(&parsed), "/search?q=secret");
+    }
+
+    #[test]
+    fn robots_matcher_can_block_query_rule() {
+        let parsed = Url::parse("https://example.com/search?q=secret").expect("valid URL");
+        let robots = "User-agent: *\nDisallow: /search?q=secret\n";
+        let mut matcher = DefaultMatcher::default();
+        assert!(!matcher.one_agent_allowed_by_robots(
+            robots,
+            USER_AGENT,
+            &robots_match_path(&parsed)
+        ));
     }
 }
