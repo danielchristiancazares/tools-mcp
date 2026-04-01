@@ -76,17 +76,17 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 error!("invalid json: {}", e);
-                let parse_error =
-                    RpcResponse::protocol_error(None, -32700, format!("Parse error: {e}"));
+                error!("parse error details: {e}");
+                let parse_error = RpcResponse::protocol_error(None, -32700, "Parse error");
                 let skip_headers = if message.has_headers {
                     false
                 } else {
                     should_skip_headers()
                 };
                 if let Err(write_err) =
-                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await                {
-                    error!("failed to write parse error response: {}", write_err);
+                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await
                 {
+                    error!("failed to write parse error response: {}", write_err);
                     break;
                 }
                 continue;

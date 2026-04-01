@@ -8,5 +8,7 @@ pub trait WebFetcher: Send + Sync {
     fn fetch<'a>(
         &'a self,
         req: crate::webfetch::FetchRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<crate::webfetch::FetchResponse>> + Send + 'a>>;
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<crate::webfetch::FetchResponse>> + Send + 'a>,
+    >;
 }

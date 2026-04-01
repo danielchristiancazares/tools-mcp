@@ -29,7 +29,7 @@
 - **Web Content Fetching**: Retrieve and process web pages with SSRF protection and robots.txt compliance
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
 - **Git Integration**: Execute git commands (status, diff, restore, add, commit)
-- **Code Search**: Regex and fuzzy file search using ripgrep/ugrep
+- **Code Search**: Regex and fuzzy file search using ugrep
 - **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
 - **Build/Test Automation**: Execute project build and test scripts
 
@@ -37,8 +37,8 @@
 
 - **CodeQuery** - One-shot helper that optionally auto-discovers and reindexes local files, then runs a semantic search query against an OpenAI vector store.
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
-- **RipGrep** - Fast local regex search via ripgrep (`rg`) with both line-oriented output and structured match records.
-- **ReadFile** - Line-numbered file reader (optionally a line range) for quick inspection.
+- **Search** - Fast local regex search via ugrep with both line-oriented output and structured match records.
+- **Read** - Line-numbered file reader (optionally a line range) for quick inspection.
 - **SmartFileEdit** - Canonical LF view + byte-precise patch tool (including unified diffs) that preserves original newline bytes and whitespace when editing files via MCP.
 - **Bash** - Run shell commands via bash with timeout and stdout/stderr capture.
 - **GitStatus / GitDiff / GitRestore** - Local Git status/diff/restore helpers with timeout and output truncation.
@@ -60,7 +60,7 @@
 
 - Rust toolchain (edition 2021; tested with latest stable).
 - Cargo in PATH (for running the MCP binary).
-- `rg` (ripgrep) in PATH (required for `RipGrep`).
+- `ugrep` in PATH (required for `Search`).
 - Git in PATH (required for `GitStatus`, `GitDiff`, and `GitRestore`).
 - **OpenAI**
   - `OPENAI_API_KEY` with access to the Assistants / Vector Store APIs (required for `CodeQuery` and other OpenAI calls).
@@ -191,7 +191,7 @@ src/
     ping.rs           # Ping tool
     pwsh.rs           # PowerShell tool
     read.rs           # Read tool
-    search.rs         # Search tool (ripgrep/ugrep compatibility)
+    search.rs         # Search tool
     test.rs           # Test tool
     webfetch.rs       # WebFetch tool wrapper
     write.rs          # Write tool
@@ -766,7 +766,7 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
 
 **Location**: `src/tools/handlers/ripgrep.rs`
 
-Provides file content search using ugrep (tool keeps ripgrep/rg aliases for compatibility).
+Provides file content search using ugrep.
 
 ```rust
 /// Searches files using regex or fuzzy patterns
@@ -1047,11 +1047,11 @@ Fetch and normalize external web content with caching and JS-aware rendering.
   - `rendering_method` – `"http"` or `"browser"`.
   - `note` – optional string such as `"cache_hit"`, `"rendered_with_browser"`, or a combination.
 
-### RipGrep
+### Search
 
-Fast local regex search using ripgrep (`rg`).
+Fast local regex search using ugrep.
 
-- **Tool name**: `RipGrep` (aliases accepted: `ripgrep`, `rg`)
+- **Tool name**: `Search`
 - **Required**:
   - `pattern` - ripgrep pattern (regex by default).
 - **Optional**:
@@ -1059,14 +1059,14 @@ Fast local regex search using ripgrep (`rg`).
   - `case` - `"smart"` (default), `"sensitive"`, or `"insensitive"`.
   - `fixed_strings`, `word_regexp`, `glob`, `hidden`, `follow`, `no_ignore`, `context`, `max_results`, `timeout_ms`.
 - **Notes**:
-  - Requires `rg` to be installed and discoverable on PATH on the machine running the MCP server.
-  - Uses `rg --json` and returns both a readable `content[0].text` and structured `matches`.
+  - Requires `ugrep` to be installed and discoverable on PATH on the machine running the MCP server.
+  - Uses `ugrep` and returns both a readable `content[0].text` and structured `matches`.
 
-### ReadFile
+### Read
 
 Read a local file (optionally a line range) for quick inspection without uploads.
 
-- **Tool name**: `ReadFile`
+- **Tool name**: `Read`
 - **Required**:
   - `path` - filesystem path to read.
 - **Optional**:
@@ -1080,7 +1080,7 @@ Read a local file (optionally a line range) for quick inspection without uploads
 
 Edit files while preserving original newline bytes and whitespace.
 
-- **Tool name**: `SmartFileEdit` (alias accepted: `smart_file_edit`)
+- **Tool name**: `SmartFileEdit`
 - **Required base fields**:
   - `action` - one of `"get_region"`, `"apply_snippet_edit"`, `"apply_unified_diff"`.
   - `path` - filesystem path to inspect or edit.
@@ -1133,7 +1133,7 @@ Edit files while preserving original newline bytes and whitespace.
 
 Run shell commands via bash with timeout and stdout/stderr capture.
 
-- **Tool name**: `Bash` (alias accepted: `bash`)
+- **Tool name**: `Bash`
 - **Required**:
   - `command` - shell command to run (executed as: `bash -lc "<command>"`).
 - **Optional**:
@@ -1155,7 +1155,7 @@ Simple health check for MCP clients.
 
 Run `git status` (porcelain by default).
 
-- **Tool name**: `GitStatus` (aliases accepted: `git_status`, `git-status`)
+- **Tool name**: `GitStatus`
 - **Optional**:
   - `working_dir` (string) - working directory for the command.
   - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
@@ -1170,7 +1170,7 @@ Run `git status` (porcelain by default).
 
 Run `git diff` with optional flags and output truncation.
 
-- **Tool name**: `GitDiff` (aliases accepted: `git_diff`, `git-diff`)
+- **Tool name**: `GitDiff`
 - **Optional**:
   - `working_dir` (string) - working directory for the command.
   - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
@@ -1188,7 +1188,7 @@ Run `git diff` with optional flags and output truncation.
 
 Run `git restore` on explicit paths.
 
-- **Tool name**: `GitRestore` (aliases accepted: `git_restore`, `git-restore`)
+- **Tool name**: `GitRestore`
 - **Required**:
   - `paths` (string[]) - paths to restore (passed after `--`).
 - **Optional**:
@@ -1204,7 +1204,7 @@ Run `git restore` on explicit paths.
 
 Stage files for commit.
 
-- **Tool name**: `GitAdd` (aliases accepted: `git_add`, `git-add`)
+- **Tool name**: `GitAdd`
 - **Optional**:
   - `paths` (string[]) - files to stage
   - `all` (boolean, default `false`) - stage all changes (`-A`)
@@ -1218,7 +1218,7 @@ Stage files for commit.
 
 Create a conventional commit.
 
-- **Tool name**: `GitCommit` (aliases accepted: `git_commit`, `git-commit`)
+- **Tool name**: `GitCommit`
 - **Required**:
   - `type` (string) - commit type (feat, fix, docs, style, refactor, test, chore, etc.)
   - `message` (string) - commit description
@@ -1233,7 +1233,7 @@ Create a conventional commit.
 
 Create a new file.
 
-- **Tool name**: `Write` (alias accepted: `write`)
+- **Tool name**: `Write`
 - **Required**:
   - `path` (string) - file path to create
   - `content` (string) - file content
@@ -1244,7 +1244,7 @@ Create a new file.
 
 Delete a file.
 
-- **Tool name**: `Delete` (alias accepted: `delete`)
+- **Tool name**: `Delete`
 - **Required**:
   - `path` (string) - file to delete
 - **Response**:
@@ -1254,7 +1254,7 @@ Delete a file.
 
 List files matching a glob pattern.
 
-- **Tool name**: `Glob` (alias accepted: `glob`)
+- **Tool name**: `Glob`
 - **Required**:
   - `pattern` (string) - glob pattern (e.g., `**/*.rs`)
 - **Optional**:
@@ -1268,7 +1268,7 @@ List files matching a glob pattern.
 
 Run build script.
 
-- **Tool name**: `Build` (alias accepted: `build`)
+- **Tool name**: `Build`
 - **Optional**:
   - `working_dir` (string) - directory containing build script
   - `timeout_ms` (integer, default: 120000) - execution timeout
@@ -1279,7 +1279,7 @@ Run build script.
 
 Run test script.
 
-- **Tool name**: `Test` (alias accepted: `test`)
+- **Tool name**: `Test`
 - **Optional**:
   - `working_dir` (string) - directory containing test script
   - `timeout_ms` (integer, default: 120000) - execution timeout
@@ -1290,7 +1290,7 @@ Run test script.
 
 Extract C++ structure.
 
-- **Tool name**: `Outline` (alias accepted: `outline`)
+- **Tool name**: `Outline`
 - **Required**:
   - `path` (string) - C++ file path
 - **Optional**:

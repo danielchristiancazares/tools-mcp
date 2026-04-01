@@ -53,18 +53,12 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             ));
         }
         Err(err) => {
-            return ToolCallOutcome::err(format!(
-                "failed to create {}: {err}",
-                path.display()
-            ));
+            return ToolCallOutcome::err(format!("failed to create {}: {err}", path.display()));
         }
     };
 
     if let Err(err) = file.write_all(bytes).await {
-        return ToolCallOutcome::err(format!(
-            "failed to write {}: {err}",
-            path.display()
-        ));
+        return ToolCallOutcome::err(format!("failed to write {}: {err}", path.display()));
     }
 
     ToolCallOutcome::ok_text_with(
@@ -79,7 +73,6 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     WriteTool,
     name: "Write",
-    aliases: ["write"],
     description: "Write content to a new file, creating directories as needed",
     schema: {
         "type": "object",

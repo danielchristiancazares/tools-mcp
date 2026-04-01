@@ -35,10 +35,7 @@ async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     if let Err(err) = tokio::fs::remove_file(path).await {
-        return ToolCallOutcome::err(format!(
-            "failed to delete {}: {err}",
-            path.display()
-        ));
+        return ToolCallOutcome::err(format!("failed to delete {}: {err}", path.display()));
     }
 
     ToolCallOutcome::ok_text_with(
@@ -50,7 +47,6 @@ async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     DeleteTool,
     name: "Delete",
-    aliases: ["delete"],
     description: "Delete a file",
     schema: {
         "type": "object",

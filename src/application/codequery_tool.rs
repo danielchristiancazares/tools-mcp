@@ -96,8 +96,8 @@ use reqwest::Client;
 use serde_json::Value;
 use std::path::Path;
 
-use crate::codequery_cache::{cache_store_id, load_store_id_from_cache};
 use crate::adapters::outbound::FileSearchCoreEngine;
+use crate::codequery_cache::{cache_store_id, load_store_id_from_cache};
 use crate::ports::CodeQueryEngine;
 use crate::validation;
 
@@ -155,7 +155,10 @@ use crate::validation;
 /// });
 /// let response = handle_code_query(Some(json!(1)), args).await;
 /// ```
-pub async fn handle_code_query(_id: Option<Value>, args: Value) -> crate::tool_outcome::ToolCallOutcome {
+pub async fn handle_code_query(
+    _id: Option<Value>,
+    args: Value,
+) -> crate::tool_outcome::ToolCallOutcome {
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
         return crate::tool_outcome::ToolCallOutcome::err_with(

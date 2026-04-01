@@ -18,7 +18,6 @@ async fn handle_test(id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     TestTool,
     name: "Test",
-    aliases: ["test"],
     description: "Run tests. Auto-detects build system (Cargo, npm, pnpm, yarn, Make, Just, Go) or runs test.ps1/test.sh if present.",
     schema: {
         "type": "object",

@@ -21,8 +21,7 @@ async fn handle_ping(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     /// Simple ping tool for health checks.
     PingTool,
-    name: "ping",
-    aliases: ["Ping"],
+    name: "Ping",
     description: "Returns 'pong' to verify the server is running",
     schema: {
         "type": "object",

@@ -230,7 +230,6 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     GlobTool,
     name: "Glob",
-    aliases: ["glob"],
     description: "Find files matching a glob pattern",
     schema: {
         "type": "object",

@@ -1,9 +1,9 @@
-use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{
     DEFAULT_PWSH_TIMEOUT_MS, MAX_PWSH_STDERR_BYTES, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_TIMEOUT_MS,
 };
 use crate::define_mcp_tool;
 use crate::process_utils;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::Value;
@@ -72,7 +72,6 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     PwshTool,
     name: "Pwsh",
-    aliases: ["pwsh", "powershell"],
     description: "Execute a PowerShell command via pwsh",
     schema: {
         "type": "object",

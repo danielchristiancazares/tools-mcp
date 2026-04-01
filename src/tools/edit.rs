@@ -4,7 +4,6 @@ use crate::define_mcp_tool;
 define_mcp_tool! {
     EditTool,
     name: "Edit",
-    aliases: ["edit"],
     description: "Replace a snippet in a file. Finds old_snippet and replaces with new_snippet, preserving line endings.",
     schema: {
         "type": "object",

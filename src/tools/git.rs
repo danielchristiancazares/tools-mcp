@@ -8,7 +8,6 @@ use crate::define_mcp_tool;
 define_mcp_tool! {
     GitStatusTool,
     name: "GitStatus",
-    aliases: ["git_status", "git-status"],
     description: "Show working tree status: staged, modified, and untracked files.",
     schema: {
         "type": "object",
@@ -27,7 +26,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitDiffTool,
     name: "GitDiff",
-    aliases: ["git_diff", "git-diff"],
     description: "Show file changes in the working tree or staging area. When from_ref, to_ref, and output_dir are provided, writes per-file patches to the directory.",
     schema: {
         "type": "object",
@@ -52,7 +50,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitRestoreTool,
     name: "GitRestore",
-    aliases: ["git_restore", "git-restore"],
     description: "Discard uncommitted changes to specific files. WARNING: destructive.",
     schema: {
         "type": "object",
@@ -71,7 +68,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitAddTool,
     name: "GitAdd",
-    aliases: ["git_add", "git-add"],
     description: "Stage files for commit.",
     schema: {
         "type": "object",
@@ -90,7 +86,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitCommitTool,
     name: "GitCommit",
-    aliases: ["git_commit", "git-commit"],
     description: "Create a conventional commit (type(scope): message).",
     schema: {
         "type": "object",
@@ -109,7 +104,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitLogTool,
     name: "GitLog",
-    aliases: ["git_log", "git-log"],
     description: "Show commit history with configurable format and filters.",
     schema: {
         "type": "object",
@@ -134,7 +128,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitBranchTool,
     name: "GitBranch",
-    aliases: ["git_branch", "git-branch"],
     description: "List, create, rename, or delete branches.",
     schema: {
         "type": "object",
@@ -157,7 +150,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitCheckoutTool,
     name: "GitCheckout",
-    aliases: ["git_checkout", "git-checkout"],
     description: "Switch branches or restore working tree files.",
     schema: {
         "type": "object",
@@ -177,7 +169,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitStashTool,
     name: "GitStash",
-    aliases: ["git_stash", "git-stash"],
     description: "Stash changes in a dirty working directory.",
     schema: {
         "type": "object",
@@ -197,7 +188,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitShowTool,
     name: "GitShow",
-    aliases: ["git_show", "git-show"],
     description: "Show commit details and diff.",
     schema: {
         "type": "object",
@@ -218,7 +208,6 @@ define_mcp_tool! {
 define_mcp_tool! {
     GitBlameTool,
     name: "GitBlame",
-    aliases: ["git_blame", "git-blame"],
     description: "Show what revision and author last modified each line of a file.",
     schema: {
         "type": "object",

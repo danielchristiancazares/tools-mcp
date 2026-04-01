@@ -18,7 +18,6 @@ async fn handle_build(id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     BuildTool,
     name: "Build",
-    aliases: ["build"],
     description: "Build the project. Auto-detects build system (Cargo, npm, pnpm, yarn, Make, Just, Go, CMake) or runs build.ps1/build.sh if present.",
     schema: {
         "type": "object",

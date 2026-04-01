@@ -4,7 +4,6 @@ use crate::define_mcp_tool;
 define_mcp_tool! {
     WebFetchTool,
     name: "WebFetch",
-    aliases: ["webfetch", "web_fetch"],
     description: "Fetch a URL via HTTP (with optional headless-browser fallback), convert to Markdown, and return token-aware chunks for LLM consumption. Respects robots.txt.",
     schema: {
         "type": "object",

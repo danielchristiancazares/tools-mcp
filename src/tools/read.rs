@@ -4,7 +4,6 @@ use crate::define_mcp_tool;
 define_mcp_tool! {
     ReadTool,
     name: "Read",
-    aliases: ["read", "ReadFile", "read_file", "read-file"],
     description: "Read file contents with optional line range",
     schema: {
         "type": "object",

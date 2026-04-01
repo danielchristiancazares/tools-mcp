@@ -98,7 +98,6 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     MoveTool,
     name: "Move",
-    aliases: ["move", "rename", "mv"],
     description: "Move or rename a file or directory.",
     schema: {
         "type": "object",
@@ -284,7 +283,6 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 define_mcp_tool! {
     CopyTool,
     name: "Copy",
-    aliases: ["copy", "cp"],
     description: "Copy a file or directory.",
     schema: {
         "type": "object",
@@ -509,7 +507,6 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 define_mcp_tool! {
     ListDirTool,
     name: "ListDir",
-    aliases: ["listdir", "ls", "dir"],
     description: "List directory contents.",
     schema: {
         "type": "object",

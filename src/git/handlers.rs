@@ -5,10 +5,10 @@
 
 use super::run_git;
 use super::types::build_git_response;
-use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 };
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

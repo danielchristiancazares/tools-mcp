@@ -4,7 +4,6 @@ use crate::define_mcp_tool;
 define_mcp_tool! {
     SearchTool,
     name: "Search",
-    aliases: ["search", "ugrep", "ug", "RipGrep", "ripgrep", "rg"],
     description: "Search file contents using ugrep with regex support",
     schema: {
         "type": "object",

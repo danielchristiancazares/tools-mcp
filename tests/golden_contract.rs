@@ -95,7 +95,7 @@ fn golden_tools_call_accepts_nested_call_shape() {
         "method": "mcp/tools/call",
         "params": {
             "call": {
-                "name": "ping",
+                "name": "Ping",
                 "arguments": {}
             }
         }
@@ -113,7 +113,7 @@ fn golden_tools_call_accepts_toolname_and_args_aliases() {
         "id": 9003,
         "method": "mcp/tools/call",
         "params": {
-            "toolName": "ping",
+            "toolName": "Ping",
             "args": {}
         }
     });

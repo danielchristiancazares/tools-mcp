@@ -1,4 +1,4 @@
-[alias]
-# Generates an HTML report in ./coverage/ (requires cargo-llvm-cov + llvm-tools-preview).
-coverage = ["llvm-cov", "--workspace", "--html", "--output-dir", "coverage"]
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 

@@ -197,7 +197,7 @@ fn test_tools_list() {
     // Check that essential tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    assert!(tool_names.contains(&"ping"));
+    assert!(tool_names.contains(&"Ping"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
     assert!(tool_names.contains(&"CodeQuery"));
@@ -223,7 +223,7 @@ fn test_ping_tool_call() {
         "id": 4,
         "method": "mcp/tools/call",
         "params": {
-            "name": "ping",
+            "name": "Ping",
             "arguments": {}
         }
     });
@@ -246,7 +246,7 @@ fn test_read_file_line_numbers_by_default() {
         "id": 40,
         "method": "mcp/tools/call",
         "params": {
-            "name": "ReadFile",
+            "name": "Read",
             "arguments": {
                 "path": "src/tools/handlers/read_file.rs",
                 "start_line": 1,
@@ -255,7 +255,7 @@ fn test_read_file_line_numbers_by_default() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call ReadFile tool");
+    let response = send_mcp_message(request).expect("Failed to call Read tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 40);
@@ -263,14 +263,14 @@ fn test_read_file_line_numbers_by_default() {
 
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .expect("missing ReadFile content text");
+        .expect("missing Read content text");
     assert!(
         text.starts_with("1\t"),
         "expected line number prefix by default"
     );
     assert!(
         text.contains("File reading handler implementation."),
-        "expected ReadFile source content"
+        "expected Read source content"
     );
     assert_eq!(response["result"]["start_line"], 1);
     assert_eq!(response["result"]["end_line"], 1);
@@ -284,7 +284,7 @@ fn test_read_file_no_line_numbers_when_disabled() {
         "id": 41,
         "method": "mcp/tools/call",
         "params": {
-            "name": "ReadFile",
+            "name": "Read",
             "arguments": {
                 "path": "src/tools/handlers/read_file.rs",
                 "start_line": 1,
@@ -294,7 +294,7 @@ fn test_read_file_no_line_numbers_when_disabled() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call ReadFile tool");
+    let response = send_mcp_message(request).expect("Failed to call Read tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 41);
@@ -302,7 +302,7 @@ fn test_read_file_no_line_numbers_when_disabled() {
 
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .expect("missing ReadFile content text");
+        .expect("missing Read content text");
     assert!(
         !text.starts_with("1\t"),
         "should not have line number prefix when disabled"
@@ -317,14 +317,14 @@ fn test_read_file_no_line_numbers_when_disabled() {
 }
 
 #[test]
-fn test_ripgrep_tool_call_if_rg_installed() {
-    let rg_bin = if cfg!(target_os = "windows") {
-        "rg.exe"
+fn test_search_tool_call_if_ugrep_installed() {
+    let ugrep_bin = if cfg!(target_os = "windows") {
+        "ugrep.exe"
     } else {
-        "rg"
+        "ugrep"
     };
 
-    let rg_available = Command::new(rg_bin)
+    let ugrep_available = Command::new(ugrep_bin)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -332,8 +332,8 @@ fn test_ripgrep_tool_call_if_rg_installed() {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if !rg_available {
-        eprintln!("Skipping RipGrep test: {rg_bin} not found on PATH");
+    if !ugrep_available {
+        eprintln!("Skipping Search test: {ugrep_bin} not found on PATH");
         return;
     }
 
@@ -342,7 +342,7 @@ fn test_ripgrep_tool_call_if_rg_installed() {
         "id": 41,
         "method": "mcp/tools/call",
         "params": {
-            "name": "RipGrep",
+            "name": "Search",
             "arguments": {
                 "pattern": "handle_read_file",
                 "path": "src/tools/handlers/read_file.rs",
@@ -353,7 +353,7 @@ fn test_ripgrep_tool_call_if_rg_installed() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call RipGrep tool");
+    let response = send_mcp_message(request).expect("Failed to call Search tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 41);
@@ -881,7 +881,7 @@ mod stress_tests {
             "id": 200,
             "method": "mcp/tools/call",
             "params": {
-                "name": "ping",
+                "name": "Ping",
                 "arguments": {
                     "unused": large_string
                 }

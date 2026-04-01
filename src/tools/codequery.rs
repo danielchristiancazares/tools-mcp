@@ -4,7 +4,6 @@ use crate::define_mcp_tool;
 define_mcp_tool! {
     CodeQueryTool,
     name: "CodeQuery",
-    aliases: ["code_query", "code-query"],
     description: "Semantic code search. Ask natural language questions about code behavior, architecture, or patterns.",
     schema: {
         "type": "object",

@@ -1,5 +1,5 @@
-use crate::tool_outcome::ToolCallOutcome;
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -450,7 +450,6 @@ fn find_preceding_comment<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str
 define_mcp_tool! {
     OutlineTool,
     name: "Outline",
-    aliases: ["outline"],
     description: "Extract structural outline from C++ source code",
     schema: {
         "type": "object",

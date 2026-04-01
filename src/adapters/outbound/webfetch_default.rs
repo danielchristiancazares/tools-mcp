@@ -12,8 +12,9 @@ impl WebFetcher for RunFetchWebFetcher {
     fn fetch<'a>(
         &'a self,
         req: crate::webfetch::FetchRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<crate::webfetch::FetchResponse>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<crate::webfetch::FetchResponse>> + Send + 'a>,
+    > {
         Box::pin(crate::webfetch::run_fetch(req))
     }
 }

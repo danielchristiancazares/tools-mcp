@@ -1,6 +1,5 @@
 use crate::tool_outcome::ToolCallOutcome;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -8,9 +7,6 @@ use std::pin::Pin;
 pub trait McpTool: Send + Sync + 'static {
     /// Primary tool name.
     const NAME: &'static str;
-
-    /// Additional name aliases for backwards compatibility.
-    const ALIASES: &'static [&'static str] = &[];
 
     /// Tool description shown in tool listings.
     const DESCRIPTION: &'static str;
@@ -45,24 +41,18 @@ struct ToolEntry {
     executor: ToolExecutor,
 }
 
-/// Registry of all MCP tools with lookup by name or alias.
+/// Registry of all MCP tools with lookup by canonical name.
 pub struct ToolRegistry {
     tools: Vec<ToolEntry>,
-    by_name: HashMap<String, usize>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self {
-            tools: Vec::new(),
-            by_name: HashMap::new(),
-        }
+        Self { tools: Vec::new() }
     }
 
     /// Register a tool type.
     pub fn register<T: McpTool>(&mut self) {
-        let idx = self.tools.len();
-
         let def = ToolDef {
             name: T::NAME.to_string(),
             description: T::DESCRIPTION.to_string(),
@@ -72,14 +62,6 @@ impl ToolRegistry {
         let executor: ToolExecutor = Box::new(|id, args| T::execute(id, args));
 
         self.tools.push(ToolEntry { def, executor });
-
-        // Register primary name
-        self.by_name.insert(T::NAME.to_string(), idx);
-
-        // Register aliases
-        for alias in T::ALIASES {
-            self.by_name.insert(alias.to_string(), idx);
-        }
     }
 
     /// Get all tool definitions for protocol responses.
@@ -94,8 +76,7 @@ impl ToolRegistry {
         id: Option<Value>,
         args: Value,
     ) -> Option<crate::RpcResponse<'static>> {
-        let idx = self.by_name.get(name)?;
-        let entry = &self.tools[*idx];
+        let entry = self.tools.iter().find(|entry| entry.def.name == name)?;
         let outcome = (entry.executor)(id.clone(), args).await;
         Some(outcome.into_rpc_response(id))
     }
@@ -123,7 +104,6 @@ mod tests {
     define_mcp_tool! {
         DummyTool,
         name: "Dummy",
-        aliases: ["dummy", "d"],
         description: "dummy tool for registry tests",
         schema: {
             "type": "object",
@@ -134,7 +114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_dispatches_by_name_and_alias() {
+    async fn registry_dispatches_by_name() {
         let mut reg = ToolRegistry::new();
         reg.register::<DummyTool>();
 
@@ -142,12 +122,6 @@ mod tests {
 
         let r1 = reg.call("Dummy", Some(json!(1)), json!({})).await;
         assert!(r1.is_some());
-
-        let r2 = reg.call("dummy", Some(json!(2)), json!({})).await;
-        assert!(r2.is_some());
-
-        let r3 = reg.call("d", Some(json!(3)), json!({})).await;
-        assert!(r3.is_some());
     }
 
     #[tokio::test]
@@ -167,7 +141,6 @@ mod tests {
 ///     /// Optional doc comment for the tool struct
 ///     ToolName,
 ///     name: "ToolName",
-///     aliases: ["alias1", "alias2"],  // optional, defaults to empty
 ///     description: "Tool description",
 ///     schema: { "type": "object", ... },
 ///     handler: handler_function
@@ -181,7 +154,6 @@ mod tests {
 ///     /// Reads file contents with optional line range.
 ///     ReadTool,
 ///     name: "Read",
-///     aliases: ["read", "ReadFile"],
 ///     description: "Read file contents with optional line range",
 ///     schema: {
 ///         "type": "object",
@@ -195,12 +167,10 @@ mod tests {
 /// ```
 #[macro_export]
 macro_rules! define_mcp_tool {
-    // With aliases
     (
         $(#[$meta:meta])*
         $tool:ident,
         name: $name:expr,
-        aliases: [$($alias:expr),* $(,)?],
         description: $desc:expr,
         schema: $schema:tt,
         handler: $handler:expr
@@ -210,7 +180,6 @@ macro_rules! define_mcp_tool {
 
         impl $crate::tool_registry::McpTool for $tool {
             const NAME: &'static str = $name;
-            const ALIASES: &'static [&'static str] = &[$($alias),*];
             const DESCRIPTION: &'static str = $desc;
 
             fn input_schema() -> serde_json::Value {
@@ -223,25 +192,6 @@ macro_rules! define_mcp_tool {
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = $crate::tool_outcome::ToolCallOutcome> + Send>> {
                 Box::pin($handler(id, args))
             }
-        }
-    };
-    // Without aliases (convenience form)
-    (
-        $(#[$meta:meta])*
-        $tool:ident,
-        name: $name:expr,
-        description: $desc:expr,
-        schema: $schema:tt,
-        handler: $handler:expr
-    ) => {
-        $crate::define_mcp_tool! {
-            $(#[$meta])*
-            $tool,
-            name: $name,
-            aliases: [],
-            description: $desc,
-            schema: $schema,
-            handler: $handler
         }
     };
 }
