@@ -398,9 +398,16 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
         Some(txt) => {
             let mut matcher = DefaultMatcher::default();
             let parsed = Url::parse(url)?;
-            let path = parsed.path();
-            Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, path))
+            let path = robots_match_path(&parsed);
+            Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, &path))
         }
+    }
+}
+
+fn robots_match_path(parsed: &Url) -> String {
+    match parsed.query() {
+        Some(query) => format!("{}?{}", parsed.path(), query),
+        None => parsed.path().to_string(),
     }
 }
 
@@ -549,6 +556,7 @@ fn build_http_client_with_resolve(resolve: Option<&(String, SocketAddr)>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use robotstxt::DefaultMatcher;
 
     #[tokio::test]
     async fn validate_url_ssrf_blocks_non_http_schemes() {
@@ -580,5 +588,23 @@ mod tests {
         validate_url_ssrf("https://93.184.216.34/")
             .await
             .expect("expected public IP literal to pass SSRF validation");
+    }
+
+    #[test]
+    fn robots_match_path_includes_query() {
+        let parsed = Url::parse("https://example.com/search?q=secret").expect("valid URL");
+        assert_eq!(robots_match_path(&parsed), "/search?q=secret");
+    }
+
+    #[test]
+    fn robots_matcher_can_block_query_rule() {
+        let parsed = Url::parse("https://example.com/search?q=secret").expect("valid URL");
+        let robots = "User-agent: *\nDisallow: /search?q=secret\n";
+        let mut matcher = DefaultMatcher::default();
+        assert!(!matcher.one_agent_allowed_by_robots(
+            robots,
+            USER_AGENT,
+            &robots_match_path(&parsed)
+        ));
     }
 }
