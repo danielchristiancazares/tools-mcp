@@ -62,9 +62,7 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     if let Some(parent) = final_dest.parent() {
         if !parent.exists() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return ToolCallOutcome::err(format!(
-                    "failed to create parent directory: {err}"
-                ));
+                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
             }
         }
     }
@@ -84,10 +82,7 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
                 ));
             }
         } else {
-            return ToolCallOutcome::err(format!(
-                "failed to move {}: {err}",
-                source.display()
-            ));
+            return ToolCallOutcome::err(format!("failed to move {}: {err}", source.display()));
         }
     }
 
@@ -177,14 +172,11 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         let source_norm = normalize_absolute_or_cwd(source);
         let dest_norm = normalize_absolute_or_cwd(&final_dest);
         if dest_norm.starts_with(&source_norm) {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
-                    final_dest.display(),
-                    source.display()
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
+                final_dest.display(),
+                source.display()
+            ));
         }
     }
 
@@ -199,19 +191,14 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     if let Some(parent) = final_dest.parent() {
         if !parent.exists() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return ToolCallOutcome::err(format!(
-                    "failed to create parent directory: {err}"
-                ));
+                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
             }
         }
     }
 
     if source.is_file() {
         if let Err(err) = tokio::fs::copy(source, &final_dest).await {
-            return ToolCallOutcome::err(format!(
-                "failed to copy {}: {err}",
-                source.display()
-            ));
+            return ToolCallOutcome::err(format!("failed to copy {}: {err}", source.display()));
         }
     } else if source.is_dir() {
         if !req.recursive.unwrap_or(false) {
@@ -333,7 +320,7 @@ mod tests {
         });
 
         let resp = handle_copy(Some(json!(1)), args).await;
-        let result = resp.result.expect("result payload");
+        let result = resp.0;
         assert_eq!(result["isError"], true);
         let msg = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(msg.contains("destination"));
