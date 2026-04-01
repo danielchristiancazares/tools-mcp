@@ -7,20 +7,24 @@ use anyhow::Result;
 use tokio::io::{self, BufReader};
 use tracing::{error, info};
 
-use crate::adapters::inbound::{RpcRequest, build_tool_registry, dispatch_jsonrpc_request};
+use crate::adapters::inbound::{RpcRequest, dispatch_jsonrpc_request};
+use crate::composition::build_tool_registry;
 use mcp_protocol::{read_mcp_message, should_skip_headers, write_mcp_response_with_mode};
 
 mod adapters;
 mod application;
 mod codequery;
 mod codequery_cache;
+mod composition;
 mod config;
 mod git;
 mod mcp_protocol;
 mod ports;
 mod process_utils;
 mod response;
+mod services;
 mod smart_file_edit;
+mod tool_outcome;
 mod tool_registry;
 mod tools;
 mod validation;
@@ -72,16 +76,17 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 error!("invalid json: {}", e);
-                let resp = RpcResponse::protocol_error(None, -32700, "Parse error");
+                let parse_error =
+                    RpcResponse::protocol_error(None, -32700, format!("Parse error: {e}"));
                 let skip_headers = if message.has_headers {
                     false
                 } else {
                     should_skip_headers()
                 };
                 if let Err(write_err) =
-                    write_mcp_response_with_mode(&mut writer, &resp, skip_headers).await
+                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await                {
+                    error!("failed to write parse error response: {}", write_err);
                 {
-                    error!("failed to write parse-error response: {}", write_err);
                     break;
                 }
                 continue;

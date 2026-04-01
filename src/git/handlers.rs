@@ -5,7 +5,7 @@
 
 use super::run_git;
 use super::types::build_git_response;
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 };
@@ -222,7 +222,7 @@ async fn write_patches_to_dir(
 ///
 /// Executes `git status` and returns working tree state in a structured format.
 /// By default, uses porcelain output for reliable machine parsing.
-pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitStatusRequest {
         #[serde(default)]
@@ -237,9 +237,9 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
         untracked: Option<bool>,
     }
 
-    let req = match RpcResponse::parse::<GitStatusRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitStatusRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -268,7 +268,7 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let clean = exec.success && exec.stdout.trim().is_empty();
@@ -288,7 +288,7 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
     extra_fields.insert("clean", json!(clean));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitDiff` MCP tool request.
@@ -298,7 +298,7 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
 ///
 /// When `from_ref` and `to_ref` are provided with `output_dir`, writes per-file
 /// patches to the specified directory along with a `_summary.json` file.
-pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitDiffRequest {
         #[serde(default)]
@@ -325,9 +325,9 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
         output_dir: Option<String>,
     }
 
-    let req = match RpcResponse::parse::<GitDiffRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitDiffRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -362,19 +362,19 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
                 response.insert("output_dir".to_string(), json!(output_dir));
                 response.insert("summary".to_string(), summary["summary"].clone());
                 response.insert("files".to_string(), summary["files"].clone());
-                return RpcResponse::ok(id, Value::Object(response));
+                return ToolCallOutcome::ok(Value::Object(response));
             }
-            Err(e) => return RpcResponse::err(id, e),
+            Err(e) => return ToolCallOutcome::err(e),
         }
     }
 
     // Validate: if from_ref or to_ref provided without output_dir, it's an error
     if req.from_ref.is_some() || req.to_ref.is_some() {
         if req.output_dir.is_none() {
-            return RpcResponse::err(id, "output_dir is required when using from_ref and to_ref");
+            return ToolCallOutcome::err("output_dir is required when using from_ref and to_ref");
         }
         if req.from_ref.is_none() || req.to_ref.is_none() {
-            return RpcResponse::err(id, "both from_ref and to_ref are required together");
+            return ToolCallOutcome::err("both from_ref and to_ref are required together");
         }
     }
 
@@ -424,7 +424,7 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -443,14 +443,14 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
     extra_fields.insert("max_bytes", json!(max_bytes));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitRestore` MCP tool request.
 ///
 /// Executes `git restore` to discard uncommitted changes. This is a **destructive
 /// operation** that cannot be undone for working tree changes.
-pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitRestoreRequest {
         paths: Vec<String>,
@@ -464,20 +464,20 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
         worktree: Option<bool>,
     }
 
-    let req = match RpcResponse::parse::<GitRestoreRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitRestoreRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     if req.paths.is_empty() {
-        return RpcResponse::err(id, "paths must be non-empty");
+        return ToolCallOutcome::err("paths must be non-empty");
     }
 
     let staged = req.staged.unwrap_or(false);
     let worktree = req.worktree.unwrap_or(true);
 
     if !staged && !worktree {
-        return RpcResponse::err(id, "at least one of staged/worktree must be true");
+        return ToolCallOutcome::err("at least one of staged/worktree must be true");
     }
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -507,7 +507,7 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -525,14 +525,14 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
     };
 
     let payload = build_git_response(&exec, text, None);
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitAdd` MCP tool request.
 ///
 /// Executes `git add` to stage files for the next commit. Supports staging
 /// specific paths, all changes, or only tracked file updates.
-pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitAddRequest {
         #[serde(default)]
@@ -547,9 +547,9 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
         update: Option<bool>,
     }
 
-    let req = match RpcResponse::parse::<GitAddRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitAddRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let use_all = req.all.unwrap_or(false);
@@ -557,7 +557,7 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
     let paths = req.paths.unwrap_or_default();
 
     if !use_all && !use_update && paths.is_empty() {
-        return RpcResponse::err(id, "paths required unless 'all' or 'update' is true");
+        return ToolCallOutcome::err("paths required unless 'all' or 'update' is true");
     }
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -589,7 +589,7 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -601,14 +601,14 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
     };
 
     let payload = build_git_response(&exec, text, None);
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitCommit` MCP tool request.
 ///
 /// Creates a Git commit using the Conventional Commits format. The commit message
 /// is automatically formatted as `type(scope): message` or `type: message`.
-pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_commit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitCommitRequest {
         #[serde(rename = "type")]
@@ -622,16 +622,16 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
         timeout_ms: Option<u64>,
     }
 
-    let req = match RpcResponse::parse::<GitCommitRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitCommitRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.commit_type, "type", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.commit_type, "type", None) {
+        return o;
     }
-    if let Err(resp) = validation::validate_non_empty(&req.message, "message", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.message, "message", None) {
+        return o;
     }
 
     // Build conventional commit message: type(scope): message
@@ -660,7 +660,7 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     // Try to extract commit hash from stdout (e.g., "[main abc1234] message")
@@ -683,13 +683,13 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
     extra_fields.insert("commit_hash", json!(commit_hash));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitLog` MCP tool request.
 ///
 /// Executes `git log` to show commit history with configurable format and filters.
-pub async fn handle_git_log(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_log(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitLogRequest {
         #[serde(default)]
@@ -716,9 +716,9 @@ pub async fn handle_git_log(id: Option<Value>, args: Value) -> RpcResponse<'stat
         max_bytes: Option<usize>,
     }
 
-    let req = match RpcResponse::parse::<GitLogRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitLogRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -763,7 +763,7 @@ pub async fn handle_git_log(id: Option<Value>, args: Value) -> RpcResponse<'stat
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -782,13 +782,13 @@ pub async fn handle_git_log(id: Option<Value>, args: Value) -> RpcResponse<'stat
     extra_fields.insert("max_bytes", json!(max_bytes));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitBranch` MCP tool request.
 ///
 /// Executes `git branch` to list, create, or delete branches.
-pub async fn handle_git_branch(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_branch(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitBranchRequest {
         #[serde(default)]
@@ -811,9 +811,9 @@ pub async fn handle_git_branch(id: Option<Value>, args: Value) -> RpcResponse<'s
         new_name: Option<String>,
     }
 
-    let req = match RpcResponse::parse::<GitBranchRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitBranchRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -834,7 +834,7 @@ pub async fn handle_git_branch(id: Option<Value>, args: Value) -> RpcResponse<'s
         if let Some(new_name) = &req.new_name {
             cmd_args.push(new_name.clone());
         } else {
-            return RpcResponse::err(id, "new_name required when renaming a branch");
+            return ToolCallOutcome::err("new_name required when renaming a branch");
         }
     } else {
         // List mode
@@ -856,7 +856,7 @@ pub async fn handle_git_branch(id: Option<Value>, args: Value) -> RpcResponse<'s
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -872,13 +872,13 @@ pub async fn handle_git_branch(id: Option<Value>, args: Value) -> RpcResponse<'s
     };
 
     let payload = build_git_response(&exec, text, None);
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitCheckout` MCP tool request.
 ///
 /// Executes `git checkout` to switch branches or restore files.
-pub async fn handle_git_checkout(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitCheckoutRequest {
         #[serde(default)]
@@ -895,9 +895,9 @@ pub async fn handle_git_checkout(id: Option<Value>, args: Value) -> RpcResponse<
         paths: Option<Vec<String>>,
     }
 
-    let req = match RpcResponse::parse::<GitCheckoutRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitCheckoutRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -924,8 +924,7 @@ pub async fn handle_git_checkout(id: Option<Value>, args: Value) -> RpcResponse<
     }
 
     if cmd_args.len() == 1 {
-        return RpcResponse::err(
-            id,
+        return ToolCallOutcome::err(
             "at least one of branch, create_branch, commit, or paths is required",
         );
     }
@@ -940,7 +939,7 @@ pub async fn handle_git_checkout(id: Option<Value>, args: Value) -> RpcResponse<
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -959,13 +958,13 @@ pub async fn handle_git_checkout(id: Option<Value>, args: Value) -> RpcResponse<
     };
 
     let payload = build_git_response(&exec, text, None);
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitStash` MCP tool request.
 ///
 /// Executes `git stash` to save and restore work in progress.
-pub async fn handle_git_stash(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitStashRequest {
         #[serde(default)]
@@ -982,9 +981,9 @@ pub async fn handle_git_stash(id: Option<Value>, args: Value) -> RpcResponse<'st
         include_untracked: Option<bool>,
     }
 
-    let req = match RpcResponse::parse::<GitStashRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitStashRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -1035,13 +1034,10 @@ pub async fn handle_git_stash(id: Option<Value>, args: Value) -> RpcResponse<'st
             cmd_args.push("clear".into());
         }
         _ => {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "unknown stash action '{}'. Valid: push, pop, apply, drop, list, show, clear",
-                    action
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "unknown stash action '{}'. Valid: push, pop, apply, drop, list, show, clear",
+                action
+            ));
         }
     }
 
@@ -1055,7 +1051,7 @@ pub async fn handle_git_stash(id: Option<Value>, args: Value) -> RpcResponse<'st
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -1077,13 +1073,13 @@ pub async fn handle_git_stash(id: Option<Value>, args: Value) -> RpcResponse<'st
     extra_fields.insert("action", json!(action));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitShow` MCP tool request.
 ///
 /// Executes `git show` to display a commit's contents.
-pub async fn handle_git_show(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_show(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitShowRequest {
         #[serde(default)]
@@ -1102,9 +1098,9 @@ pub async fn handle_git_show(id: Option<Value>, args: Value) -> RpcResponse<'sta
         max_bytes: Option<usize>,
     }
 
-    let req = match RpcResponse::parse::<GitShowRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitShowRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -1136,7 +1132,7 @@ pub async fn handle_git_show(id: Option<Value>, args: Value) -> RpcResponse<'sta
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -1151,13 +1147,13 @@ pub async fn handle_git_show(id: Option<Value>, args: Value) -> RpcResponse<'sta
     extra_fields.insert("max_bytes", json!(max_bytes));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }
 
 /// Handle the `GitBlame` MCP tool request.
 ///
 /// Executes `git blame` to show line-by-line authorship.
-pub async fn handle_git_blame(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct GitBlameRequest {
         path: String,
@@ -1175,13 +1171,13 @@ pub async fn handle_git_blame(id: Option<Value>, args: Value) -> RpcResponse<'st
         max_bytes: Option<usize>,
     }
 
-    let req = match RpcResponse::parse::<GitBlameRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<GitBlameRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.path, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.path, "path", None) {
+        return o;
     }
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -1215,7 +1211,7 @@ pub async fn handle_git_blame(id: Option<Value>, args: Value) -> RpcResponse<'st
     .await
     {
         Ok(r) => r,
-        Err(e) => return RpcResponse::err(id, format!("git error: {e:#}")),
+        Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
     let text = if exec.success {
@@ -1231,5 +1227,5 @@ pub async fn handle_git_blame(id: Option<Value>, args: Value) -> RpcResponse<'st
     extra_fields.insert("max_bytes", json!(max_bytes));
 
     let payload = build_git_response(&exec, text, Some(extra_fields));
-    RpcResponse::ok(id, payload)
+    ToolCallOutcome::ok(payload)
 }

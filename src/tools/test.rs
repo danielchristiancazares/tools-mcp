@@ -1,9 +1,9 @@
 use super::handlers::{ScriptConfig, run_script_tool};
-use crate::RpcResponse;
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use serde_json::Value;
 
-async fn handle_test(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+async fn handle_test(id: Option<Value>, args: Value) -> ToolCallOutcome {
     run_script_tool(
         id,
         args,

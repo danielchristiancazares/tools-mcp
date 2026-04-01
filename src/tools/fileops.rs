@@ -1,7 +1,7 @@
 //! File operation tools: Move, Copy, ListDir.
 
-use crate::RpcResponse;
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,24 +20,24 @@ struct MoveRequest {
     overwrite: Option<bool>,
 }
 
-async fn handle_move(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<MoveRequest>(id.clone(), args) {
+async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<MoveRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.source, "source", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.source, "source", None) {
+        return o;
     }
-    if let Err(resp) = validation::validate_non_empty(&req.destination, "destination", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.destination, "destination", None) {
+        return o;
     }
 
     let source = Path::new(&req.source);
     let destination = Path::new(&req.destination);
 
     if !source.exists() {
-        return RpcResponse::err(id, format!("source not found: {}", source.display()));
+        return ToolCallOutcome::err(format!("source not found: {}", source.display()));
     }
 
     // If destination is a directory, move into it with same filename
@@ -45,27 +45,24 @@ async fn handle_move(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
-            return RpcResponse::err(id, "source has no filename");
+            return ToolCallOutcome::err("source has no filename");
         }
     } else {
         destination.to_path_buf()
     };
 
     if final_dest.exists() && !req.overwrite.unwrap_or(false) {
-        return RpcResponse::err(
-            id,
-            format!(
-                "destination already exists: {}. Use overwrite: true to replace.",
-                final_dest.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "destination already exists: {}. Use overwrite: true to replace.",
+            final_dest.display()
+        ));
     }
 
     // Create parent directories if needed
     if let Some(parent) = final_dest.parent() {
         if !parent.exists() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return RpcResponse::err(id, format!("failed to create parent directory: {err}"));
+                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
             }
         }
     }
@@ -74,27 +71,22 @@ async fn handle_move(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         // rename() may fail across filesystems, try copy+delete
         if source.is_file() {
             if let Err(copy_err) = tokio::fs::copy(source, &final_dest).await {
-                return RpcResponse::err(
-                    id,
-                    format!(
-                        "failed to move {}: {err}, copy fallback failed: {copy_err}",
-                        source.display()
-                    ),
-                );
+                return ToolCallOutcome::err(format!(
+                    "failed to move {}: {err}, copy fallback failed: {copy_err}",
+                    source.display()
+                ));
             }
             if let Err(del_err) = tokio::fs::remove_file(source).await {
-                return RpcResponse::err(
-                    id,
-                    format!("moved file but failed to remove source: {del_err}"),
-                );
+                return ToolCallOutcome::err(format!(
+                    "moved file but failed to remove source: {del_err}"
+                ));
             }
         } else {
-            return RpcResponse::err(id, format!("failed to move {}: {err}", source.display()));
+            return ToolCallOutcome::err(format!("failed to move {}: {err}", source.display()));
         }
     }
 
-    RpcResponse::ok_text_with(
-        id,
+    ToolCallOutcome::ok_text_with(
         format!("Moved {} to {}", source.display(), final_dest.display()),
         [
             ("source", json!(source.display().to_string())),
@@ -145,24 +137,24 @@ struct CopyRequest {
     recursive: Option<bool>,
 }
 
-async fn handle_copy(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<CopyRequest>(id.clone(), args) {
+async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<CopyRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.source, "source", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.source, "source", None) {
+        return o;
     }
-    if let Err(resp) = validation::validate_non_empty(&req.destination, "destination", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.destination, "destination", None) {
+        return o;
     }
 
     let source = Path::new(&req.source);
     let destination = Path::new(&req.destination);
 
     if !source.exists() {
-        return RpcResponse::err(id, format!("source not found: {}", source.display()));
+        return ToolCallOutcome::err(format!("source not found: {}", source.display()));
     }
 
     // If destination is a directory, copy into it with same filename
@@ -170,7 +162,7 @@ async fn handle_copy(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
-            return RpcResponse::err(id, "source has no filename");
+            return ToolCallOutcome::err("source has no filename");
         }
     } else {
         destination.to_path_buf()
@@ -180,60 +172,50 @@ async fn handle_copy(id: Option<Value>, args: Value) -> RpcResponse<'static> {
         let source_norm = normalize_absolute_or_cwd(source);
         let dest_norm = normalize_absolute_or_cwd(&final_dest);
         if dest_norm.starts_with(&source_norm) {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
-                    final_dest.display(),
-                    source.display()
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
+                final_dest.display(),
+                source.display()
+            ));
         }
     }
 
     if final_dest.exists() && !req.overwrite.unwrap_or(false) {
-        return RpcResponse::err(
-            id,
-            format!(
-                "destination already exists: {}. Use overwrite: true to replace.",
-                final_dest.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "destination already exists: {}. Use overwrite: true to replace.",
+            final_dest.display()
+        ));
     }
 
     // Create parent directories if needed
     if let Some(parent) = final_dest.parent() {
         if !parent.exists() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return RpcResponse::err(id, format!("failed to create parent directory: {err}"));
+                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
             }
         }
     }
 
     if source.is_file() {
         if let Err(err) = tokio::fs::copy(source, &final_dest).await {
-            return RpcResponse::err(id, format!("failed to copy {}: {err}", source.display()));
+            return ToolCallOutcome::err(format!("failed to copy {}: {err}", source.display()));
         }
     } else if source.is_dir() {
         if !req.recursive.unwrap_or(false) {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "{} is a directory. Use recursive: true to copy directories.",
-                    source.display()
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "{} is a directory. Use recursive: true to copy directories.",
+                source.display()
+            ));
         }
         if let Err(err) = copy_dir_recursive(source, &final_dest).await {
-            return RpcResponse::err(
-                id,
-                format!("failed to copy directory {}: {err}", source.display()),
-            );
+            return ToolCallOutcome::err(format!(
+                "failed to copy directory {}: {err}",
+                source.display()
+            ));
         }
     }
 
-    RpcResponse::ok_text_with(
-        id,
+    ToolCallOutcome::ok_text_with(
         format!("Copied {} to {}", source.display(), final_dest.display()),
         [
             ("source", json!(source.display().to_string())),
@@ -338,7 +320,7 @@ mod tests {
         });
 
         let resp = handle_copy(Some(json!(1)), args).await;
-        let result = resp.result.expect("result payload");
+        let result = resp.0;
         assert_eq!(result["isError"], true);
         let msg = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(msg.contains("destination"));
@@ -360,14 +342,14 @@ struct ListDirRequest {
     long: Option<bool>,
 }
 
-async fn handle_listdir(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<ListDirRequest>(id.clone(), args) {
+async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<ListDirRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.path, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.path, "path", None) {
+        return o;
     }
 
     let path = Path::new(&req.path);
@@ -375,35 +357,26 @@ async fn handle_listdir(id: Option<Value>, args: Value) -> RpcResponse<'static> 
     let long_format = req.long.unwrap_or(false);
 
     if !path.exists() {
-        return RpcResponse::err(
-            id,
-            format!(
-                "path not found: {}. Remediation: check the path (relative to the server working directory) or use '.' for the current directory.",
-                path.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "path not found: {}. Remediation: check the path (relative to the server working directory) or use '.' for the current directory.",
+            path.display()
+        ));
     }
 
     if !path.is_dir() {
-        return RpcResponse::err(
-            id,
-            format!(
-                "not a directory: {}. Remediation: pass a directory path (use Read for files).",
-                path.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "not a directory: {}. Remediation: pass a directory path (use Read for files).",
+            path.display()
+        ));
     }
 
     let mut entries = match tokio::fs::read_dir(path).await {
         Ok(e) => e,
         Err(err) => {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "failed to read directory {}: {err}. Remediation: check permissions and that the path is a directory.",
-                    path.display()
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "failed to read directory {}: {err}. Remediation: check permissions and that the path is a directory.",
+                path.display()
+            ));
         }
     };
 
@@ -475,8 +448,7 @@ async fn handle_listdir(id: Option<Value>, args: Value) -> RpcResponse<'static> 
             .cmp(b["name"].as_str().unwrap_or(""))
     });
 
-    RpcResponse::ok_text_with(
-        id,
+    ToolCallOutcome::ok_text_with(
         lines.join("\n"),
         [
             ("path", json!(path.display().to_string())),

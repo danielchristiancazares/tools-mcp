@@ -97,7 +97,8 @@ use serde_json::Value;
 use std::path::Path;
 
 use crate::codequery_cache::{cache_store_id, load_store_id_from_cache};
-use crate::ports::{CodeQueryEngine, FileSearchCoreEngine};
+use crate::adapters::outbound::FileSearchCoreEngine;
+use crate::ports::CodeQueryEngine;
 use crate::validation;
 
 /// Handles the CodeQuery MCP tool invocation.
@@ -154,11 +155,10 @@ use crate::validation;
 /// });
 /// let response = handle_code_query(Some(json!(1)), args).await;
 /// ```
-pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResponse<'static> {
+pub async fn handle_code_query(_id: Option<Value>, args: Value) -> crate::tool_outcome::ToolCallOutcome {
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        return crate::RpcResponse::err_with(
-            id,
+        return crate::tool_outcome::ToolCallOutcome::err_with(
             "OPENAI_API_KEY is not set. CodeQuery uses the OpenAI API (vector stores) and requires an API key.",
             [
                 ("error_type", serde_json::json!("missing_env")),
@@ -188,8 +188,8 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .map(|s| s.to_string());
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
-    if let Err(resp) = validation::validate_non_empty(query, "query", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(query, "query", None) {
+        return o;
     }
 
     if vector_store_id_arg.is_none() && vector_store_name.is_none() {
@@ -198,8 +198,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         // advanced callers override via vector_store_name when needed.
         vector_store_name = default_vector_store_name();
         if vector_store_name.is_none() {
-            return crate::RpcResponse::err(
-                id,
+            return crate::tool_outcome::ToolCallOutcome::err(
                 "CodeQuery could not infer a vector store name. Provide vector_store_name explicitly.",
             );
         }
@@ -229,7 +228,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
                     "CodeQuery could not discover local files: {err}. Remediation: run the server from the repo root or pass file_paths explicitly."
                 );
                 tracing::error!(error = %message);
-                return crate::RpcResponse::err(id, message);
+                return crate::tool_outcome::ToolCallOutcome::err(message);
             }
         }
     }
@@ -239,12 +238,9 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .and_then(|v| v.as_u64())
         .unwrap_or(5) as usize;
     if !(1..=20).contains(&concurrent_limit) {
-        return crate::RpcResponse::err(
-            id,
-            format!(
-                "concurrent_limit must be between 1 and 20 (got {concurrent_limit}). Use a smaller value to reduce API concurrency."
-            ),
-        );
+        return crate::tool_outcome::ToolCallOutcome::err(format!(
+            "concurrent_limit must be between 1 and 20 (got {concurrent_limit}). Use a smaller value to reduce API concurrency."
+        ));
     }
 
     let timeout_ms = args
@@ -252,12 +248,9 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         .and_then(|v| v.as_u64())
         .unwrap_or(60_000);
     if timeout_ms < 1_000 {
-        return crate::RpcResponse::err(
-            id,
-            format!(
-                "timeout_ms must be at least 1000 milliseconds (got {timeout_ms}). Increase timeout_ms for large repos or slow networks."
-            ),
-        );
+        return crate::tool_outcome::ToolCallOutcome::err(format!(
+            "timeout_ms must be at least 1000 milliseconds (got {timeout_ms}). Increase timeout_ms for large repos or slow networks."
+        ));
     }
 
     let include_results = args
@@ -280,8 +273,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
         Some(id) => id,
         None => {
             let Some(name) = vector_store_name.as_deref() else {
-                return crate::RpcResponse::err(
-                    id,
+                return crate::tool_outcome::ToolCallOutcome::err(
                     "CodeQuery could not determine a vector store name.",
                 );
             };
@@ -289,10 +281,10 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
             match resolve_vector_store_id(&client, &cfg, name).await {
                 Ok(id) => id,
                 Err(e) => {
-                    return crate::RpcResponse::err(
-                        id,
-                        format!("failed to resolve vector store name '{}': {}", name, e),
-                    );
+                    return crate::tool_outcome::ToolCallOutcome::err(format!(
+                        "failed to resolve vector store name '{}': {}",
+                        name, e
+                    ));
                 }
             }
         }
@@ -331,13 +323,10 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
                 }));
             }
 
-            crate::RpcResponse::ok(
-                id,
-                serde_json::json!({
-                    "content": content,
-                    "isError": false
-                }),
-            )
+            crate::tool_outcome::ToolCallOutcome::ok(serde_json::json!({
+                "content": content,
+                "isError": false
+            }))
         }
         Err(e) => {
             let error_message = e.to_string();
@@ -397,8 +386,7 @@ pub async fn handle_code_query(id: Option<Value>, args: Value) -> crate::RpcResp
 
             tracing::error!("CodeQuery error: {}", error_message);
 
-            crate::RpcResponse::err_with(
-                id,
+            crate::tool_outcome::ToolCallOutcome::err_with(
                 headline,
                 [
                     ("error_type", serde_json::json!("codequery_failure")),

@@ -1,39 +1,37 @@
-//! MCP WebFetch tool handler (application layer); delegates to [`crate::webfetch::run_fetch`].
+//! MCP WebFetch tool handler (application layer); delegates to [`crate::ports::WebFetcher`].
 
-use crate::webfetch::{FetchRequest, run_fetch};
+use crate::services::default_web_fetcher;
+use crate::tool_outcome::ToolCallOutcome;
+use crate::webfetch::FetchRequest;
 
 /// MCP tool handler for WebFetch
 pub async fn handle_webfetch(
-    id: Option<serde_json::Value>,
+    _id: Option<serde_json::Value>,
     args: serde_json::Value,
-) -> crate::RpcResponse<'static> {
-    let request = match crate::RpcResponse::parse::<FetchRequest>(id.clone(), args) {
+) -> ToolCallOutcome {
+    let request = match ToolCallOutcome::parse_args::<FetchRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     let url = request.url.clone();
     let force_browser = request.force_browser;
 
-    match run_fetch(request).await {
+    match default_web_fetcher().fetch(request).await {
         Ok(response) => {
             let json_text = serde_json::to_string(&response)
                 .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-            crate::RpcResponse::ok(
-                id,
-                serde_json::json!({
-                    "content": [{"type": "text", "text": json_text}],
-                    "isError": false
-                }),
-            )
+            ToolCallOutcome::ok(serde_json::json!({
+                "content": [{"type": "text", "text": json_text}],
+                "isError": false
+            }))
         }
         Err(e) => {
             let details_full = format!("{:#}", e);
             let (message, error_type, remediation) =
                 classify_webfetch_error(&details_full, force_browser);
 
-            crate::RpcResponse::err_with(
-                id,
+            ToolCallOutcome::err_with(
                 message,
                 [
                     ("error_type", serde_json::json!(error_type)),
@@ -51,8 +49,23 @@ pub async fn handle_webfetch(
 }
 
 fn truncate_tool_details(input: &str, max_chars: usize) -> String {
-    if input.len() > max_chars {
-        format!("{}…", &input[..max_chars])
+    if max_chars == 0 {
+        return "…".to_string();
+    }
+
+    let mut char_count = 0usize;
+    let mut truncation_byte_idx = input.len();
+
+    for (byte_idx, _) in input.char_indices() {
+        if char_count == max_chars {
+            truncation_byte_idx = byte_idx;
+            break;
+        }
+        char_count += 1;
+    }
+
+    if char_count == max_chars && truncation_byte_idx < input.len() {
+        format!("{}…", &input[..truncation_byte_idx])
     } else {
         input.to_string()
     }
@@ -168,4 +181,27 @@ fn classify_webfetch_error(
             "Try another URL or provide the text directly if available.".to_string(),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_tool_details;
+
+    #[test]
+    fn truncate_tool_details_truncates_ascii() {
+        let out = truncate_tool_details("abcdef", 3);
+        assert_eq!(out, "abc…");
+    }
+
+    #[test]
+    fn truncate_tool_details_preserves_short_input() {
+        let out = truncate_tool_details("abc", 10);
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn truncate_tool_details_handles_unicode_boundaries() {
+        let out = truncate_tool_details("éééé", 3);
+        assert_eq!(out, "ééé…");
+    }
 }

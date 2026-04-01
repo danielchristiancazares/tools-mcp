@@ -1,4 +1,4 @@
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,7 +22,7 @@ pub trait McpTool: Send + Sync + 'static {
     fn execute(
         id: Option<Value>,
         args: Value,
-    ) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>>;
 }
 
 /// Tool definition for MCP protocol responses.
@@ -35,7 +35,7 @@ pub struct ToolDef {
 }
 
 type ToolExecutor = Box<
-    dyn Fn(Option<Value>, Value) -> Pin<Box<dyn Future<Output = RpcResponse<'static>> + Send>>
+    dyn Fn(Option<Value>, Value) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>>
         + Send
         + Sync,
 >;
@@ -93,10 +93,11 @@ impl ToolRegistry {
         name: &str,
         id: Option<Value>,
         args: Value,
-    ) -> Option<RpcResponse<'static>> {
+    ) -> Option<crate::RpcResponse<'static>> {
         let idx = self.by_name.get(name)?;
         let entry = &self.tools[*idx];
-        Some((entry.executor)(id, args).await)
+        let outcome = (entry.executor)(id.clone(), args).await;
+        Some(outcome.into_rpc_response(id))
     }
 }
 
@@ -112,14 +113,11 @@ mod tests {
     use crate::define_mcp_tool;
     use serde_json::json;
 
-    async fn ok_tool(id: Option<Value>, _args: Value) -> RpcResponse<'static> {
-        RpcResponse::ok(
-            id,
-            json!({
-                "content": [{"type": "text", "text": "ok"}],
-                "isError": false
-            }),
-        )
+    async fn ok_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
+        ToolCallOutcome::ok(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "isError": false
+        }))
     }
 
     define_mcp_tool! {
@@ -222,7 +220,7 @@ macro_rules! define_mcp_tool {
             fn execute(
                 id: Option<serde_json::Value>,
                 args: serde_json::Value,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = $crate::RpcResponse<'static>> + Send>> {
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = $crate::tool_outcome::ToolCallOutcome> + Send>> {
                 Box::pin($handler(id, args))
             }
         }

@@ -1,5 +1,5 @@
-use crate::RpcResponse;
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,38 +11,37 @@ struct DeleteRequest {
     path: String,
 }
 
-async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<DeleteRequest>(id.clone(), args) {
+async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<DeleteRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.path, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.path, "path", None) {
+        return o;
     }
 
     let path = Path::new(&req.path);
 
     if !path.exists() {
-        return RpcResponse::err(id, format!("file not found: {}", path.display()));
+        return ToolCallOutcome::err(format!("file not found: {}", path.display()));
     }
 
     if path.is_dir() {
-        return RpcResponse::err(
-            id,
-            format!(
-                "cannot delete directory: {}. This tool only deletes files. Remediation: delete files within the directory first, or use a shell tool carefully if you intend to remove a directory.",
-                path.display()
-            ),
-        );
+        return ToolCallOutcome::err(format!(
+            "cannot delete directory: {}. This tool only deletes files. Remediation: delete files within the directory first, or use a shell tool carefully if you intend to remove a directory.",
+            path.display()
+        ));
     }
 
     if let Err(err) = tokio::fs::remove_file(path).await {
-        return RpcResponse::err(id, format!("failed to delete {}: {err}", path.display()));
+        return ToolCallOutcome::err(format!(
+            "failed to delete {}: {err}",
+            path.display()
+        ));
     }
 
-    RpcResponse::ok_text_with(
-        id,
+    ToolCallOutcome::ok_text_with(
         format!("Deleted {}", path.display()),
         [("path", json!(path.display().to_string()))],
     )

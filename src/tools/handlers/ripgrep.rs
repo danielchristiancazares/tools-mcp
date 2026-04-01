@@ -1,6 +1,6 @@
 //! ugrep search handler implementation.
 
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,13 +46,25 @@ fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
     (String::new(), 0, String::new(), true)
 }
 
+fn classify_success(
+    status: Option<std::process::ExitStatus>,
+    exit_code: Option<i32>,
+    truncated: bool,
+    timed_out: bool,
+) -> bool {
+    status
+        .as_ref()
+        .is_some_and(|s| s.success() || exit_code == Some(1) || truncated)
+        && !timed_out
+}
+
 /// Run ugrep and return both a readable summary and structured matches.
 ///
 /// Notes:
 /// - This tool executes `ugrep` directly (no shell).
 /// - Uses text output with -n -H for simpler parsing.
 /// - Exit code semantics: 0 = matches found, 1 = no matches, 2 = error.
-pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'static> {
+pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     struct RgRequest {
         /// Regex (or literal if `fixed_strings=true`).
@@ -95,18 +107,18 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         fuzzy: Option<u8>,
     }
 
-    let req = match RpcResponse::parse::<RgRequest>(id.clone(), args) {
+    let req = match ToolCallOutcome::parse_args::<RgRequest>(args) {
         Ok(req) => req,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
-    if let Err(resp) = validation::validate_non_empty(&req.pattern, "pattern", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(&req.pattern, "pattern", None) {
+        return o;
     }
 
     let root = req.path.as_deref().unwrap_or(".");
-    if let Err(resp) = validation::validate_non_empty(root, "path", id.clone()) {
-        return resp;
+    if let Err(o) = validation::validate_non_empty(root, "path", None) {
+        return o;
     }
 
     let max_results = validation::clamp_limit(req.max_results, 200, 1, 10_000);
@@ -208,6 +220,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         let mut rendered_lines: Vec<String> = Vec::new();
         let mut truncated = false;
         let mut timed_out = false;
+        let mut terminated_for_limit = false;
 
         let mut reader = BufReader::new(stdout).lines();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -237,6 +250,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
 
                     if matches.len() >= max_results {
                         truncated = true;
+                        terminated_for_limit = true;
                         let _ = child.kill().await;
                         break;
                     }
@@ -253,7 +267,11 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         let status = match time::timeout(Duration::from_millis(2_000), child.wait()).await {
             Ok(res) => Some(res?),
             Err(_) => {
-                timed_out = true;
+                // If we intentionally terminated after collecting enough results,
+                // a slow process shutdown should not be reported as a user-visible timeout.
+                if !terminated_for_limit {
+                    timed_out = true;
+                }
                 let _ = child.kill().await;
                 None
             }
@@ -273,10 +291,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
         .to_string();
 
         // ugrep: 0 = matches, 1 = no matches, 2 = error
-        let success = status
-            .as_ref()
-            .is_some_and(|s| s.success() || exit_code == Some(1) || truncated)
-            && !timed_out;
+        let success = classify_success(status, exit_code, truncated, timed_out);
 
         Ok::<_, anyhow::Error>((
             matches,
@@ -318,8 +333,29 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
                 obj.insert("stderr".to_string(), Value::String(stderr_text));
             }
 
-            RpcResponse::ok(id, payload)
+            ToolCallOutcome::ok(payload)
         }
-        Err(e) => RpcResponse::err(id, format!("ugrep error: {e:#}")),
+        Err(e) => ToolCallOutcome::err(format!("ugrep error: {e:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_success;
+
+    #[test]
+    #[cfg(unix)]
+    fn truncated_without_timeout_is_success_even_after_forced_termination() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let terminated = std::process::ExitStatus::from_raw(9);
+        assert!(classify_success(Some(terminated), None, true, false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn truncated_with_timeout_is_error() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let terminated = std::process::ExitStatus::from_raw(9);
+        assert!(!classify_success(Some(terminated), None, true, true));
     }
 }

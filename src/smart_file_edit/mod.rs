@@ -104,7 +104,7 @@
 //! - `"stale_file"`: The file changed since the provided hash was computed
 //!
 //! All errors include descriptive messages and relevant context for debugging.
-use crate::RpcResponse;
+use crate::tool_outcome::ToolCallOutcome;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -125,15 +125,14 @@ struct SimpleEditRequest {
 /// Simplified edit handler - replaces old_snippet with new_snippet in a file.
 ///
 /// This is the streamlined interface for the Edit tool. No action field needed.
-pub async fn handle_edit(id: Option<Value>, args: Value) -> RpcResponse<'static> {
-    let req = match RpcResponse::parse::<SimpleEditRequest>(id.clone(), args) {
+pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<SimpleEditRequest>(args) {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(o) => return o,
     };
 
     if req.old_snippet.is_empty() {
-        return RpcResponse::err(
-            id,
+        return ToolCallOutcome::err(
             "old_snippet cannot be empty. Remediation: use Read to copy the exact snippet from the file (use LF newlines), then retry Edit.",
         );
     }
@@ -150,14 +149,11 @@ pub async fn handle_edit(id: Option<Value>, args: Value) -> RpcResponse<'static>
     match apply_snippet_edit_impl(&internal_req) {
         Ok(result) => {
             let is_error = !matches!(result.status, SnippetStatusKind::Ok);
-            RpcResponse::ok_json_content(id, result.payload, is_error)
+            ToolCallOutcome::ok_json_content(result.payload, is_error)
         }
-        Err(err) => RpcResponse::err(
-            id,
-            format!(
-                "edit error: {err}. Remediation: ensure 'path' exists and 'old_snippet' matches exactly; if there are multiple matches, provide match_hint."
-            ),
-        ),
+        Err(err) => ToolCallOutcome::err(format!(
+            "edit error: {err}. Remediation: ensure 'path' exists and 'old_snippet' matches exactly; if there are multiple matches, provide match_hint."
+        )),
     }
 }
 
