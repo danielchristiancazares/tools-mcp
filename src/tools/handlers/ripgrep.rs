@@ -13,33 +13,36 @@ use tokio::time::{self, Instant};
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
 /// Returns (path, line_number, text, is_match)
 fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
-    // Try match format first: "path:123:text"
-    // Need to handle paths with colons (e.g., C:\foo on Windows)
+    fn parse_with_sep(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
+        let bytes = line.as_bytes();
+        for i in (0..bytes.len()).rev() {
+            if bytes[i] != sep {
+                continue;
+            }
 
-    // Find the pattern ":digits:" which separates path from line number from text
-    let bytes = line.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b':' || bytes[i] == b'-' {
-            let sep = bytes[i];
-            let is_match = sep == b':';
-
-            // Check if followed by digits then another separator
+            // Check if followed by digits then another matching separator.
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
 
-            // Must have at least one digit and be followed by the same separator
             if j > i + 1 && j < bytes.len() && bytes[j] == sep {
                 let path = &line[..i];
-                let line_no: u64 = line[i + 1..j].parse().unwrap_or(0);
+                let line_no: u64 = line[i + 1..j].parse().ok()?;
                 let text = &line[j + 1..];
-                return (path.to_string(), line_no, text.to_string(), is_match);
+                return Some((path.to_string(), line_no, text.to_string(), sep == b':'));
             }
         }
-        i += 1;
+        None
+    }
+
+    // Parse match lines first ("path:line:text"), then context lines ("path-line-text").
+    // This avoids misparsing filenames containing "-<digits>-", e.g. "foo-1-bar.txt:10:text".
+    if let Some(parsed) = parse_with_sep(line, b':') {
+        return parsed;
+    }
+    if let Some(parsed) = parse_with_sep(line, b'-') {
+        return parsed;
     }
 
     // Couldn't parse, return empty
@@ -341,7 +344,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
 
 #[cfg(test)]
 mod tests {
-    use super::classify_success;
+    use super::{classify_success, parse_grep_line};
 
     #[test]
     #[cfg(unix)]
@@ -357,5 +360,25 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
         let terminated = std::process::ExitStatus::from_raw(9);
         assert!(!classify_success(Some(terminated), None, true, true));
+    }
+
+    #[test]
+    fn parse_grep_line_prefers_match_separator_when_filename_contains_hyphen_digits() {
+        let line = "src/foo-1-bar.rs:42:let x = 1;";
+        let (path, line_no, text, is_match) = parse_grep_line(line);
+        assert_eq!(path, "src/foo-1-bar.rs");
+        assert_eq!(line_no, 42);
+        assert_eq!(text, "let x = 1;");
+        assert!(is_match);
+    }
+
+    #[test]
+    fn parse_grep_line_parses_context_lines() {
+        let line = "src/main.rs-7-use std::time::Duration;";
+        let (path, line_no, text, is_match) = parse_grep_line(line);
+        assert_eq!(path, "src/main.rs");
+        assert_eq!(line_no, 7);
+        assert_eq!(text, "use std::time::Duration;");
+        assert!(!is_match);
     }
 }
