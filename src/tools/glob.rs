@@ -1,6 +1,6 @@
-use crate::tool_outcome::ToolCallOutcome;
 use crate::config::{DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT};
 use crate::define_mcp_tool;
+use crate::tool_outcome::ToolCallOutcome;
 use crate::validation;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
@@ -134,12 +134,9 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     let expanded = match expand_braces(&req.pattern) {
         Ok(expanded) => expanded,
         Err(err) => {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "invalid glob pattern: {err}. Remediation: reduce brace groups/options or use a simpler pattern."
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "invalid glob pattern: {err}. Remediation: reduce brace groups/options or use a simpler pattern."
+            ));
         }
     };
     let patterns: Vec<Pattern> = match expanded

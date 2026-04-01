@@ -62,9 +62,7 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     if let Some(parent) = final_dest.parent() {
         if !parent.exists() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return ToolCallOutcome::err(format!(
-                    "failed to create parent directory: {err}"
-                ));
+                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
             }
         }
     }
@@ -84,10 +82,7 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
                 ));
             }
         } else {
-            return ToolCallOutcome::err(format!(
-                "failed to move {}: {err}",
-                source.display()
-            ));
+            return ToolCallOutcome::err(format!("failed to move {}: {err}", source.display()));
         }
     }
 
@@ -177,14 +172,11 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         let source_norm = normalize_absolute_or_cwd(source);
         let dest_norm = normalize_absolute_or_cwd(&final_dest);
         if dest_norm.starts_with(&source_norm) {
-            return RpcResponse::err(
-                id,
-                format!(
-                    "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
-                    final_dest.display(),
-                    source.display()
-                ),
-            );
+            return ToolCallOutcome::err(format!(
+                "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
+                final_dest.display(),
+                source.display()
+            ));
         }
     }
 
@@ -199,19 +191,14 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     if let Some(parent) = final_dest.parent() {
         if !parent.exists() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                return ToolCallOutcome::err(format!(
-                    "failed to create parent directory: {err}"
-                ));
+                return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
             }
         }
     }
 
     if source.is_file() {
         if let Err(err) = tokio::fs::copy(source, &final_dest).await {
-            return ToolCallOutcome::err(format!(
-                "failed to copy {}: {err}",
-                source.display()
-            ));
+            return ToolCallOutcome::err(format!("failed to copy {}: {err}", source.display()));
         }
     } else if source.is_dir() {
         if !req.recursive.unwrap_or(false) {
@@ -269,7 +256,23 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     while let Some(entry) = entries.next_entry().await? {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let file_type = entry.file_type().await?;
+
+        // Avoid following symlinked directories during recursive copy.
+        // Following links can cause unbounded recursion (e.g., a symlink
+        // pointing back to an ancestor) or unintentionally copy data outside
+        // the source subtree.
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to recurse through symlink while copying directory: {}",
+                    src_path.display()
+                ),
+            ));
+        }
+
+        if file_type.is_dir() {
             Box::pin(copy_dir_recursive(&src_path, &dst_path)).await?;
         } else {
             tokio::fs::copy(&src_path, &dst_path).await?;
@@ -333,11 +336,43 @@ mod tests {
         });
 
         let resp = handle_copy(Some(json!(1)), args).await;
-        let result = resp.result.expect("result payload");
+        let result = resp.0;
         assert_eq!(result["isError"], true);
         let msg = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(msg.contains("destination"));
         assert!(msg.contains("inside source"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_rejects_symlink_inside_recursive_directory_copy() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let nested = src.join("nested");
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("create nested");
+        tokio::fs::write(src.join("file.txt"), "hello")
+            .await
+            .expect("write");
+
+        // Create loop: src/nested/back -> src
+        unix_fs::symlink(&src, nested.join("back")).expect("symlink");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string(),
+            "recursive": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("symlink"));
     }
 }
 
