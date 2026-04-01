@@ -398,9 +398,21 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
         Some(txt) => {
             let mut matcher = DefaultMatcher::default();
             let parsed = Url::parse(url)?;
-            let path = parsed.path();
-            Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, path))
+            let path_with_query = robots_match_path(&parsed);
+            Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, &path_with_query))
         }
+    }
+}
+
+/// Builds the robots.txt match input from a URL path and optional query.
+///
+/// Some robots rules intentionally target query-string URLs (for example,
+/// `Disallow: /*?print=1`). Matching only on `Url::path()` silently bypasses
+/// those rules, so we include `?query` when present.
+fn robots_match_path(parsed: &Url) -> String {
+    match parsed.query() {
+        Some(query) => format!("{}?{}", parsed.path(), query),
+        None => parsed.path().to_string(),
     }
 }
 
@@ -580,5 +592,17 @@ mod tests {
         validate_url_ssrf("https://93.184.216.34/")
             .await
             .expect("expected public IP literal to pass SSRF validation");
+    }
+
+    #[test]
+    fn robots_match_path_includes_query_string() {
+        let parsed = Url::parse("https://example.com/docs/page?print=1&lang=en").expect("url");
+        assert_eq!(robots_match_path(&parsed), "/docs/page?print=1&lang=en");
+    }
+
+    #[test]
+    fn robots_match_path_without_query_is_path_only() {
+        let parsed = Url::parse("https://example.com/docs/page").expect("url");
+        assert_eq!(robots_match_path(&parsed), "/docs/page");
     }
 }
