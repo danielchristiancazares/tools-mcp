@@ -189,11 +189,21 @@ where
 pub fn read_cache(url: &str) -> Result<Option<CachedFetch>> {
     let path = cache_path_for(url)?;
     if path.exists() {
-        let mut file = fs::File::open(path).context("open cache file")?;
+        let mut file = fs::File::open(&path).context("open cache file")?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).context("read cache file")?;
-        let entry: CachedFetch = serde_json::from_slice(&buf).context("deserialize cache entry")?;
-        Ok(Some(entry))
+        match serde_json::from_slice(&buf) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Ignoring corrupted webfetch cache entry"
+                );
+                Ok(None)
+            }
+        }
     } else {
         Ok(None)
     }
@@ -280,5 +290,20 @@ mod tests {
 
         // Cleanup so temp dir doesn't grow unbounded during test runs.
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_cache_treats_corrupt_entry_as_miss_and_removes_file() {
+        let key = format!("test://cache-corrupt-{}_http", uuid::Uuid::new_v4());
+        let path = cache_path_for(&key).expect("cache path");
+
+        fs::write(&path, b"{not-json").expect("write corrupt cache");
+
+        let loaded = read_cache(&key).expect("read cache should not fail on corruption");
+        assert!(loaded.is_none(), "corrupt cache should be treated as miss");
+        assert!(
+            !path.exists(),
+            "corrupt cache file should be removed to avoid repeated failures"
+        );
     }
 }
