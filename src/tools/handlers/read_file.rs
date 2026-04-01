@@ -62,7 +62,8 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         return ToolCallOutcome::err(format!("file is empty: {}", path.display()));
     }
 
-    let line_count = text.split_inclusive('\n').count();
+    let lines = split_lines_with_endings(&text);
+    let line_count = lines.len();
 
     let start = req.start_line.unwrap_or(1);
     let end = req.end_line.unwrap_or(line_count);
@@ -90,7 +91,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
     let show_line_numbers = req.show_line_numbers.unwrap_or(true);
 
     let mut body = String::new();
-    for (idx, line) in text.split_inclusive('\n').enumerate() {
+    for (idx, line) in lines.iter().enumerate() {
         let line_no = idx + 1;
         if line_no < start {
             continue;
@@ -99,7 +100,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
             break;
         }
 
-        // Keep the file's original line endings (split_inclusive keeps the trailing '\n').
+        // Keep the file's original line endings from `split_lines_with_endings`.
         if show_line_numbers {
             let _ = write!(body, "{:>width$}\t{}", line_no, line, width = width);
         } else {
@@ -117,4 +118,56 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
     });
 
     ToolCallOutcome::ok(payload)
+}
+
+fn split_lines_with_endings(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push(&text[start..i + 1]);
+                start = i + 1;
+                i += 1;
+            }
+            b'\r' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    lines.push(&text[start..i + 2]);
+                    start = i + 2;
+                    i += 2;
+                } else {
+                    lines.push(&text[start..i + 1]);
+                    start = i + 1;
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_lines_with_endings;
+
+    #[test]
+    fn split_lines_with_endings_handles_cr_only_files() {
+        let lines = split_lines_with_endings("line1\rline2\rline3");
+        assert_eq!(lines, vec!["line1\r", "line2\r", "line3"]);
+    }
+
+    #[test]
+    fn split_lines_with_endings_handles_mixed_newlines() {
+        let lines = split_lines_with_endings("a\r\nb\nc\rd");
+        assert_eq!(lines, vec!["a\r\n", "b\n", "c\r", "d"]);
+    }
 }
