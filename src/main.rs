@@ -84,9 +84,9 @@ async fn main() -> Result<()> {
                     should_skip_headers()
                 };
                 if let Err(write_err) =
-                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await
-                {
+                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await                {
                     error!("failed to write parse error response: {}", write_err);
+                {
                     break;
                 }
                 continue;

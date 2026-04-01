@@ -517,6 +517,54 @@ fn test_error_handling_unknown_tool() {
 }
 
 #[test]
+fn test_invalid_json_returns_parse_error_response() {
+    setup();
+
+    let mut child = Command::new("cargo")
+        .args(["run", "--release", "--quiet"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    stdin
+        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping""#)
+        .unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+
+    let mut reader = BufReader::new(stdout);
+    let mut response = String::new();
+    loop {
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).unwrap();
+        if bytes_read == 0 {
+            break;
+        }
+        if line.starts_with("Content-Length:") || line.trim().is_empty() {
+            continue;
+        }
+        response = line;
+        break;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(!response.is_empty(), "expected parse-error response");
+    let json_response: Value = serde_json::from_str(&response).expect("Failed to parse response");
+    assert_eq!(json_response["jsonrpc"], "2.0");
+    assert_eq!(json_response["id"], Value::Null);
+    assert_eq!(json_response["error"]["code"], -32700);
+    assert_eq!(json_response["error"]["message"], "Parse error");
+}
+
+#[test]
 fn test_content_length_headers() {
     let request = json!({
         "jsonrpc": "2.0",
