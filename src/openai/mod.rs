@@ -1,8 +1,8 @@
-//! OpenAI API client modules.
+//! `OpenAI` API client modules.
 //!
-//! This module provides utilities for interacting with OpenAI's APIs:
+//! This module provides utilities for interacting with `OpenAI`'s APIs:
 //!
-//! - [`file_ext`]: File extension validation for uploads and CodeQuery indexing
+//! - [`file_ext`]: File extension validation for uploads and `CodeQuery` indexing
 //! - [`hash`]: SHA256 hashing utilities for content change detection
 //! - [`types`]: API type definitions (responses, configuration, metadata)
 

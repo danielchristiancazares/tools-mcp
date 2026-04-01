@@ -88,7 +88,7 @@ define_mcp_tool! {
                 "type": "integer",
                 "description": "Timeout in milliseconds (default: 60000, max: 300000)",
                 "minimum": 100,
-                "maximum": 300000
+                "maximum": 300_000
             }
         },
         "required": ["command"],

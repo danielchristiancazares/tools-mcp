@@ -473,7 +473,7 @@ async fn configure_stealth(page: &Page) -> Result<()> {
 
     // Inject JavaScript patches to mask headless browser indicators.
     // These run before any page JavaScript executes.
-    let stealth_script = r#"
+    let stealth_script = r"
         // Override navigator.webdriver - headless browsers set this to true
         Object.defineProperty(navigator, 'webdriver', {
             get: () => false
@@ -488,7 +488,7 @@ async fn configure_stealth(page: &Page) -> Result<()> {
         Object.defineProperty(navigator, 'languages', {
             get: () => ['en-US', 'en']
         });
-    "#;
+    ";
 
     page.evaluate(stealth_script)
         .await
@@ -664,7 +664,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Requires Chrome/Chromium installation
+    #[ignore = "requires Chrome/Chromium installation"]
     async fn test_browser_pool_creation() {
         let pool = BrowserPool::new();
         assert!(
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Chrome/Chromium installation
+    #[ignore = "requires Chrome/Chromium installation"]
     async fn test_chrome_detection() {
         let is_available = BrowserPool::is_available().await;
         println!("Chrome available: {}", is_available);
@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Chrome/Chromium installation and network
+    #[ignore = "requires Chrome/Chromium installation and network"]
     async fn test_render_simple_page() {
         if !BrowserPool::is_available().await {
             println!("Skipping test - Chrome not available");

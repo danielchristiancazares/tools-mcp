@@ -1,25 +1,25 @@
-//! OpenAI API type definitions.
+//! `OpenAI` API type definitions.
 //!
-//! This module contains all the public types used for OpenAI API interactions,
+//! This module contains all the public types used for `OpenAI` API interactions,
 //! including response structures, configuration, and file metadata.
 
 use serde::{Deserialize, Serialize};
 
-/// Represents a complete response from OpenAI's Responses API.
+/// Represents a complete response from `OpenAI`'s Responses API.
 ///
 /// This struct captures the full response payload from a Responses API call,
 /// including the generated output, status information, and optional error/usage data.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ResponseObject {
-    /// Unique identifier for this response (e.g., "resp_abc123").
+    /// Unique identifier for this response (e.g., `"resp_abc123"`).
     pub id: String,
-    /// Object type, always "response" for Responses API.
+    /// Object type, always `"response"` for the Responses API.
     pub object: String,
     /// Unix timestamp (seconds) when the response was created.
     pub created_at: i64,
     /// Current status: "completed", "failed", "in_progress", etc.
     pub status: String,
-    /// Model used to generate the response (e.g., "gpt-4o").
+    /// Model used to generate the response (e.g., `"gpt-4o"`).
     pub model: String,
     /// List of output items produced by the model.
     pub output: Vec<OutputItem>,
@@ -60,7 +60,7 @@ pub struct MessageOutput {
     pub content: Vec<ContentItem>,
 }
 
-/// Output from a file_search tool invocation.
+/// Output from a `file_search` tool invocation.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FileSearchOutput {
     /// Unique identifier for this tool call.
@@ -78,7 +78,7 @@ pub struct FileSearchOutput {
 /// A content block within a message output.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ContentItem {
-    /// The type of content: "output_text", "refusal", etc.
+    /// The type of content: `"output_text"`, `"refusal"`, etc.
     #[serde(rename = "type")]
     pub content_type: String,
     /// The text content (present for "output_text" type).

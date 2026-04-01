@@ -42,7 +42,7 @@ pub async fn compute_file_hash(path: &str) -> Result<String> {
 
     let mut file = File::open(path)
         .await
-        .with_context(|| format!("Failed to open file: {}", path))?;
+        .with_context(|| format!("Failed to open file: {path}"))?;
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 8192];
@@ -82,7 +82,7 @@ pub(crate) async fn looks_binary_by_content(path: &str) -> Result<bool> {
 
     let mut file = File::open(path)
         .await
-        .with_context(|| format!("Failed to open file: {}", path))?;
+        .with_context(|| format!("Failed to open file: {path}"))?;
 
     let mut buf = vec![0u8; 8192];
     let n = file.read(&mut buf).await?;
@@ -110,6 +110,7 @@ pub(crate) async fn looks_binary_by_content(path: &str) -> Result<bool> {
 /// let hash = compute_bytes_hash(b"hello world");
 /// assert_eq!(hash.len(), 64);  // SHA256 produces 64 hex chars
 /// ```
+#[must_use]
 pub fn compute_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

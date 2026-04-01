@@ -14,9 +14,11 @@ fn setup() {
             .args(["build", "--release"])
             .output()
             .expect("Failed to build project");
-        if !output.status.success() {
-            panic!("Build failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
+        assert!(
+            output.status.success(),
+            "Build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     });
 }
 

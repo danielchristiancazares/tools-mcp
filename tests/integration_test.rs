@@ -13,9 +13,11 @@ fn setup() {
             .output()
             .expect("Failed to build project");
 
-        if !output.status.success() {
-            panic!("Build failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
+        assert!(
+            output.status.success(),
+            "Build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     });
 }
 
@@ -871,7 +873,7 @@ mod api_tests {
     }
 
     #[test]
-    #[ignore] // Ignore by default since it requires API key
+    #[ignore = "requires OPENAI_API_KEY"]
     fn test_create_store_tool() {
         if skip_if_no_api_key() {
             return;
@@ -903,7 +905,7 @@ mod api_tests {
     }
 
     #[test]
-    #[ignore] // Ignore by default since it requires API key
+    #[ignore = "requires OPENAI_API_KEY"]
     fn test_list_stores_tool() {
         if skip_if_no_api_key() {
             return;
@@ -931,7 +933,7 @@ mod api_tests {
     }
 
     #[test]
-    #[ignore] // Requires OpenAI API
+    #[ignore = "requires OPENAI_API_KEY"]
     fn test_code_query_without_reindex() {
         if skip_if_no_api_key() {
             return;

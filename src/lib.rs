@@ -1,17 +1,17 @@
 //! # OpenAI Vector Store API Client Library
 //!
-//! This library provides a comprehensive Rust client for interacting with OpenAI's Vector Stores
+//! This library provides a comprehensive Rust client for interacting with `OpenAI`'s Vector Stores
 //! API, enabling file uploads, vector store management, semantic search, and intelligent file
 //! reindexing capabilities.
 //!
 //! ## Overview
 //!
-//! The library wraps OpenAI's Assistants v2 API to provide:
+//! The library wraps `OpenAI`'s Assistants v2 API to provide:
 //!
-//! - **File Upload**: Upload local files or URLs to OpenAI's file storage with automatic format
+//! - **File Upload**: Upload local files or URLs to `OpenAI`'s file storage with automatic format
 //!   validation and extension handling
 //! - **Vector Store Management**: Create, list, and query vector stores for semantic search
-//! - **Semantic Search**: Execute natural language queries against indexed files using OpenAI's
+//! - **Semantic Search**: Execute natural language queries against indexed files using `OpenAI`'s
 //!   Responses API with file search tools
 //! - **Intelligent Reindexing**: Hash-based file synchronization that detects changes, moves,
 //!   and deletions to minimize API calls
@@ -37,14 +37,14 @@
 //!
 //! ## Main Components
 //!
-//! - [`ApiConfig`]: Configuration container for OpenAI API authentication and default model
-//! - [`ResponseObject`]: Type-safe representation of OpenAI Responses API output
+//! - [`ApiConfig`]: Configuration container for `OpenAI` API authentication and default model
+//! - [`ResponseObject`]: Type-safe representation of `OpenAI` Responses API output
 //! - [`VectorStoreDetails`]: Vector store metadata including file processing status
 //! - [`FileInfo`]: File metadata including attributes for hash-based tracking
 //!
 //! ## File Format Support
 //!
-//! The library automatically validates and converts file formats for OpenAI compatibility:
+//! The library automatically validates and converts file formats for `OpenAI` compatibility:
 //!
 //! **Supported extensions** (passed through unchanged):
 //! `c`, `cpp`, `css`, `csv`, `doc`, `docx`, `gif`, `go`, `html`, `java`, `jpeg`, `jpg`,
@@ -191,7 +191,7 @@
 //!
 //! ## Environment Requirements
 //!
-//! - **OPENAI_API_KEY**: Required environment variable for authentication
+//! - **`OPENAI_API_KEY`**: Required environment variable for authentication
 //! - **Network**: HTTPS access to `api.openai.com`
 //!
 //! ## Thread Safety

@@ -122,19 +122,21 @@ pub fn strip_ansi_codes(s: &str) -> String {
                             // BEL (bell character) terminates OSC
                             chars.next();
                             break;
-                        } else if ch == '\x1b' {
+                        }
+
+                        if ch == '\x1b' {
                             // Check for ST (String Terminator): ESC followed by backslash
                             chars.next();
                             if chars.peek() == Some(&'\\') {
                                 chars.next();
                             }
                             break;
-                        } else {
-                            chars.next();
                         }
+
+                        chars.next();
                     }
                 }
-                Some('(') | Some(')') => {
+                Some('(' | ')') => {
                     // Character set designation: ESC ( G or ESC ) G
                     // Two bytes follow ESC: the designator type and character set
                     chars.next(); // consume '(' or ')'
