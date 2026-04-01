@@ -256,7 +256,23 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     while let Some(entry) = entries.next_entry().await? {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let file_type = entry.file_type().await?;
+
+        // Avoid following symlinked directories during recursive copy.
+        // Following links can cause unbounded recursion (e.g., a symlink
+        // pointing back to an ancestor) or unintentionally copy data outside
+        // the source subtree.
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to recurse through symlink while copying directory: {}",
+                    src_path.display()
+                ),
+            ));
+        }
+
+        if file_type.is_dir() {
             Box::pin(copy_dir_recursive(&src_path, &dst_path)).await?;
         } else {
             tokio::fs::copy(&src_path, &dst_path).await?;
@@ -325,6 +341,38 @@ mod tests {
         let msg = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(msg.contains("destination"));
         assert!(msg.contains("inside source"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_rejects_symlink_inside_recursive_directory_copy() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let nested = src.join("nested");
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("create nested");
+        tokio::fs::write(src.join("file.txt"), "hello")
+            .await
+            .expect("write");
+
+        // Create loop: src/nested/back -> src
+        unix_fs::symlink(&src, nested.join("back")).expect("symlink");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string(),
+            "recursive": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("symlink"));
     }
 }
 
