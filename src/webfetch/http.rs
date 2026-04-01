@@ -591,6 +591,17 @@ mod tests {
     }
 
     #[test]
+    fn robots_match_path_includes_query_string() {
+        let parsed = Url::parse("https://example.com/docs/page?print=1&lang=en").expect("url");
+        assert_eq!(robots_match_path(&parsed), "/docs/page?print=1&lang=en");
+    }
+
+    #[test]
+    fn robots_match_path_without_query_is_path_only() {
+        let parsed = Url::parse("https://example.com/docs/page").expect("url");
+        assert_eq!(robots_match_path(&parsed), "/docs/page");
+      
+    #[test]  
     fn robots_match_path_includes_query() {
         let parsed = Url::parse("https://example.com/search?q=secret").expect("valid URL");
         assert_eq!(robots_match_path(&parsed), "/search?q=secret");
