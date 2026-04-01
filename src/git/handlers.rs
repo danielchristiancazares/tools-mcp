@@ -200,8 +200,7 @@ fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<()
         let key = diff_manifest_key(&path, old_path.as_deref());
         let Some(entry_pos) = entry_index.remove(&key) else {
             return Err(format!(
-                "git diff --numstat returned a path not present in --name-status: {}",
-                path
+                "git diff --numstat returned a path not present in --name-status: {path}"
             ));
         };
         let entry = &mut entries[entry_pos];
@@ -231,7 +230,7 @@ async fn collect_ref_diff_manifest(
     name_status_args.push("--name-status".into());
     name_status_args.push("-z".into());
     let name_status_exec = run_git(
-        working_dir.map(|s| s.to_string()),
+        working_dir.map(std::string::ToString::to_string),
         name_status_args,
         timeout_ms,
         MAX_OUTPUT_BYTES,
@@ -252,7 +251,7 @@ async fn collect_ref_diff_manifest(
     numstat_args.push("--numstat".into());
     numstat_args.push("-z".into());
     let numstat_exec = run_git(
-        working_dir.map(|s| s.to_string()),
+        working_dir.map(std::string::ToString::to_string),
         numstat_args,
         timeout_ms,
         MAX_OUTPUT_BYTES,
@@ -311,7 +310,7 @@ async fn write_patches_to_dir(
         }
         patch_args.push(entry.path.clone());
         let patch_exec = run_git(
-            working_dir.map(|s| s.to_string()),
+            working_dir.map(std::string::ToString::to_string),
             patch_args,
             timeout_ms,
             MAX_OUTPUT_BYTES,
@@ -501,8 +500,7 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
             Ok(summary) => {
                 let files_changed = summary["summary"]["files_changed"].as_u64().unwrap_or(0);
                 let text = format!(
-                    "Diff between {} and {}: {} files changed. Patches written to {}",
-                    from_ref, to_ref, files_changed, output_dir
+                    "Diff between {from_ref} and {to_ref}: {files_changed} files changed. Patches written to {output_dir}"
                 );
                 let mut response = serde_json::Map::new();
                 response.insert(
@@ -1188,8 +1186,7 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
         }
         _ => {
             return ToolCallOutcome::err(format!(
-                "unknown stash action '{}'. Valid: push, pop, apply, drop, list, show, clear",
-                action
+                "unknown stash action '{action}'. Valid: push, pop, apply, drop, list, show, clear"
             ));
         }
     }

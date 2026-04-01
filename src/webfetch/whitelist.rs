@@ -127,10 +127,10 @@ pub fn is_whitelisted_js_heavy(url: &str) -> bool {
     for pattern in JS_HEAVY_DOMAINS {
         if let Some(suffix) = pattern.strip_prefix("*.") {
             // Wildcard: *.vercel.app matches foo.vercel.app but NOT vercel.app
-            if host != suffix && host.ends_with(&format!(".{}", suffix)) {
+            if host != suffix && host.ends_with(&format!(".{suffix}")) {
                 return true;
             }
-        } else if host == *pattern || host.ends_with(&format!(".{}", pattern)) {
+        } else if host == *pattern || host.ends_with(&format!(".{pattern}")) {
             // Exact or subdomain: medium.com matches medium.com AND blog.medium.com
             return true;
         }

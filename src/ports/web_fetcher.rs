@@ -1,9 +1,9 @@
-//! Outbound port: fetch remote documents for WebFetch.
+//! Outbound port: fetch remote documents for `WebFetch`.
 
 use anyhow::Result;
 use std::pin::Pin;
 
-/// Fetches a URL and returns the structured WebFetch response (HTTP and/or browser pipeline).
+/// Fetches a URL and returns the structured `WebFetch` response (HTTP and/or browser pipeline).
 pub trait WebFetcher: Send + Sync {
     fn fetch<'a>(
         &'a self,

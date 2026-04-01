@@ -1,10 +1,10 @@
 //! # Vector Store ID Cache
 //!
-//! Persistent disk cache for mapping vector store names to OpenAI IDs.
+//! Persistent disk cache for mapping vector store names to `OpenAI` IDs.
 //!
 //! ## Purpose
 //!
-//! OpenAI vector stores are identified by opaque IDs (e.g., `vs_abc123def456`), but
+//! `OpenAI` vector stores are identified by opaque IDs (e.g., `vs_abc123def456`), but
 //! users typically reference them by human-readable names. This cache avoids repeated
 //! API calls to resolve names to IDs by persisting the mapping to disk.
 //!
@@ -33,7 +33,7 @@
 //! - Missing `HOME` env var: Cache operations become no-ops
 //! - Write failures: Logged but do not fail the calling operation
 //!
-//! This ensures cache issues never block the primary CodeQuery workflow.
+//! This ensures cache issues never block the primary `CodeQuery` workflow.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -44,7 +44,7 @@ use tracing::warn;
 
 /// In-memory cache of the store-name -> store-id mapping.
 ///
-/// This avoids reading/parsing `stores.json` on every CodeQuery invocation in long-running
+/// This avoids reading/parsing `stores.json` on every `CodeQuery` invocation in long-running
 /// MCP server processes. Disk persistence is still performed on updates via
 /// [`write_store_cache`].
 static STORE_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
@@ -64,7 +64,7 @@ fn store_cache() -> &'static RwLock<HashMap<String, String>> {
 ///
 /// # Returns
 ///
-/// - `Some(id)` - The cached OpenAI vector store ID
+/// - `Some(id)` - The cached `OpenAI` vector store ID
 /// - `None` - Cache miss, or cache could not be read
 ///
 /// # Performance
@@ -98,7 +98,7 @@ pub fn load_store_id_from_cache(name: &str) -> Option<String> {
 /// # Arguments
 ///
 /// * `name` - The human-readable vector store name
-/// * `id` - The OpenAI vector store ID (e.g., `vs_abc123def456`)
+/// * `id` - The `OpenAI` vector store ID (e.g., `vs_abc123def456`)
 ///
 /// # Error Handling
 ///
@@ -125,11 +125,7 @@ pub fn cache_store_id(name: &str, id: &str) {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if cache
-            .get(name)
-            .map(|existing| existing == id)
-            .unwrap_or(false)
-        {
+        if cache.get(name).is_some_and(|existing| existing == id) {
             return;
         }
 
@@ -149,7 +145,7 @@ pub fn cache_store_id(name: &str, id: &str) {
 ///
 /// # Returns
 ///
-/// A `HashMap` mapping store names to OpenAI IDs. Empty if cache cannot be read.
+/// A `HashMap` mapping store names to `OpenAI` IDs. Empty if cache cannot be read.
 fn load_store_cache() -> HashMap<String, String> {
     let Some(path) = stores_cache_path() else {
         return HashMap::new();

@@ -744,7 +744,7 @@ fn test_protocol_aliases() {
         });
 
         let response =
-            send_mcp_message(request).unwrap_or_else(|_| panic!("Failed with alias: {}", method));
+            send_mcp_message(request).unwrap_or_else(|_| panic!("Failed with alias: {method}"));
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response["result"].is_object() || response["error"].is_object());
     }
@@ -987,8 +987,7 @@ mod api_tests {
         assert!(
             query_response["result"]["content"][0]["text"]
                 .as_str()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false),
+                .is_some_and(|s| !s.is_empty()),
             "CodeQuery response text should not be empty"
         );
     }
@@ -1009,7 +1008,7 @@ mod stress_tests {
             });
 
             let response =
-                send_mcp_message(request).unwrap_or_else(|_| panic!("Failed request {}", i));
+                send_mcp_message(request).unwrap_or_else(|_| panic!("Failed request {i}"));
             assert_eq!(response["id"], 100 + i);
             assert_eq!(
                 response["result"]["content"][0]["text"].as_str(),

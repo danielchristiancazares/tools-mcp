@@ -159,7 +159,7 @@ fn extract_language(document: &Html) -> Option<String> {
         .root_element()
         .value()
         .attr("lang")
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .filter(|s| !s.is_empty())
         .or_else(|| {
             // Fall back to meta http-equiv tag
@@ -249,11 +249,10 @@ fn extract_from_html(bytes: &[u8], _source_url: &str) -> Result<ExtractedDocumen
 
     // Extract just the <body> content to avoid head/script/style noise
     let body_html: Cow<'_, str> = if let Ok(body_selector) = Selector::parse("body") {
-        document
-            .select(&body_selector)
-            .next()
-            .map(|body| Cow::Owned(body.inner_html()))
-            .unwrap_or_else(|| Cow::Borrowed(html_source.as_ref()))
+        document.select(&body_selector).next().map_or_else(
+            || Cow::Borrowed(html_source.as_ref()),
+            |body| Cow::Owned(body.inner_html()),
+        )
     } else {
         Cow::Borrowed(html_source.as_ref())
     };

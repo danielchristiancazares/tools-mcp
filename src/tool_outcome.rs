@@ -94,7 +94,7 @@ impl ToolCallOutcome {
         } else {
             serde_json::to_string(&json_value)
         }
-        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
         ToolCallOutcome(serde_json::json!({
             "content": [{"type": "text", "text": json_text}],
             "isError": is_error

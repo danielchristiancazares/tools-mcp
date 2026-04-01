@@ -1,7 +1,7 @@
 //! Process-wide default service instances (composition-owned adapters).
 //!
 //! Keeps tool handlers free of global singletons while preserving the previous behavior of
-//! using the default WebFetch pipeline everywhere.
+//! using the default `WebFetch` pipeline everywhere.
 
 use std::sync::{Arc, OnceLock};
 
@@ -10,7 +10,7 @@ use crate::ports::WebFetcher;
 
 static DEFAULT_WEB_FETCHER: OnceLock<Arc<dyn WebFetcher>> = OnceLock::new();
 
-/// Shared default WebFetch adapter (wraps [`crate::webfetch::run_fetch`]).
+/// Shared default `WebFetch` adapter (wraps [`crate::webfetch::run_fetch`]).
 pub fn default_web_fetcher() -> Arc<dyn WebFetcher> {
     DEFAULT_WEB_FETCHER
         .get_or_init(|| {

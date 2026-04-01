@@ -1,4 +1,4 @@
-//! File operation tools: Move, Copy, ListDir.
+//! File operation tools: Move, Copy, `ListDir`.
 
 use crate::define_mcp_tool;
 use crate::tool_outcome::ToolCallOutcome;
@@ -571,12 +571,14 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         }
 
         let file_type = entry.file_type().await.ok();
-        let is_dir = file_type.as_ref().is_some_and(|ft| ft.is_dir());
-        let is_symlink = file_type.as_ref().is_some_and(|ft| ft.is_symlink());
+        let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
+        let is_symlink = file_type
+            .as_ref()
+            .is_some_and(std::fs::FileType::is_symlink);
 
         if long_format {
             let metadata = entry.metadata().await.ok();
-            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
             let modified = metadata
                 .as_ref()
                 .and_then(|m| m.modified().ok())
@@ -594,7 +596,7 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
                 '-'
             };
 
-            lines.push(format!("{} {:>10} {}", type_char, size, name));
+            lines.push(format!("{type_char} {size:>10} {name}"));
 
             items.push(json!({
                 "name": name,
@@ -610,7 +612,7 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             } else {
                 ""
             };
-            lines.push(format!("{}{}", name, suffix));
+            lines.push(format!("{name}{suffix}"));
             items.push(json!({
                 "name": name,
                 "type": if is_symlink { "symlink" } else if is_dir { "dir" } else { "file" },

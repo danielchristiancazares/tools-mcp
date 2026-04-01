@@ -106,11 +106,10 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
         "namespace_definition" => {
             let name = node
                 .child_by_field_name("name")
-                .map(|n| node_text(n, ctx.source))
-                .unwrap_or("anonymous");
+                .map_or("anonymous", |n| node_text(n, ctx.source));
 
             output.push_str(&indent_str(ctx.indent));
-            output.push_str(&format!("namespace {} {{\n", name));
+            output.push_str(&format!("namespace {name} {{\n"));
 
             ctx.indent += 1;
             if let Some(body) = node.child_by_field_name("body") {
@@ -122,7 +121,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             ctx.indent -= 1;
 
             output.push_str(&indent_str(ctx.indent));
-            output.push_str(&format!("}} // namespace {}\n\n", name));
+            output.push_str(&format!("}} // namespace {name}\n\n"));
         }
 
         "class_specifier" | "struct_specifier" => {
@@ -133,8 +132,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             };
             let name = node
                 .child_by_field_name("name")
-                .map(|n| node_text(n, ctx.source))
-                .unwrap_or("anonymous");
+                .map_or("anonymous", |n| node_text(n, ctx.source));
 
             let mut base_clause = String::new();
             let mut cursor = node.walk();
@@ -152,7 +150,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             }
 
             output.push_str(&indent_str(ctx.indent));
-            output.push_str(&format!("{} {}{} {{\n", keyword, name, base_clause));
+            output.push_str(&format!("{keyword} {name}{base_clause} {{\n"));
 
             ctx.indent += 1;
 
@@ -168,8 +166,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
         "enum_specifier" => {
             let name = node
                 .child_by_field_name("name")
-                .map(|n| node_text(n, ctx.source))
-                .unwrap_or("");
+                .map_or("", |n| node_text(n, ctx.source));
 
             let text = node_text(node, ctx.source);
             let is_enum_class = text.contains("enum class") || text.contains("enum struct");
@@ -182,9 +179,9 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
 
             output.push_str(&indent_str(ctx.indent));
             if is_enum_class {
-                output.push_str(&format!("enum class {} {{\n", name));
+                output.push_str(&format!("enum class {name} {{\n"));
             } else {
-                output.push_str(&format!("enum {} {{\n", name));
+                output.push_str(&format!("enum {name} {{\n"));
             }
 
             if let Some(body) = node.child_by_field_name("body") {

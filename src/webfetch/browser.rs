@@ -2,7 +2,7 @@
 //!
 //! This module provides a managed Chrome/Chromium browser pool that handles the
 //! complexity of headless browser automation for web scraping. It uses the
-//! Chrome DevTools Protocol (CDP) via the `chromiumoxide` crate.
+//! Chrome `DevTools` Protocol (CDP) via the `chromiumoxide` crate.
 //!
 //! ## Architecture
 //!
@@ -271,8 +271,7 @@ impl BrowserPool {
             Ok(Ok(html)) => Ok(html),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!(
-                "Browser rendering timed out after {:?}",
-                NAVIGATION_TIMEOUT
+                "Browser rendering timed out after {NAVIGATION_TIMEOUT:?}"
             )),
         }
     }
@@ -325,7 +324,7 @@ impl Drop for BrowserPool {
 ///
 /// # Returns
 ///
-/// A `Browser` handle connected via Chrome DevTools Protocol (CDP).
+/// A `Browser` handle connected via Chrome `DevTools` Protocol (CDP).
 ///
 /// # Errors
 ///
@@ -372,7 +371,7 @@ async fn spawn_browser() -> Result<Browser> {
             "--safebrowsing-disable-auto-update".to_string(),
         ])
         .build()
-        .map_err(|e| anyhow!("Failed to build browser config: {}", e))?;
+        .map_err(|e| anyhow!("Failed to build browser config: {e}"))?;
 
     let (browser, mut handler) = Browser::launch(config)
         .await
@@ -677,7 +676,7 @@ mod tests {
     #[ignore = "requires Chrome/Chromium installation"]
     async fn test_chrome_detection() {
         let is_available = BrowserPool::is_available().await;
-        println!("Chrome available: {}", is_available);
+        println!("Chrome available: {is_available}");
         // Don't assert - this depends on system configuration
     }
 
@@ -701,7 +700,7 @@ mod tests {
                 assert!(html.len() > 100, "Should have substantial HTML content");
             }
             Err(e) => {
-                println!("Render failed (might be network issue): {}", e);
+                println!("Render failed (might be network issue): {e}");
             }
         }
     }

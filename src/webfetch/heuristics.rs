@@ -372,14 +372,14 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
         found_frameworks.push("Svelte");
     }
 
-    if !found_frameworks.is_empty() {
+    if found_frameworks.is_empty() {
+        false
+    } else {
         result.add_indicator(
             0.1,
             format!("Framework detected: {}", found_frameworks.join(", ")),
         );
         true
-    } else {
-        false
     }
 }
 

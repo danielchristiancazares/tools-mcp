@@ -276,7 +276,7 @@ where
 
     // Write Content-Length header unless in raw JSON mode
     if !skip_headers {
-        let header = format!("Content-Length: {}\r\n\r\n", payload_len);
+        let header = format!("Content-Length: {payload_len}\r\n\r\n");
         writer
             .write_all(header.as_bytes())
             .await

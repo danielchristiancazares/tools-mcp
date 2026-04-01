@@ -1,10 +1,10 @@
-//! MCP WebFetch tool handler (application layer); delegates to [`crate::ports::WebFetcher`].
+//! MCP `WebFetch` tool handler (application layer); delegates to [`crate::ports::WebFetcher`].
 
 use crate::services::default_web_fetcher;
 use crate::tool_outcome::ToolCallOutcome;
 use crate::webfetch::FetchRequest;
 
-/// MCP tool handler for WebFetch
+/// MCP tool handler for `WebFetch`
 pub async fn handle_webfetch(
     _id: Option<serde_json::Value>,
     args: serde_json::Value,
@@ -20,14 +20,14 @@ pub async fn handle_webfetch(
     match default_web_fetcher().fetch(request).await {
         Ok(response) => {
             let json_text = serde_json::to_string(&response)
-                .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+                .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
             ToolCallOutcome::ok(serde_json::json!({
                 "content": [{"type": "text", "text": json_text}],
                 "isError": false
             }))
         }
         Err(e) => {
-            let details_full = format!("{:#}", e);
+            let details_full = format!("{e:#}");
             let (message, error_type, remediation) =
                 classify_webfetch_error(&details_full, force_browser);
 

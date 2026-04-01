@@ -1,16 +1,16 @@
-//! File extension validation and classification for OpenAI operations.
+//! File extension validation and classification for `OpenAI` operations.
 //!
 //! This module provides functions to determine:
-//! - Which file extensions are allowed for upload to OpenAI
+//! - Which file extensions are allowed for upload to `OpenAI`
 //! - Which extensions indicate binary content (unsuitable for code search)
-//! - Which extensions indicate source code (suitable for CodeQuery indexing)
+//! - Which extensions indicate source code (suitable for `CodeQuery` indexing)
 
 use std::borrow::Cow;
 use std::path::Path;
 
-/// Checks if a file extension is allowed for direct upload to OpenAI.
+/// Checks if a file extension is allowed for direct upload to `OpenAI`.
 ///
-/// OpenAI's Files API only accepts specific file formats. The check is case-insensitive.
+/// `OpenAI`'s Files API only accepts specific file formats. The check is case-insensitive.
 ///
 /// # Allowed Extensions
 ///
@@ -55,7 +55,7 @@ pub fn is_allowed_upload_ext(ext: &str) -> bool {
     )
 }
 
-/// Checks if a file extension indicates binary content unsuitable for CodeQuery indexing.
+/// Checks if a file extension indicates binary content unsuitable for `CodeQuery` indexing.
 ///
 /// # Categories Blocked
 ///
@@ -86,7 +86,7 @@ pub fn is_codequery_binary_ext(ext: &str) -> bool {
     )
 }
 
-/// Checks if a file extension indicates source code suitable for CodeQuery indexing.
+/// Checks if a file extension indicates source code suitable for `CodeQuery` indexing.
 ///
 /// # Supported Languages
 ///
@@ -114,16 +114,16 @@ pub fn is_codequery_indexable_ext(ext: &str) -> bool {
     )
 }
 
-/// Checks if a filename (without extension) should be indexed by CodeQuery.
+/// Checks if a filename (without extension) should be indexed by `CodeQuery`.
 ///
-/// Currently always returns `false` - CodeQuery only indexes files with explicit code extensions.
+/// Currently always returns `false` - `CodeQuery` only indexes files with explicit code extensions.
 #[inline]
 #[must_use]
 pub fn is_codequery_indexable_filename(_file_name: &str) -> bool {
     false
 }
 
-/// Determines if a file path should be indexed by CodeQuery.
+/// Determines if a file path should be indexed by `CodeQuery`.
 ///
 /// Applies multiple rules:
 /// 1. Dotfiles excluded (files starting with `.`)
@@ -164,7 +164,7 @@ pub fn is_codequery_indexable_path(path: &Path) -> bool {
     is_codequery_indexable_ext(ext)
 }
 
-/// Computes the filename to use for OpenAI upload, converting unsupported extensions to `.txt`.
+/// Computes the filename to use for `OpenAI` upload, converting unsupported extensions to `.txt`.
 ///
 /// If the file's extension is not in the allowed list, the filename is modified to use `.txt`.
 #[must_use]

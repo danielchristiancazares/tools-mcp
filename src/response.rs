@@ -98,6 +98,7 @@ impl RpcResponse<'static> {
     /// ```ignore
     /// RpcResponse::ok(Some(json!(1)), json!({"status": "ready"}))
     /// ```
+    #[must_use]
     pub fn ok(id: Option<Value>, result: Value) -> RpcResponse<'static> {
         RpcResponse {
             jsonrpc: "2.0",
@@ -240,7 +241,7 @@ impl RpcResponse<'static> {
         } else {
             serde_json::to_string(&json_value)
         }
-        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
         RpcResponse::ok(
             id,
             serde_json::json!({

@@ -5,7 +5,7 @@
 //!
 //! ## Tokenizer
 //!
-//! Uses OpenAI's `cl100k_base` tokenizer via the `tiktoken-rs` crate. This is the
+//! Uses `OpenAI`'s `cl100k_base` tokenizer via the `tiktoken-rs` crate. This is the
 //! tokenizer used by GPT-4 and GPT-3.5-turbo, ensuring accurate token counts for
 //! those models.
 //!
@@ -48,7 +48,7 @@ fn get_encoder() -> Result<&'static CoreBPE> {
     CL100K_BASE
         .get_or_init(|| cl100k_base().map_err(|e| e.to_string()))
         .as_ref()
-        .map_err(|msg| anyhow::anyhow!("failed to init cl100k_base tokenizer: {}", msg))
+        .map_err(|msg| anyhow::anyhow!("failed to init cl100k_base tokenizer: {msg}"))
 }
 
 /// Splits Markdown content into token-budgeted chunks with heading context.
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn chunk_markdown_respects_heading_boundaries() {
-        let md = r#"
+        let md = r"
 Intro line
 
 # Title
@@ -297,7 +297,7 @@ Body line 1
 
 ## Sub
 Body line 2
-"#;
+";
 
         let chunks = chunk_markdown(md, Some(10_000)).expect("chunking failed");
         assert!(
@@ -453,7 +453,7 @@ Body line 2
         ];
 
         for url in urls {
-            eprintln!("\n\n========== TESTING: {} ==========", url);
+            eprintln!("\n\n========== TESTING: {url} ==========");
             test_url(url).await;
         }
     }
@@ -470,7 +470,7 @@ Body line 2
             .await
             .expect("fetch failed");
 
-        eprintln!("\n=== FETCHED: {} ===", url);
+        eprintln!("\n=== FETCHED: {url} ===");
         eprintln!(
             "Chunks: {}, Method: {}",
             response.chunks.len(),
@@ -486,16 +486,7 @@ Body line 2
             }
         }
 
-        if !broken.is_empty() {
-            eprintln!("\n=== BROKEN CHUNKS ({}) ===", broken.len());
-            for (i, count, heading, text) in &broken {
-                eprintln!(
-                    "\n--- Chunk {} (heading: {:?}, {} backticks) ---",
-                    i, heading, count
-                );
-                eprintln!("{}", &text[..text.len().min(300)]);
-            }
-        } else {
+        if broken.is_empty() {
             eprintln!("\nNo broken chunks found.");
             // Show some chunks anyway
             for (i, chunk) in response.chunks.iter().take(5).enumerate() {
@@ -505,6 +496,12 @@ Body line 2
                     chunk.heading,
                     &chunk.text[..chunk.text.len().min(200)]
                 );
+            }
+        } else {
+            eprintln!("\n=== BROKEN CHUNKS ({}) ===", broken.len());
+            for (i, count, heading, text) in &broken {
+                eprintln!("\n--- Chunk {i} (heading: {heading:?}, {count} backticks) ---");
+                eprintln!("{}", &text[..text.len().min(300)]);
             }
         }
     }

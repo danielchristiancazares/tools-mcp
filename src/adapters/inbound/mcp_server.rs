@@ -145,8 +145,7 @@ pub async fn dispatch_jsonrpc_request(
                     req.id,
                     -32601,
                     format!(
-                        "Unknown tool: {}. Call mcp/tools/list to see available tool names.",
-                        name
+                        "Unknown tool: {name}. Call mcp/tools/list to see available tool names."
                     ),
                 )
             };

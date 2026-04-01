@@ -75,7 +75,7 @@ pub async fn compute_file_hash(path: &str) -> Result<String> {
 /// # Design
 ///
 /// Intentionally conservative: errs on the side of classifying files as binary
-/// to avoid uploading inappropriate content to CodeQuery.
+/// to avoid uploading inappropriate content to `CodeQuery`.
 pub(crate) async fn looks_binary_by_content(path: &str) -> Result<bool> {
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;

@@ -112,7 +112,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Edit request - just path, old_snippet, new_snippet.
+/// Edit request - just path, `old_snippet`, `new_snippet`.
 #[derive(Deserialize)]
 struct SimpleEditRequest {
     path: String,
@@ -122,7 +122,7 @@ struct SimpleEditRequest {
     match_hint: Option<MatchHint>,
 }
 
-/// Simplified edit handler - replaces old_snippet with new_snippet in a file.
+/// Simplified edit handler - replaces `old_snippet` with `new_snippet` in a file.
 ///
 /// This is the streamlined interface for the Edit tool. No action field needed.
 pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
@@ -237,7 +237,7 @@ struct SnippetResult {
     payload: Value,
 }
 
-/// Test helper: wraps apply_snippet_edit_impl and returns the JSON payload.
+/// Test helper: wraps `apply_snippet_edit_impl` and returns the JSON payload.
 #[cfg(test)]
 fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value> {
     let result = apply_snippet_edit_impl(req)?;
@@ -255,7 +255,7 @@ fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value> {
 /// 6. Writes the modified content back to disk
 ///
 /// Returns a [`SnippetResult`] with status and metadata, allowing
-/// callers to handle partial success (no_match, stale_file) gracefully.
+/// callers to handle partial success (`no_match`, `stale_file`) gracefully.
 fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResult> {
     if req.old_snippet.is_empty() {
         return Err(anyhow!("old_snippet must not be empty"));
@@ -338,13 +338,11 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
     let start_line = model
         .canonical
         .line_index_for_offset(canonical_start)
-        .map(|idx| idx + 1)
-        .unwrap_or(1);
+        .map_or(1, |idx| idx + 1);
     let end_line = model
         .canonical
         .line_index_for_offset(canonical_end.saturating_sub(1))
-        .map(|idx| idx + 1)
-        .unwrap_or(start_line);
+        .map_or(start_line, |idx| idx + 1);
 
     Ok(SnippetResult {
         status: SnippetStatusKind::Ok,
@@ -511,7 +509,7 @@ fn canonical_range_for_lines(
     end_line: usize,
 ) -> Result<std::ops::Range<usize>> {
     if start_line == 0 || end_line < start_line {
-        return Err(anyhow!("invalid line range {}-{}", start_line, end_line));
+        return Err(anyhow!("invalid line range {start_line}-{end_line}"));
     }
     if start_line > views.len() || end_line > views.len() {
         return Err(anyhow!("line range exceeds total lines"));

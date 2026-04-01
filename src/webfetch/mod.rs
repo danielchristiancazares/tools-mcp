@@ -1,4 +1,4 @@
-//! # WebFetch Module
+//! # `WebFetch` Module
 //!
 //! A token-aware web content fetcher designed for LLM consumption. This module provides
 //! a complete pipeline for fetching, rendering, extracting, and chunking web content
@@ -6,7 +6,7 @@
 //!
 //! ## Architecture Overview
 //!
-//! The WebFetch pipeline consists of several stages:
+//! The `WebFetch` pipeline consists of several stages:
 //!
 //! ```text
 //! +------------------+     +------------------+     +------------------+
@@ -54,7 +54,7 @@
 //!
 //! ## Token-Aware Chunking
 //!
-//! Content is chunked using OpenAI's `cl100k_base` tokenizer (GPT-4 compatible). Chunks
+//! Content is chunked using `OpenAI`'s `cl100k_base` tokenizer (GPT-4 compatible). Chunks
 //! respect heading boundaries when possible and include token counts for budget management.
 //! Default chunk size is 600 tokens. See [`chunker`] for details.
 //!
@@ -112,7 +112,7 @@ pub use types::{FetchChunk, FetchRequest, FetchResponse};
 /// `tokio::sync::OnceCell`.
 static BROWSER_POOL: OnceCell<Arc<browser::BrowserPool>> = OnceCell::const_new();
 
-/// Main entry point for the WebFetch MCP tool.
+/// Main entry point for the `WebFetch` MCP tool.
 ///
 /// Orchestrates the complete fetch pipeline:
 /// 1. Determines rendering strategy (browser vs HTTP) based on whitelist and request flags
@@ -162,27 +162,26 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
         cache::read_cache(&cache_key).context("read cache")?
     };
 
-    let (body, content_type, fetched_at, cache_hit) = match cached {
-        Some(entry) => (entry.body, entry.content_type, entry.fetched_at, true),
-        None => {
-            let fetched = http::fetch_document(&req)
-                .await
-                .context("fetch remote document")?;
-            // Avoid cloning potentially-large bodies: move into the cache entry, write it,
-            // then destructure the entry to continue processing.
-            let entry = cache::CachedFetch {
-                content_type: fetched.content_type,
-                body: fetched.body,
-                fetched_at: fetched.fetched_at,
-            };
-            maybe_write_cache(&cache_key, &entry, req.no_cache).context("write cache")?;
-            let cache::CachedFetch {
-                body,
-                content_type,
-                fetched_at,
-            } = entry;
-            (body, content_type, fetched_at, false)
-        }
+    let (body, content_type, fetched_at, cache_hit) = if let Some(entry) = cached {
+        (entry.body, entry.content_type, entry.fetched_at, true)
+    } else {
+        let fetched = http::fetch_document(&req)
+            .await
+            .context("fetch remote document")?;
+        // Avoid cloning potentially-large bodies: move into the cache entry, write it,
+        // then destructure the entry to continue processing.
+        let entry = cache::CachedFetch {
+            content_type: fetched.content_type,
+            body: fetched.body,
+            fetched_at: fetched.fetched_at,
+        };
+        maybe_write_cache(&cache_key, &entry, req.no_cache).context("write cache")?;
+        let cache::CachedFetch {
+            body,
+            content_type,
+            fetched_at,
+        } = entry;
+        (body, content_type, fetched_at, false)
     };
 
     // Extract content from HTTP response
@@ -191,7 +190,9 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 
     // Check if content appears JS-heavy (even when HTML came from cache,
     // otherwise a JS-heavy page can get "stuck" returning cached shell HTML forever)
-    let rendering_method = if !req.force_browser {
+    let rendering_method = if req.force_browser {
+        "http"
+    } else {
         let html_str = String::from_utf8_lossy(&body);
         let analysis = heuristics::analyze_js_heavy(
             &html_str,
@@ -219,8 +220,6 @@ pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
         } else {
             "http"
         }
-    } else {
-        "http"
     };
 
     // Build response from HTTP content

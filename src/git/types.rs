@@ -45,7 +45,7 @@ pub struct GitExecResult {
 ///
 /// * `exec` - The Git execution result containing output and metadata
 /// * `text` - The human-readable text to include in the response
-/// * `extra_fields` - Optional HashMap of additional fields to include
+/// * `extra_fields` - Optional `HashMap` of additional fields to include
 ///
 /// # Returns
 ///
