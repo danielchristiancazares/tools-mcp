@@ -165,7 +165,9 @@ fn check_empty_spa_shell(
     }
 
     // Check content-to-HTML ratio
+    #[allow(clippy::cast_precision_loss)]
     let html_len = html_body.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
     let content_len = extracted_markdown.len() as f64;
 
     if html_len > 0.0 {

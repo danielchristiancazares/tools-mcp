@@ -285,7 +285,7 @@ impl BrowserPool {
     ///
     /// Call this before attempting browser rendering to provide graceful
     /// fallback to HTTP-only mode when Chrome is not installed.
-    pub async fn is_available() -> bool {
+    pub fn is_available() -> bool {
         find_chrome_binary().is_some()
     }
 }
@@ -622,26 +622,6 @@ fn find_chrome_binary() -> Option<String> {
         }
     }
 
-    // Try PATH lookup via which (Unix) or where (Windows)
-    fn find_in_path(bin: &str) -> Option<String> {
-        let cmd = if cfg!(target_os = "windows") {
-            "where"
-        } else {
-            "which"
-        };
-        let output = std::process::Command::new(cmd).arg(bin).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let first = stdout.lines().next()?.trim();
-        if first.is_empty() {
-            None
-        } else {
-            Some(first.to_string())
-        }
-    }
-
     for bin in [
         "google-chrome",
         "chrome",
@@ -650,12 +630,31 @@ fn find_chrome_binary() -> Option<String> {
         "msedge",
         "microsoft-edge",
     ] {
-        if let Some(p) = find_in_path(bin) {
+        if let Some(p) = find_binary_in_path(bin) {
             return Some(p);
         }
     }
 
     None
+}
+
+fn find_binary_in_path(bin: &str) -> Option<String> {
+    let cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    let output = std::process::Command::new(cmd).arg(bin).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?.trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -675,7 +674,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Chrome/Chromium installation"]
     async fn test_chrome_detection() {
-        let is_available = BrowserPool::is_available().await;
+        let is_available = BrowserPool::is_available();
         println!("Chrome available: {is_available}");
         // Don't assert - this depends on system configuration
     }
@@ -683,7 +682,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Chrome/Chromium installation and network"]
     async fn test_render_simple_page() {
-        if !BrowserPool::is_available().await {
+        if !BrowserPool::is_available() {
             println!("Skipping test - Chrome not available");
             return;
         }

@@ -293,7 +293,7 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
     }
 
     // Check if browser is available
-    if !browser::BrowserPool::is_available().await {
+    if !browser::BrowserPool::is_available() {
         return Err(anyhow::anyhow!(
             "Chrome/Chromium not installed. Browser rendering disabled."
         ));

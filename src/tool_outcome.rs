@@ -43,8 +43,8 @@ impl ToolCallOutcome {
 
     /// Deserialize tool arguments; on failure returns a tool-level error (same strings as
     /// [`crate::response::RpcResponse::parse`]).
-    pub fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Self> {
-        serde_json::from_value::<T>(args).map_err(|e| {
+    pub fn parse_args<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, Self> {
+        serde_json::from_value::<T>(args.clone()).map_err(|e| {
             let msg = e.to_string();
             let hint = if msg.contains("unknown field") {
                 " Unknown fields are not allowed; check argument names against the tool schema."
@@ -81,7 +81,7 @@ impl ToolCallOutcome {
     }
 
     /// JSON serialized as text content (same behavior as [`crate::response::RpcResponse::ok_json_content`]).
-    pub fn ok_json_content(json_value: Value, is_error: bool) -> Self {
+    pub fn ok_json_content(json_value: &Value, is_error: bool) -> Self {
         static PRETTY_JSON: OnceLock<bool> = OnceLock::new();
         let pretty = *PRETTY_JSON.get_or_init(|| {
             std::env::var("TOOLS_PRETTY_JSON")
@@ -90,9 +90,9 @@ impl ToolCallOutcome {
         });
 
         let json_text = if pretty {
-            serde_json::to_string_pretty(&json_value)
+            serde_json::to_string_pretty(json_value)
         } else {
-            serde_json::to_string(&json_value)
+            serde_json::to_string(json_value)
         }
         .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
         ToolCallOutcome(serde_json::json!({

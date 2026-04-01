@@ -14,7 +14,7 @@ struct WriteRequest {
 }
 
 async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<WriteRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<WriteRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };

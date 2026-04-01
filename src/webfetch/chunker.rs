@@ -198,9 +198,8 @@ fn is_closing_fence_line(trimmed_line: &str) -> bool {
     // Closing fence line may contain surrounding whitespace but no info string/content.
     // We call this only after confirming marker + minimum length.
     let mut chars = trimmed_line.chars();
-    let marker = match chars.next() {
-        Some(c) => c,
-        None => return false,
+    let Some(marker) = chars.next() else {
+        return false;
     };
     let rest = trimmed_line
         .chars()

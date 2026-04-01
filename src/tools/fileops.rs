@@ -22,7 +22,7 @@ struct MoveRequest {
 }
 
 async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<MoveRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<MoveRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -137,7 +137,7 @@ struct CopyRequest {
 }
 
 async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<CopyRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<CopyRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -522,7 +522,7 @@ struct ListDirRequest {
 }
 
 async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<ListDirRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<ListDirRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };

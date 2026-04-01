@@ -240,7 +240,7 @@ fn clean_markdown(html: &str) -> String {
 /// 3. Extract language from `<html lang>` or `<meta>` tag
 /// 4. Extract `<body>` inner HTML (avoids `<head>` content)
 /// 5. Convert body to Markdown with boilerplate removal
-fn extract_from_html(bytes: &[u8], _source_url: &str) -> Result<ExtractedDocument> {
+fn extract_from_html(bytes: &[u8], _source_url: &str) -> ExtractedDocument {
     let html_source = String::from_utf8_lossy(bytes);
     let document = Html::parse_document(html_source.as_ref());
 
@@ -260,24 +260,24 @@ fn extract_from_html(bytes: &[u8], _source_url: &str) -> Result<ExtractedDocumen
     // Convert body HTML to markdown
     let markdown = clean_markdown(body_html.as_ref());
 
-    Ok(ExtractedDocument {
+    ExtractedDocument {
         title,
         language,
         markdown,
-    })
+    }
 }
 
 /// Extracts content from plain text bytes (non-HTML fallback).
 ///
 /// For non-HTML content, we simply convert bytes to UTF-8 (lossy) and
 /// return as-is. No metadata extraction is possible from plain text.
-fn extract_from_text(bytes: &[u8]) -> Result<ExtractedDocument> {
+fn extract_from_text(bytes: &[u8]) -> ExtractedDocument {
     let text = String::from_utf8_lossy(bytes).to_string();
-    Ok(ExtractedDocument {
+    ExtractedDocument {
         title: None,
         language: None,
         markdown: text,
-    })
+    }
 }
 
 // ============================================================================
@@ -314,10 +314,10 @@ pub fn extract(
     source_url: &str,
 ) -> Result<ExtractedDocument> {
     if looks_like_html(content_type, bytes) {
-        extract_from_html(bytes, source_url)
+        Ok(extract_from_html(bytes, source_url))
     } else {
         // Non-HTML content: treat as plain text/Markdown
-        extract_from_text(bytes)
+        Ok(extract_from_text(bytes))
     }
 }
 

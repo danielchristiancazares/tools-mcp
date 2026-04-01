@@ -9,7 +9,7 @@ pub async fn handle_webfetch(
     _id: Option<serde_json::Value>,
     args: serde_json::Value,
 ) -> ToolCallOutcome {
-    let request = match ToolCallOutcome::parse_args::<FetchRequest>(args) {
+    let request = match ToolCallOutcome::parse_args::<FetchRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };

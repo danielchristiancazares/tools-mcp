@@ -54,7 +54,7 @@ fn read_server_response<R: BufRead>(reader: &mut R) -> Result<String, Box<dyn st
 }
 
 /// Helper function to send a message to the MCP server and get response
-fn send_mcp_message(message: Value) -> Result<Value, Box<dyn std::error::Error>> {
+fn send_mcp_message(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
     setup();
 
     let mut child = Command::new("cargo")
@@ -89,7 +89,7 @@ fn send_mcp_message(message: Value) -> Result<Value, Box<dyn std::error::Error>>
 }
 
 /// Helper to send message with Content-Length header
-fn send_mcp_message_with_headers(message: Value) -> Result<Value, Box<dyn std::error::Error>> {
+fn send_mcp_message_with_headers(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
     setup();
 
     let mut child = Command::new("cargo")
@@ -132,7 +132,7 @@ fn test_ping() {
         "params": {}
     });
 
-    let response = send_mcp_message(request).expect("Failed to send ping");
+    let response = send_mcp_message(&request).expect("Failed to send ping");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 1);
@@ -150,7 +150,7 @@ fn test_mcp_initialize() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to initialize");
+    let response = send_mcp_message(&request).expect("Failed to initialize");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 2);
@@ -167,7 +167,7 @@ fn test_tools_list() {
         "params": {}
     });
 
-    let response = send_mcp_message(request).expect("Failed to list tools");
+    let response = send_mcp_message(&request).expect("Failed to list tools");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 3);
@@ -212,7 +212,7 @@ fn test_ping_tool_call() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call ping tool");
+    let response = send_mcp_message(&request).expect("Failed to call ping tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 4);
@@ -239,7 +239,7 @@ fn test_read_file_line_numbers_by_default() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call Read tool");
+    let response = send_mcp_message(&request).expect("Failed to call Read tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 40);
@@ -278,7 +278,7 @@ fn test_read_file_no_line_numbers_when_disabled() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call Read tool");
+    let response = send_mcp_message(&request).expect("Failed to call Read tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 41);
@@ -337,7 +337,7 @@ fn test_search_tool_call_if_ugrep_installed() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call Search tool");
+    let response = send_mcp_message(&request).expect("Failed to call Search tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 41);
@@ -396,7 +396,7 @@ fn test_git_status_tool_call_if_git_installed() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call GitStatus tool");
+    let response = send_mcp_message(&request).expect("Failed to call GitStatus tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 42);
@@ -501,7 +501,7 @@ fn test_git_diff_ref_export_preserves_rename_metadata() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call GitDiff");
+    let response = send_mcp_message(&request).expect("Failed to call GitDiff");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 420);
     assert_eq!(response["result"]["isError"], false);
@@ -528,7 +528,7 @@ fn test_error_handling_unknown_method() {
         "params": {}
     });
 
-    let response = send_mcp_message(request).expect("Failed to send unknown method");
+    let response = send_mcp_message(&request).expect("Failed to send unknown method");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 5);
@@ -601,7 +601,7 @@ fn test_error_handling_unknown_tool() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call unknown tool");
+    let response = send_mcp_message(&request).expect("Failed to call unknown tool");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 6);
@@ -666,7 +666,7 @@ fn test_content_length_headers() {
         "params": {}
     });
 
-    let response = send_mcp_message_with_headers(request).expect("Failed with headers");
+    let response = send_mcp_message_with_headers(&request).expect("Failed with headers");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 7);
@@ -744,7 +744,7 @@ fn test_protocol_aliases() {
         });
 
         let response =
-            send_mcp_message(request).unwrap_or_else(|_| panic!("Failed with alias: {method}"));
+            send_mcp_message(&request).unwrap_or_else(|_| panic!("Failed with alias: {method}"));
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response["result"].is_object() || response["error"].is_object());
     }
@@ -841,7 +841,7 @@ fn test_webfetch_blocks_localhost_ssrf() {
         }
     });
 
-    let response = send_mcp_message(request).expect("Failed to call WebFetch");
+    let response = send_mcp_message(&request).expect("Failed to call WebFetch");
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 31);
@@ -892,7 +892,7 @@ mod api_tests {
             }
         });
 
-        let response = send_mcp_message(request).expect("Failed to create store");
+        let response = send_mcp_message(&request).expect("Failed to create store");
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["result"]["isError"], false);
@@ -921,7 +921,7 @@ mod api_tests {
             }
         });
 
-        let response = send_mcp_message(request).expect("Failed to list stores");
+        let response = send_mcp_message(&request).expect("Failed to list stores");
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["result"]["isError"], false);
@@ -953,7 +953,7 @@ mod api_tests {
         });
 
         let create_response =
-            send_mcp_message(create_request).expect("Failed to create store for CodeQuery test");
+            send_mcp_message(&create_request).expect("Failed to create store for CodeQuery test");
         assert_eq!(create_response["jsonrpc"], "2.0");
         let store_info_text = create_response["result"]["content"][0]["text"]
             .as_str()
@@ -980,7 +980,7 @@ mod api_tests {
         });
 
         let query_response =
-            send_mcp_message(query_request).expect("Failed to call query with API key");
+            send_mcp_message(&query_request).expect("Failed to call query with API key");
         assert_eq!(query_response["jsonrpc"], "2.0");
         assert_eq!(query_response["id"], 61);
         assert_eq!(query_response["result"]["isError"], false);
@@ -1008,7 +1008,7 @@ mod stress_tests {
             });
 
             let response =
-                send_mcp_message(request).unwrap_or_else(|_| panic!("Failed request {i}"));
+                send_mcp_message(&request).unwrap_or_else(|_| panic!("Failed request {i}"));
             assert_eq!(response["id"], 100 + i);
             assert_eq!(
                 response["result"]["content"][0]["text"].as_str(),
@@ -1032,7 +1032,7 @@ mod stress_tests {
             }
         });
 
-        let response = send_mcp_message(request).expect("Failed with large payload");
+        let response = send_mcp_message(&request).expect("Failed with large payload");
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 200);
     }

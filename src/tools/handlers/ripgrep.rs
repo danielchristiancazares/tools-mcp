@@ -110,7 +110,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         fuzzy: Option<u8>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<RgRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<RgRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };

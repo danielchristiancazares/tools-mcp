@@ -24,7 +24,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         show_line_numbers: Option<bool>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<ReadRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<ReadRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };

@@ -203,6 +203,7 @@ pub fn strip_ansi_codes(s: &str) -> String {
 /// # }
 /// ```
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProcessResult {
     /// The process exit code, or `None` if killed by signal or timeout.
     ///

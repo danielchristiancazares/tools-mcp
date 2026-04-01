@@ -22,7 +22,7 @@ fn setup() {
     });
 }
 
-fn send_mcp_message(message: Value) -> Result<Value, Box<dyn std::error::Error>> {
+fn send_mcp_message(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
     setup();
     let mut child = Command::new("cargo")
         .args(["run", "--release", "--quiet"])
@@ -68,7 +68,7 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
         "method": "mcp/initialize",
         "params": {}
     });
-    let response = send_mcp_message(request).expect("initialize");
+    let response = send_mcp_message(&request).expect("initialize");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9001);
     let result = response["result"].as_object().expect("result object");
@@ -102,7 +102,7 @@ fn golden_tools_call_accepts_nested_call_shape() {
             }
         }
     });
-    let response = send_mcp_message(request).expect("nested call");
+    let response = send_mcp_message(&request).expect("nested call");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9002);
     assert_eq!(response["result"]["content"][0]["text"], "pong");
@@ -119,7 +119,7 @@ fn golden_tools_call_accepts_toolname_and_args_aliases() {
             "args": {}
         }
     });
-    let response = send_mcp_message(request).expect("alias call");
+    let response = send_mcp_message(&request).expect("alias call");
     assert_eq!(response["result"]["content"][0]["text"], "pong");
 }
 
@@ -131,7 +131,7 @@ fn golden_unknown_method_returns_protocol_error() {
         "method": "mcp/does_not_exist",
         "params": {}
     });
-    let response = send_mcp_message(request).expect("unknown method");
+    let response = send_mcp_message(&request).expect("unknown method");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9004);
     assert!(response["result"].is_null());
@@ -156,7 +156,7 @@ fn golden_unknown_tool_returns_protocol_error() {
             "arguments": {}
         }
     });
-    let response = send_mcp_message(request).expect("unknown tool");
+    let response = send_mcp_message(&request).expect("unknown tool");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9005);
     assert!(response["result"].is_null());
@@ -173,7 +173,7 @@ fn golden_tools_list_returns_tools_array() {
         "method": "mcp/tools/list",
         "params": {}
     });
-    let response = send_mcp_message(request).expect("tools list");
+    let response = send_mcp_message(&request).expect("tools list");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9006);
     let tools = response["result"]["tools"].as_array().expect("tools array");
@@ -199,7 +199,7 @@ fn golden_webfetch_blocks_localhost_ssrf() {
             }
         }
     });
-    let response = send_mcp_message(request).expect("webfetch ssrf");
+    let response = send_mcp_message(&request).expect("webfetch ssrf");
     assert_eq!(response["jsonrpc"], "2.0");
     let result = response["result"].as_object().expect("tool result");
     assert_eq!(result["isError"], true);
@@ -226,7 +226,7 @@ fn golden_edit_invalid_args_returns_tool_error() {
             }
         }
     });
-    let response = send_mcp_message(request).expect("edit invalid");
+    let response = send_mcp_message(&request).expect("edit invalid");
     assert_eq!(response["jsonrpc"], "2.0");
     let result = response["result"].as_object().expect("tool result");
     assert_eq!(result["isError"], true);

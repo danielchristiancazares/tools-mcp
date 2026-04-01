@@ -102,8 +102,9 @@ struct GlobRequest {
     limit: Option<usize>,
 }
 
+#[allow(clippy::unused_async)]
 async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<GlobRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GlobRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
