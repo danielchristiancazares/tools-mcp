@@ -1,23 +1,24 @@
 # Repository Guidelines
 
 ## Project Overview
-Rust MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for code search (OpenAI vector stores), web fetching, and newline-safe file editing.
+Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for code search (OpenAI vector stores), web fetching, git operations, and newline-safe file editing.
 
 ## Project Structure
-- `src/main.rs` — composition root (stdin/stdout loop).
-- `src/adapters/inbound/mcp_server.rs` — JSON-RPC/MCP routing and tool dispatch.
-- `src/application/` — MCP tool use cases (e.g. `codequery_tool`, `webfetch_tool`).
-- `src/ports/` — outbound port traits (e.g. `CodeQueryEngine`).
-- `src/lib.rs` — OpenAI/vector-store client (`file_search_core`).
-- `src/codequery/`, `src/codequery_cache.rs`, `src/webfetch/`, `src/smart_file_edit/` — tool implementations and caches.
-- `src/tools/handlers/read_file.rs` — raw file reader tool.
-- `tests/` — integration tests; `target/` — build output (generated).
+- `apps/tools-mcp-server/` — binary crate with stdin/stdout loop, JSON-RPC routing, and feature-crate composition.
+- `crates/tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process_utils`, config).
+- `crates/openai-file-search-core/` — OpenAI/vector-store client library.
+- `crates/tools-mcp-codequery/` — CodeQuery tool and vector-store cache/orchestration.
+- `crates/tools-mcp-webfetch/` — WebFetch pipeline and tool registration.
+- `crates/tools-mcp-local/` — local file/search/edit tools, including `smart_file_edit`.
+- `crates/tools-mcp-git/` — git tool implementations.
+- `apps/tools-mcp-server/tests/` — server integration and golden contract tests.
+- `target/` — build output (generated).
 
 ## Commands
-- `cargo build --release` — build release binary.
-- `cargo run --release` — run server locally.
-- `cargo test` — run tests (some are `#[ignore]`).
-- `cargo fmt` / `cargo clippy --all-targets` — format/lint.
+- `cargo build --workspace --release` — build the full workspace.
+- `cargo run -p tools-mcp-server --release` — run the server locally.
+- `cargo test --workspace` — run tests (some are `#[ignore]`).
+- `cargo fmt --all` / `cargo clippy --workspace --all-targets` — format/lint.
 
 Env vars:
 - `OPENAI_API_KEY` — required for OpenAI-backed tools.
@@ -27,8 +28,8 @@ Env vars:
 
 ## Style & Testing
 - Keep changes `cargo fmt`-clean; follow standard Rust naming (`snake_case`, `CamelCase`).
-- Keep network/OpenAI tests ignored by default; run with `OPENAI_API_KEY` via `cargo test -- --ignored`.
-- If you change tool schemas or response shapes, update `README.md` and `tests/integration_test.rs`.
+- Keep network/OpenAI tests ignored by default; run with `OPENAI_API_KEY` via `cargo test --workspace -- --ignored`.
+- If you change tool schemas or response shapes, update `README.md` and `apps/tools-mcp-server/tests/integration_test.rs`.
 
 ## Commits & Pull Requests
 - Prefer Conventional Commits (e.g., `feat(webfetch): ...`, `perf(webfetch): ...`).
@@ -41,17 +42,17 @@ Env vars:
 ## Cursor Cloud specific instructions
 
 ### System dependencies
-The VM needs **Rust stable ≥ 1.85** (edition 2024), **libssl-dev**, and **ugrep**. The update script handles `cargo build --release`; system packages are pre-installed in the snapshot.
+The VM needs **Rust stable ≥ 1.85** (edition 2024), **libssl-dev**, and **ugrep**. The update script handles `cargo build --workspace --release`; system packages are pre-installed in the snapshot.
 
 ### Running the MCP server
 The server is a stdin/stdout binary — pipe JSON-RPC messages into it. Use `MCP_SKIP_HEADERS=true` for raw JSON (no Content-Length framing). Example:
 ```
 echo '{"jsonrpc":"2.0","id":1,"method":"mcp/tools/call","params":{"name":"ping","arguments":{}}}' \
-  | MCP_SKIP_HEADERS=true RUST_LOG=error cargo run --release 2>/dev/null
+  | MCP_SKIP_HEADERS=true RUST_LOG=error cargo run -p tools-mcp-server --release 2>/dev/null
 ```
 
 ### Testing caveats
-- `cargo test` runs all non-ignored tests (~80 total across unit, integration, and doc tests). No external services required.
-- Tests tagged `#[ignore]` need `OPENAI_API_KEY`; run with `cargo test -- --ignored`.
+- `cargo test --workspace` runs all non-ignored tests across the workspace. No external services required.
+- Tests tagged `#[ignore]` need `OPENAI_API_KEY`; run with `cargo test --workspace -- --ignored`.
 - The `Search` tool uses **ugrep** (not ripgrep) as its backend; some integration tests exercise it.
-- The release build is needed by integration tests that spawn the binary; `cargo test` triggers a release build automatically via `build.rs`.
+- The app integration tests spawn the compiled `tools-mcp-server` binary via Cargo's `CARGO_BIN_EXE_...` support.

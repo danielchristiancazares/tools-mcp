@@ -1,0 +1,23 @@
+[package]
+name = "tools-mcp-local"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+glob.workspace = true
+ignore.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tree-sitter.workspace = true
+tree-sitter-cpp.workspace = true
+tools-mcp-core = { path = "../tools-mcp-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

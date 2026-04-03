@@ -1,4 +1,4 @@
-# tools Technical Documentation
+# tools-mcp Workspace Technical Documentation
 
 ## Table of Contents
 
@@ -21,7 +21,7 @@
 
 ## Project Overview
 
-**tools** is a Rust-based Model Context Protocol (MCP) server that provides a comprehensive suite of developer tools for AI-assisted coding workflows. The server communicates via JSON-RPC 2.0 over stdin/stdout, enabling seamless integration with MCP-compatible clients such as Codex agents.
+**tools-mcp** is a Rust Cargo workspace for a Model Context Protocol (MCP) server and its supporting feature crates. The server communicates via JSON-RPC 2.0 over stdin/stdout, enabling seamless integration with MCP-compatible clients such as Codex agents.
 
 ### Key Capabilities
 
@@ -57,7 +57,7 @@
 
 ### Requirements
 
-- Rust toolchain (edition 2021; tested with latest stable).
+- Rust toolchain (edition 2024; tested with latest stable).
 - Cargo in PATH (for running the MCP binary).
 - `ugrep` in PATH (required for `Search`).
 - Git in PATH (required for `GitStatus`, `GitDiff`, and `GitRestore`).
@@ -73,12 +73,12 @@
 git clone https://github.com/your-org/tools.git
 cd tools
 
-# Build the binary
-cargo build --release
+# Build the workspace
+cargo build --workspace --release
 
 # Run the MCP server (OpenAI only)
 export OPENAI_API_KEY="sk-..."
-cargo run --release
+cargo run -p tools-mcp-server --release
 ```
 
 When running under an MCP client, the server reads JSON-RPC messages from stdin and writes responses to stdout. Set `MCP_SKIP_HEADERS=true` to omit `Content-Length` headers if your client expects raw JSON lines.
@@ -129,82 +129,17 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 
 ### Module Organization
 
-```
-build.rs              # Build script for version embedding
-src/
-  main.rs             # Composition root and stdin/stdout lifecycle
-  lib.rs              # OpenAI/vector-store client (file_search_core library)
-  config.rs           # Environment/config defaults
-  mcp_protocol.rs     # Message framing/parsing helpers
-  process_utils.rs    # Process helpers
-  response.rs         # JSON-RPC response helpers
-  tool_registry.rs    # Tool metadata + execution registry
-  validation.rs       # Input validation helpers
-  codequery_cache.rs  # Vector store name/id cache
+```text
+apps/
+  tools-mcp-server/        # Binary crate: stdin/stdout loop, routing, composition
 
-  adapters/
-    mod.rs            # Adapter namespace
-    inbound/
-      mod.rs          # Inbound adapter exports
-      mcp_server.rs   # JSON-RPC/MCP routing + tool registry wiring
-    outbound/
-      mod.rs          # Outbound adapter docs/placeholders
-
-  application/
-    mod.rs            # Application-layer exports
-    codequery_tool.rs # CodeQuery orchestration/use case
-    webfetch_tool.rs  # WebFetch orchestration/use case
-    workspace.rs      # Workspace editing facade
-
-  codequery/
-    mod.rs            # Compatibility facade for CodeQuery
-
-  git/
-    mod.rs            # Git command execution core
-    handlers.rs       # Git tool handlers
-    types.rs          # Git result types
-
-  openai/
-    mod.rs            # OpenAI client plumbing
-    types.rs          # OpenAI API types
-    file_ext.rs       # Extension filtering
-    hash.rs           # Content hashing
-
-  ports/
-    mod.rs            # Outbound port traits
-
-  smart_file_edit/
-    mod.rs            # Newline-aware file editing
-
-  tools/
-    mod.rs            # Tool exports
-    codequery.rs      # CodeQuery tool wrapper
-    delete.rs         # Delete tool
-    edit.rs           # Edit tool
-    git.rs            # Git tool wrapper
-    glob.rs           # Glob tool
-    outline.rs        # C++ outline tool
-    ping.rs           # Ping tool
-    pwsh.rs           # PowerShell tool
-    read.rs           # Read tool
-    search.rs         # Search tool
-    webfetch.rs       # WebFetch tool wrapper
-    write.rs          # Write tool
-    handlers/
-      mod.rs          # Tool handler exports
-      read_file.rs    # File reading
-      ripgrep.rs      # Search handler (ugrep backend)
-
-  webfetch/
-    mod.rs            # Web fetching pipeline orchestration
-    types.rs          # Request/response type definitions
-    http.rs           # HTTP client with SSRF protection
-    browser.rs        # Headless Chrome integration
-    cache.rs          # Disk-based response caching
-    extract.rs        # HTML content extraction
-    chunker.rs        # Token-aware text chunking
-    heuristics.rs     # JS-heavy site detection
-    whitelist.rs      # JS-heavy domain whitelist
+crates/
+  tools-mcp-core/          # Shared MCP/runtime support and tool registry
+  openai-file-search-core/ # OpenAI/vector-store client library
+  tools-mcp-codequery/     # CodeQuery tool, cache, OpenAI integration adapter
+  tools-mcp-webfetch/      # WebFetch tool and fetch pipeline
+  tools-mcp-local/         # Read/Edit/Write/Delete/Glob/Search/Outline/Pwsh and smart_file_edit
+  tools-mcp-git/           # Git tool implementations
 ```
 
 ---
@@ -213,7 +148,7 @@ src/
 
 ### main.rs - MCP Server Implementation
 
-**Location**: `src/main.rs`
+**Location**: `apps/tools-mcp-server/src/main.rs`
 
 The main module implements the MCP server, handling protocol communication and routing requests to appropriate tool handlers.
 
@@ -271,8 +206,8 @@ Supported method aliases for broad client compatibility:
 
 ### lib.rs - OpenAI API Client
 
-**Location**: `src/lib.rs`
-**Library Name**: `file_search_core`
+**Location**: `crates/openai-file-search-core/src/lib.rs`
+**Library Name**: `openai_file_search_core`
 
 Provides the core functionality for interacting with OpenAI's vector stores and file search APIs.
 
@@ -936,14 +871,13 @@ Index code and query an OpenAI vector store in a single call.
 
 #### CodeQuery Architecture
 
-At a high level, CodeQuery is split into an application-layer MCP handler (`src/application/codequery_tool.rs`), a compatibility facade (`src/codequery/mod.rs`), and a reusable OpenAI/vector-store client layer (`src/lib.rs`, exposed as `crate::core::*`).
+At a high level, CodeQuery is split across the feature crate `crates/tools-mcp-codequery/` and the reusable OpenAI/vector-store client crate `crates/openai-file-search-core/`.
 
 **Key modules**
-- `src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `src/adapters/inbound/mcp_server.rs`.
-- `src/application/codequery_tool.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `file_search_core` via [`crate::ports::CodeQueryEngine`].
-- `src/codequery/mod.rs`: compatibility re-exports (`handle_code_query`, store cache helpers).
-- `src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
-- `src/lib.rs` (`crate::core`): OpenAI REST calls (files + vector stores + Responses API), plus the change-based reindexing algorithm.
+- `apps/tools-mcp-server/src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `apps/tools-mcp-server/src/mcp_server.rs`.
+- `crates/tools-mcp-codequery/src/tool_handler.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `openai_file_search_core` via the feature crate's `CodeQueryEngine`.
+- `crates/tools-mcp-codequery/src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
+- `crates/openai-file-search-core/src/lib.rs`: OpenAI REST calls (files + vector stores + Responses API), plus the change-based reindexing algorithm.
 
 **Data flow (single CodeQuery call)**
 ```text
@@ -1607,13 +1541,13 @@ The `reindex_with_retry` function implements exponential backoff:
 
 ```bash
 # Run all tests
-cargo test
+cargo test --workspace
 
 # Run with output
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 
 # Run specific test
-cargo test test_name
+cargo test --workspace test_name
 ```
 
 ### Coverage (Local HTML)
@@ -1654,13 +1588,13 @@ The server can be tested via stdin/stdout:
 
 ```bash
 # Initialize
-echo '{"jsonrpc":"2.0","id":1,"method":"mcp/initialize","params":{}}' | cargo run
+echo '{"jsonrpc":"2.0","id":1,"method":"mcp/initialize","params":{}}' | cargo run -p tools-mcp-server
 
 # List tools
-echo '{"jsonrpc":"2.0","id":2,"method":"mcp/tools/list","params":{}}' | cargo run
+echo '{"jsonrpc":"2.0","id":2,"method":"mcp/tools/list","params":{}}' | cargo run -p tools-mcp-server
 
 # Read file
-echo '{"jsonrpc":"2.0","id":3,"method":"mcp/tools/call","params":{"name":"Read","arguments":{"path":"Cargo.toml"}}}' | cargo run
+echo '{"jsonrpc":"2.0","id":3,"method":"mcp/tools/call","params":{"name":"Read","arguments":{"path":"Cargo.toml"}}}' | cargo run -p tools-mcp-server
 ```
 
 ---
@@ -1671,19 +1605,19 @@ echo '{"jsonrpc":"2.0","id":3,"method":"mcp/tools/call","params":{"name":"Read",
 
 ```bash
 # Debug build
-cargo build
+cargo build --workspace
 
 # Release build
-cargo build --release
+cargo build --workspace --release
 
 # With custom version
-APP_VERSION="1.0.0" cargo build --release
+APP_VERSION="1.0.0" cargo build -p tools-mcp-server --release
 ```
 
 ### Binary Location
 
-- Debug: `target/debug/tools`
-- Release: `target/release/tools`
+- Debug: `target/debug/tools-mcp-server`
+- Release: `target/release/tools-mcp-server`
 
 ### System Requirements
 

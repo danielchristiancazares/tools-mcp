@@ -1,0 +1,16 @@
+[package]
+name = "tools-mcp-git"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tools-mcp-core = { path = "../tools-mcp-core" }

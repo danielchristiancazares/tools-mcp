@@ -1,9 +1,20 @@
-[package]
-name = "tools"
+[workspace]
+members = [
+    "apps/tools-mcp-server",
+    "crates/openai-file-search-core",
+    "crates/tools-mcp-codequery",
+    "crates/tools-mcp-core",
+    "crates/tools-mcp-git",
+    "crates/tools-mcp-local",
+    "crates/tools-mcp-webfetch",
+]
+resolver = "2"
+
+[workspace.package]
 version = "1.0.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -11,31 +22,21 @@ chromiumoxide = "0.7"
 futures = "0.3"
 glob = "0.3"
 hex = "0.4"
+htmd = "0.4.0"
+ignore = "0.4"
+readability = "0.3"
+reqwest = { version = "0.12.24", features = ["json", "multipart", "rustls-tls", "gzip", "brotli", "deflate"] }
+robotstxt = "0.3"
+scraper = "0.24"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+tempfile = "3.10"
+tiktoken-rs = "0.9.1"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-readability = "0.3"
-scraper = "0.24"
-url = "2.5"
-robotstxt = "0.3"
-ignore = "0.4"
-uuid = { version = "1.0", features = ["v4"] }
-reqwest = { version = "0.12.24", features = ["json", "multipart", "rustls-tls", "gzip", "brotli", "deflate"] }
-htmd = "0.4.0"
-tiktoken-rs = "0.9.1"
 tree-sitter = "0.26.3"
 tree-sitter-cpp = "0.23.4"
-
-[dev-dependencies]
-tempfile = "3.10"
-
-[lib]
-name = "file_search_core"
-path = "src/lib.rs"
-
-[[bin]]
-name = "tools"
-path = "src/main.rs"
+url = "2.5"
+uuid = { version = "1.0", features = ["v4"] }
