@@ -9,7 +9,7 @@
 //!   byte limits to prevent memory exhaustion from runaway processes.
 //! - **ANSI code stripping**: Terminal escape sequences are automatically removed from
 //!   captured output for clean text processing.
-//! - **Cross-platform support**: PowerShell execution uses `pwsh`/`pwsh.exe` across
+//! - **Cross-platform support**: `PowerShell` execution uses `pwsh`/`pwsh.exe` across
 //!   supported platforms.
 //!
 //! # Error Handling
@@ -122,19 +122,21 @@ pub fn strip_ansi_codes(s: &str) -> String {
                             // BEL (bell character) terminates OSC
                             chars.next();
                             break;
-                        } else if ch == '\x1b' {
+                        }
+
+                        if ch == '\x1b' {
                             // Check for ST (String Terminator): ESC followed by backslash
                             chars.next();
                             if chars.peek() == Some(&'\\') {
                                 chars.next();
                             }
                             break;
-                        } else {
-                            chars.next();
                         }
+
+                        chars.next();
                     }
                 }
-                Some('(') | Some(')') => {
+                Some('(' | ')') => {
                     // Character set designation: ESC ( G or ESC ) G
                     // Two bytes follow ESC: the designator type and character set
                     chars.next(); // consume '(' or ')'
@@ -201,6 +203,7 @@ pub fn strip_ansi_codes(s: &str) -> String {
 /// # }
 /// ```
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProcessResult {
     /// The process exit code, or `None` if killed by signal or timeout.
     ///
@@ -324,27 +327,27 @@ where
     Ok((out, truncated))
 }
 
-/// Executes a PowerShell command string with timeout enforcement and output capture.
+/// Executes a `PowerShell` command string with timeout enforcement and output capture.
 ///
-/// This function runs an inline PowerShell command (not a script file) using
-/// PowerShell Core (`pwsh`). It is cross-platform: PowerShell Core runs on
+/// This function runs an inline `PowerShell` command (not a script file) using
+/// `PowerShell` Core (`pwsh`). It is cross-platform: `PowerShell` Core runs on
 /// Windows, macOS, and Linux when installed.
 ///
 /// Use this function when you need PowerShell-specific features (cmdlets, pipeline,
-/// object handling) or cross-platform consistency with PowerShell syntax.
+/// object handling) or cross-platform consistency with `PowerShell` syntax.
 ///
 /// # Platform Behavior
 ///
 /// - **Windows**: Runs `pwsh.exe -NoLogo -Command <command>`
 /// - **Unix/Linux/macOS**: Runs `pwsh -NoLogo -Command <command>`
 ///
-/// Note: On non-Windows systems, PowerShell Core must be installed separately.
+/// Note: On non-Windows systems, `PowerShell` Core must be installed separately.
 ///
 /// # Arguments
 ///
-/// * `command` - The PowerShell command string to execute. Can include pipelines,
+/// * `command` - The `PowerShell` command string to execute. Can include pipelines,
 ///   cmdlets, and complex expressions. The entire string is passed as-is to `-Command`.
-/// * `working_dir` - Working directory for the PowerShell process.
+/// * `working_dir` - Working directory for the `PowerShell` process.
 /// * `timeout_ms` - Maximum execution time in milliseconds before forcible termination.
 /// * `max_stdout_bytes` - Maximum bytes to capture from stdout.
 /// * `max_stderr_bytes` - Maximum bytes to capture from stderr.
@@ -352,7 +355,7 @@ where
 /// # Returns
 ///
 /// - `Ok(ProcessResult)` - Command was executed (check fields for success/failure)
-/// - `Err(String)` - Failed to spawn PowerShell or wait on the process
+/// - `Err(String)` - Failed to spawn `PowerShell` or wait on the process
 ///
 /// # Examples
 ///
@@ -397,7 +400,7 @@ where
 /// # Errors
 ///
 /// Returns an error string if:
-/// - PowerShell Core (`pwsh` / `pwsh.exe`) is not installed or not in PATH
+/// - `PowerShell` Core (`pwsh` / `pwsh.exe`) is not installed or not in PATH
 /// - Pipe setup fails
 /// - The `wait()` syscall fails unexpectedly
 pub async fn run_pwsh_command(
@@ -463,8 +466,11 @@ pub async fn run_pwsh_command(
     // Convert raw bytes to clean strings
     let stdout = strip_ansi_codes(&String::from_utf8_lossy(&stdout_bytes));
     let stderr = strip_ansi_codes(&String::from_utf8_lossy(&stderr_bytes));
-    let exit_code = status.as_ref().and_then(|s| s.code());
-    let success = status.as_ref().is_some_and(|s| s.success()) && !timed_out;
+    let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+    let success = status
+        .as_ref()
+        .is_some_and(std::process::ExitStatus::success)
+        && !timed_out;
 
     Ok(ProcessResult {
         exit_code,
@@ -480,18 +486,18 @@ pub async fn run_pwsh_command(
 /// Build a standard MCP-compatible process result response payload.
 ///
 /// This consolidates the repeated pattern of building JSON responses from
-/// ProcessResult structs across tools such as `Pwsh`. It handles
-/// the common fields (exit_code, success, timed_out, truncated flags, stdout, stderr)
+/// `ProcessResult` structs across tools such as `Pwsh`. It handles
+/// the common fields (`exit_code`, success, `timed_out`, truncated flags, stdout, stderr)
 /// and allows optional extra fields to be added per-tool.
 ///
 /// # Arguments
 ///
-/// * `result` - The ProcessResult from process execution
-/// * `extra_fields` - Optional HashMap of additional fields to include
+/// * `result` - The `ProcessResult` from process execution
+/// * `extra_fields` - Optional `HashMap` of additional fields to include
 ///
 /// # Returns
 ///
-/// A serde_json::Value containing the complete response payload
+/// A `serde_json::Value` containing the complete response payload
 ///
 /// # Example
 ///

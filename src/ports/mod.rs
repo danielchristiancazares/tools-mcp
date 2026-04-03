@@ -1,6 +1,6 @@
 //! Outbound port traits (Clean Architecture). Implementations live in [`crate::adapters::outbound`].
 //!
-//! These traits isolate application logic from concrete infrastructure (`reqwest`, OpenAI HTTP, etc.)
+//! These traits isolate application logic from concrete infrastructure (`reqwest`, `OpenAI` HTTP, etc.)
 //! while preserving behavior: default adapters delegate to `file_search_core` unchanged.
 
 pub mod web_fetcher;

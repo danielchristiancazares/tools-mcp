@@ -11,7 +11,7 @@ use tokio::process::Command;
 use tokio::time::{self, Instant};
 
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
-/// Returns (path, line_number, text, is_match)
+/// Returns (path, `line_number`, text, `is_match`)
 fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
     fn parse_with_sep(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
         let bytes = line.as_bytes();
@@ -102,7 +102,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         /// Maximum number of match/context events to return (global). Defaults to 200.
         #[serde(default)]
         max_results: Option<usize>,
-        /// Kill the search if it runs longer than this (ms). Defaults to 20_000.
+        /// Kill the search if it runs longer than this (ms). Defaults to `20_000`.
         #[serde(default)]
         timeout_ms: Option<u64>,
         /// Fuzzy match tolerance (1-4 edits). Uses ugrep backend.
@@ -110,7 +110,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         fuzzy: Option<u8>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<RgRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<RgRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -141,7 +141,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
 
         // Fuzzy flag
         if let Some(dist) = fuzzy_distance {
-            cmd.arg(format!("-Z{}", dist));
+            cmd.arg(format!("-Z{dist}"));
         }
 
         if req.fixed_strings.unwrap_or(false) {
@@ -258,7 +258,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
                         break;
                     }
                 }
-                _ = time::sleep_until(deadline) => {
+                () = time::sleep_until(deadline) => {
                     timed_out = true;
                     let _ = child.kill().await;
                     break;
@@ -267,9 +267,10 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         }
 
         // Wait for process to exit (even if killed).
-        let status = match time::timeout(Duration::from_millis(2_000), child.wait()).await {
-            Ok(res) => Some(res?),
-            Err(_) => {
+        let status =
+            if let Ok(res) = time::timeout(Duration::from_millis(2_000), child.wait()).await {
+                Some(res?)
+            } else {
                 // If we intentionally terminated after collecting enough results,
                 // a slow process shutdown should not be reported as a user-visible timeout.
                 if !terminated_for_limit {
@@ -277,18 +278,17 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
                 }
                 let _ = child.kill().await;
                 None
-            }
-        };
-        let exit_code = status.as_ref().and_then(|s| s.code());
+            };
+        let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
 
         let mut stderr_task = stderr_task;
-        let stderr_text = match time::timeout(Duration::from_millis(2_000), &mut stderr_task).await
+        let stderr_text = if let Ok(joined) =
+            time::timeout(Duration::from_millis(2_000), &mut stderr_task).await
         {
-            Ok(joined) => joined.unwrap_or_else(|_| String::new()),
-            Err(_) => {
-                stderr_task.abort();
-                String::new()
-            }
+            joined.unwrap_or_else(|_| String::new())
+        } else {
+            stderr_task.abort();
+            String::new()
         }
         .trim()
         .to_string();
@@ -311,7 +311,7 @@ pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         Ok((matches, rendered_lines, truncated, exit_code, stderr_text, success, timed_out)) => {
             let text_view = if !success && !stderr_text.is_empty() {
                 // Show error message when search failed
-                format!("Search error: {}", stderr_text)
+                format!("Search error: {stderr_text}")
             } else if rendered_lines.is_empty() {
                 String::new()
             } else {

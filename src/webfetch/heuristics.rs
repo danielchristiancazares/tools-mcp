@@ -155,7 +155,7 @@ fn check_empty_spa_shell(
         r#"<div id="root-container""#,
         r#"<div id="app-root""#,
         r#"<div class="app""#,
-        r#"<div data-reactroot"#,
+        r"<div data-reactroot",
     ];
 
     for pattern in &spa_patterns {
@@ -165,7 +165,9 @@ fn check_empty_spa_shell(
     }
 
     // Check content-to-HTML ratio
+    #[allow(clippy::cast_precision_loss)]
     let html_len = html_body.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
     let content_len = extracted_markdown.len() as f64;
 
     if html_len > 0.0 {
@@ -372,14 +374,14 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
         found_frameworks.push("Svelte");
     }
 
-    if !found_frameworks.is_empty() {
+    if found_frameworks.is_empty() {
+        false
+    } else {
         result.add_indicator(
             0.1,
             format!("Framework detected: {}", found_frameworks.join(", ")),
         );
         true
-    } else {
-        false
     }
 }
 
@@ -504,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_normal_html_page() {
-        let html = r#"
+        let html = r"
             <!DOCTYPE html>
             <html>
             <head><title>Blog Post</title></head>
@@ -520,7 +522,7 @@ mod tests {
                 <p>So we add plenty of content here to test the heuristics properly.</p>
             </body>
             </html>
-        "#;
+        ";
         let markdown = "Welcome to my blog\nThis is a long article with lots of content...\nMore content here, making this a substantial page.\nEven more content to ensure we exceed the minimum threshold.\nAdditional paragraphs to make this a realistic HTML page.\nThe content continues with more text and information.\nThis ensures the extracted markdown will be long enough.\nWe want to avoid false positives for normal static pages.\nSo we add plenty of content here to test the heuristics properly.";
 
         let result = analyze_js_heavy(html, markdown, Some("text/html"), None);

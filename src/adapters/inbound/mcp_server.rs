@@ -1,6 +1,7 @@
 //! MCP JSON-RPC routing and tool dispatch (inbound adapter).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use serde_json::Value;
 
 use crate::response::{RpcError, RpcResponse};
@@ -136,7 +137,7 @@ pub async fn dispatch_jsonrpc_request(
                 .cloned()
                 .or_else(|| params.get("args").cloned())
                 .or_else(|| params.get("call").and_then(|c| c.get("arguments")).cloned())
-                .unwrap_or(Value::Object(Default::default()));
+                .unwrap_or(Value::Object(Map::new()));
 
             let resp = if let Some(result) = registry.call(name, req.id.clone(), args).await {
                 result
@@ -145,8 +146,7 @@ pub async fn dispatch_jsonrpc_request(
                     req.id,
                     -32601,
                     format!(
-                        "Unknown tool: {}. Call mcp/tools/list to see available tool names.",
-                        name
+                        "Unknown tool: {name}. Call mcp/tools/list to see available tool names."
                     ),
                 )
             };

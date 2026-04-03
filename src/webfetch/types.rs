@@ -1,11 +1,11 @@
-//! Data types for WebFetch request and response payloads.
+//! Data types for `WebFetch` request and response payloads.
 //!
-//! These structures define the MCP tool interface for the WebFetch functionality.
+//! These structures define the MCP tool interface for the `WebFetch` functionality.
 //! All types implement `Serialize` and `Deserialize` for JSON-RPC transport.
 
 use serde::{Deserialize, Serialize};
 
-/// Request payload for the WebFetch MCP tool.
+/// Request payload for the `WebFetch` MCP tool.
 ///
 /// This structure is deserialized from the JSON-RPC `arguments` field when the
 /// tool is invoked. All fields except `url` have sensible defaults.
@@ -35,7 +35,7 @@ pub struct FetchRequest {
 
     /// Maximum tokens per chunk. Chunks exceeding this limit are split.
     ///
-    /// Uses OpenAI's `cl100k_base` tokenizer (GPT-4 compatible). Defaults to 600
+    /// Uses `OpenAI`'s `cl100k_base` tokenizer (GPT-4 compatible). Defaults to 600
     /// tokens if not specified, which keeps chunks under typical tool response limits
     /// while preserving sufficient context.
     #[serde(default)]
@@ -92,7 +92,7 @@ pub struct FetchChunk {
     pub token_count: usize,
 }
 
-/// Response payload returned by the WebFetch tool.
+/// Response payload returned by the `WebFetch` tool.
 ///
 /// Contains the fetched and processed document content along with metadata
 /// about the fetch operation (timing, rendering method, cache status).

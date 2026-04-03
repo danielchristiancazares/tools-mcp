@@ -157,6 +157,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::unused_async)]
     async fn ok_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
         ToolCallOutcome::ok(json!({
             "content": [{"type": "text", "text": "ok"}],

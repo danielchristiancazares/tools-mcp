@@ -200,8 +200,7 @@ fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<()
         let key = diff_manifest_key(&path, old_path.as_deref());
         let Some(entry_pos) = entry_index.remove(&key) else {
             return Err(format!(
-                "git diff --numstat returned a path not present in --name-status: {}",
-                path
+                "git diff --numstat returned a path not present in --name-status: {path}"
             ));
         };
         let entry = &mut entries[entry_pos];
@@ -231,7 +230,7 @@ async fn collect_ref_diff_manifest(
     name_status_args.push("--name-status".into());
     name_status_args.push("-z".into());
     let name_status_exec = run_git(
-        working_dir.map(|s| s.to_string()),
+        working_dir.map(std::string::ToString::to_string),
         name_status_args,
         timeout_ms,
         MAX_OUTPUT_BYTES,
@@ -252,7 +251,7 @@ async fn collect_ref_diff_manifest(
     numstat_args.push("--numstat".into());
     numstat_args.push("-z".into());
     let numstat_exec = run_git(
-        working_dir.map(|s| s.to_string()),
+        working_dir.map(std::string::ToString::to_string),
         numstat_args,
         timeout_ms,
         MAX_OUTPUT_BYTES,
@@ -311,7 +310,7 @@ async fn write_patches_to_dir(
         }
         patch_args.push(entry.path.clone());
         let patch_exec = run_git(
-            working_dir.map(|s| s.to_string()),
+            working_dir.map(std::string::ToString::to_string),
             patch_args,
             timeout_ms,
             MAX_OUTPUT_BYTES,
@@ -390,7 +389,7 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
         untracked: Option<bool>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitStatusRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitStatusRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -440,7 +439,7 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
     let mut extra_fields = HashMap::new();
     extra_fields.insert("clean", json!(clean));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
@@ -478,7 +477,7 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
         output_dir: Option<String>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitDiffRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitDiffRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -501,8 +500,7 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
             Ok(summary) => {
                 let files_changed = summary["summary"]["files_changed"].as_u64().unwrap_or(0);
                 let text = format!(
-                    "Diff between {} and {}: {} files changed. Patches written to {}",
-                    from_ref, to_ref, files_changed, output_dir
+                    "Diff between {from_ref} and {to_ref}: {files_changed} files changed. Patches written to {output_dir}"
                 );
                 let mut response = serde_json::Map::new();
                 response.insert(
@@ -595,7 +593,7 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
     let mut extra_fields = HashMap::new();
     extra_fields.insert("max_bytes", json!(max_bytes));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
@@ -617,7 +615,7 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
         worktree: Option<bool>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitRestoreRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitRestoreRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -677,7 +675,7 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = build_git_response(&exec, text, None);
+    let payload = build_git_response(&exec, &text, None);
     ToolCallOutcome::ok(payload)
 }
 
@@ -700,7 +698,7 @@ pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         update: Option<bool>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitAddRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitAddRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -753,7 +751,7 @@ pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = build_git_response(&exec, text, None);
+    let payload = build_git_response(&exec, &text, None);
     ToolCallOutcome::ok(payload)
 }
 
@@ -775,7 +773,7 @@ pub async fn handle_git_commit(_id: Option<Value>, args: Value) -> ToolCallOutco
         timeout_ms: Option<u64>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitCommitRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitCommitRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -835,7 +833,7 @@ pub async fn handle_git_commit(_id: Option<Value>, args: Value) -> ToolCallOutco
     extra_fields.insert("commit_message", json!(commit_msg));
     extra_fields.insert("commit_hash", json!(commit_hash));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
@@ -869,7 +867,7 @@ pub async fn handle_git_log(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         max_bytes: Option<usize>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitLogRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitLogRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -934,7 +932,7 @@ pub async fn handle_git_log(_id: Option<Value>, args: Value) -> ToolCallOutcome 
     let mut extra_fields = HashMap::new();
     extra_fields.insert("max_bytes", json!(max_bytes));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
@@ -964,7 +962,7 @@ pub async fn handle_git_branch(_id: Option<Value>, args: Value) -> ToolCallOutco
         new_name: Option<String>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitBranchRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitBranchRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -1024,7 +1022,7 @@ pub async fn handle_git_branch(_id: Option<Value>, args: Value) -> ToolCallOutco
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = build_git_response(&exec, text, None);
+    let payload = build_git_response(&exec, &text, None);
     ToolCallOutcome::ok(payload)
 }
 
@@ -1048,7 +1046,7 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
         paths: Option<Vec<String>>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitCheckoutRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitCheckoutRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -1110,7 +1108,7 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
         exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     };
 
-    let payload = build_git_response(&exec, text, None);
+    let payload = build_git_response(&exec, &text, None);
     ToolCallOutcome::ok(payload)
 }
 
@@ -1134,7 +1132,7 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
         include_untracked: Option<bool>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitStashRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitStashRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -1188,8 +1186,7 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
         }
         _ => {
             return ToolCallOutcome::err(format!(
-                "unknown stash action '{}'. Valid: push, pop, apply, drop, list, show, clear",
-                action
+                "unknown stash action '{action}'. Valid: push, pop, apply, drop, list, show, clear"
             ));
         }
     }
@@ -1225,7 +1222,7 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
     let mut extra_fields = HashMap::new();
     extra_fields.insert("action", json!(action));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
@@ -1251,7 +1248,7 @@ pub async fn handle_git_show(_id: Option<Value>, args: Value) -> ToolCallOutcome
         max_bytes: Option<usize>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitShowRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitShowRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -1299,7 +1296,7 @@ pub async fn handle_git_show(_id: Option<Value>, args: Value) -> ToolCallOutcome
     let mut extra_fields = HashMap::new();
     extra_fields.insert("max_bytes", json!(max_bytes));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
@@ -1324,7 +1321,7 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
         max_bytes: Option<usize>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<GitBlameRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<GitBlameRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -1379,7 +1376,7 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
     extra_fields.insert("path", json!(req.path));
     extra_fields.insert("max_bytes", json!(max_bytes));
 
-    let payload = build_git_response(&exec, text, Some(extra_fields));
+    let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 

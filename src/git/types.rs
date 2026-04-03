@@ -23,6 +23,7 @@ use std::collections::HashMap;
 /// - `truncated_stdout`/`truncated_stderr`: Whether output exceeded byte limits
 /// - `timed_out`: Whether the command was killed due to timeout
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GitExecResult {
     pub git_bin: String,
     pub args: Vec<String>,
@@ -45,7 +46,7 @@ pub struct GitExecResult {
 ///
 /// * `exec` - The Git execution result containing output and metadata
 /// * `text` - The human-readable text to include in the response
-/// * `extra_fields` - Optional HashMap of additional fields to include
+/// * `extra_fields` - Optional `HashMap` of additional fields to include
 ///
 /// # Returns
 ///
@@ -62,7 +63,7 @@ pub struct GitExecResult {
 /// ```
 pub fn build_git_response(
     exec: &GitExecResult,
-    text: String,
+    text: &str,
     extra_fields: Option<HashMap<&str, Value>>,
 ) -> Value {
     let mut payload = json!({

@@ -2,6 +2,7 @@ use crate::define_mcp_tool;
 use crate::tool_outcome::ToolCallOutcome;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fmt::Write as FmtWrite;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
@@ -14,7 +15,7 @@ struct OutlineRequest {
 }
 
 async fn handle_outline(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<OutlineRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<OutlineRequest>(&args) {
         Ok(r) => r,
         Err(o) => return o,
     };
@@ -39,11 +40,8 @@ async fn handle_outline(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("failed to set language: {e}"));
     }
 
-    let tree = match parser.parse(&source, None) {
-        Some(t) => t,
-        None => {
-            return ToolCallOutcome::err("failed to parse file");
-        }
+    let Some(tree) = parser.parse(&source, None) else {
+        return ToolCallOutcome::err("failed to parse file");
     };
 
     let mut output = String::new();
@@ -106,11 +104,9 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
         "namespace_definition" => {
             let name = node
                 .child_by_field_name("name")
-                .map(|n| node_text(n, ctx.source))
-                .unwrap_or("anonymous");
+                .map_or("anonymous", |n| node_text(n, ctx.source));
 
-            output.push_str(&indent_str(ctx.indent));
-            output.push_str(&format!("namespace {} {{\n", name));
+            let _ = writeln!(output, "namespace {name} {{");
 
             ctx.indent += 1;
             if let Some(body) = node.child_by_field_name("body") {
@@ -121,8 +117,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             }
             ctx.indent -= 1;
 
-            output.push_str(&indent_str(ctx.indent));
-            output.push_str(&format!("}} // namespace {}\n\n", name));
+            let _ = write!(output, "}} // namespace {name}\n\n");
         }
 
         "class_specifier" | "struct_specifier" => {
@@ -133,8 +128,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             };
             let name = node
                 .child_by_field_name("name")
-                .map(|n| node_text(n, ctx.source))
-                .unwrap_or("anonymous");
+                .map_or("anonymous", |n| node_text(n, ctx.source));
 
             let mut base_clause = String::new();
             let mut cursor = node.walk();
@@ -151,8 +145,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
                 output.push('\n');
             }
 
-            output.push_str(&indent_str(ctx.indent));
-            output.push_str(&format!("{} {}{} {{\n", keyword, name, base_clause));
+            let _ = writeln!(output, "{keyword} {name}{base_clause} {{");
 
             ctx.indent += 1;
 
@@ -168,8 +161,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
         "enum_specifier" => {
             let name = node
                 .child_by_field_name("name")
-                .map(|n| node_text(n, ctx.source))
-                .unwrap_or("");
+                .map_or("", |n| node_text(n, ctx.source));
 
             let text = node_text(node, ctx.source);
             let is_enum_class = text.contains("enum class") || text.contains("enum struct");
@@ -182,9 +174,9 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
 
             output.push_str(&indent_str(ctx.indent));
             if is_enum_class {
-                output.push_str(&format!("enum class {} {{\n", name));
+                let _ = writeln!(output, "enum class {name} {{");
             } else {
-                output.push_str(&format!("enum {} {{\n", name));
+                let _ = writeln!(output, "enum {name} {{");
             }
 
             if let Some(body) = node.child_by_field_name("body") {
@@ -204,18 +196,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             output.push_str("};\n\n");
         }
 
-        "type_definition" => {
-            if let Some(comment) = find_preceding_comment(node, ctx.source) {
-                output.push_str(&indent_str(ctx.indent));
-                output.push_str(comment.trim());
-                output.push('\n');
-            }
-            output.push_str(&indent_str(ctx.indent));
-            output.push_str(node_text(node, ctx.source).trim());
-            output.push('\n');
-        }
-
-        "alias_declaration" => {
+        "type_definition" | "alias_declaration" => {
             if let Some(comment) = find_preceding_comment(node, ctx.source) {
                 output.push_str(&indent_str(ctx.indent));
                 output.push_str(comment.trim());
@@ -245,7 +226,8 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
         }
 
         "function_definition" => {
-            if let Some(sig) = extract_function_signature(node, ctx.source) {
+            let sig = extract_function_signature(node, ctx.source);
+            if !sig.is_empty() {
                 if let Some(comment) = find_preceding_comment(node, ctx.source) {
                     output.push_str(&indent_str(ctx.indent));
                     output.push_str(comment.trim());
@@ -349,7 +331,8 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
                         output.push('\n');
                     }
                     "function_definition" => {
-                        if let Some(sig) = extract_function_signature(child, ctx.source) {
+                        let sig = extract_function_signature(child, ctx.source);
+                        if !sig.is_empty() {
                             if let Some(comment) = find_preceding_comment(child, ctx.source) {
                                 output.push_str(&indent_str(ctx.indent));
                                 output.push_str(comment.trim());
@@ -370,9 +353,6 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
                         output.push_str(&indent_str(ctx.indent));
                         output.push_str(text.trim());
                         output.push('\n');
-                    }
-                    "template_declaration" => {
-                        extract_outline(child, ctx, output);
                     }
                     _ => {
                         extract_outline(child, ctx, output);
@@ -397,7 +377,7 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
     }
 }
 
-fn extract_function_signature(node: Node, source: &str) -> Option<String> {
+fn extract_function_signature(node: Node, source: &str) -> String {
     let full_text = node_text(node, source);
 
     let mut body_pos = None;
@@ -425,9 +405,9 @@ fn extract_function_signature(node: Node, source: &str) -> Option<String> {
             sig = sig.trim_end_matches(':').trim_end();
         }
 
-        Some(sig.to_string())
+        sig.to_string()
     } else {
-        Some(full_text.trim_end_matches(';').trim().to_string())
+        full_text.trim_end_matches(';').trim().to_string()
     }
 }
 

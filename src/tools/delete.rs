@@ -12,7 +12,7 @@ struct DeleteRequest {
 }
 
 async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<DeleteRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<DeleteRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };

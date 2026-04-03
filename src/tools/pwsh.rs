@@ -20,7 +20,7 @@ struct PwshRequest {
 }
 
 async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<PwshRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<PwshRequest>(&args) {
         Ok(r) => r,
         Err(o) => return o,
     };
@@ -66,7 +66,7 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     let payload = process_utils::build_process_result_response(&result, None);
-    ToolCallOutcome::ok_json_content(payload, !result.success)
+    ToolCallOutcome::ok_json_content(&payload, !result.success)
 }
 
 define_mcp_tool! {
@@ -88,7 +88,7 @@ define_mcp_tool! {
                 "type": "integer",
                 "description": "Timeout in milliseconds (default: 60000, max: 300000)",
                 "minimum": 100,
-                "maximum": 300000
+                "maximum": 300_000
             }
         },
         "required": ["command"],

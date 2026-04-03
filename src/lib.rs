@@ -1,21 +1,21 @@
-//! # OpenAI Vector Store API Client Library
+//! # `OpenAI` Vector Store API Client Library
 //!
-//! This library provides a comprehensive Rust client for interacting with OpenAI's Vector Stores
+//! This library provides a comprehensive Rust client for interacting with `OpenAI`'s Vector Stores
 //! API, enabling file uploads, vector store management, semantic search, and intelligent file
 //! reindexing capabilities.
 //!
 //! ## Overview
 //!
-//! The library wraps OpenAI's Assistants v2 API to provide:
+//! The library wraps `OpenAI`'s Assistants v2 API to provide:
 //!
-//! - **File Upload**: Upload local files or URLs to OpenAI's file storage with automatic format
+//! - **File Upload**: Upload local files or URLs to `OpenAI`'s file storage with automatic format
 //!   validation and extension handling
 //! - **Vector Store Management**: Create, list, and query vector stores for semantic search
-//! - **Semantic Search**: Execute natural language queries against indexed files using OpenAI's
+//! - **Semantic Search**: Execute natural language queries against indexed files using `OpenAI`'s
 //!   Responses API with file search tools
 //! - **Intelligent Reindexing**: Hash-based file synchronization that detects changes, moves,
 //!   and deletions to minimize API calls
-//! - **Response Processing**: Type-safe deserialization of OpenAI API responses with structured
+//! - **Response Processing**: Type-safe deserialization of `OpenAI` API responses with structured
 //!   output extraction
 //!
 //! ## Architecture
@@ -37,14 +37,14 @@
 //!
 //! ## Main Components
 //!
-//! - [`ApiConfig`]: Configuration container for OpenAI API authentication and default model
-//! - [`ResponseObject`]: Type-safe representation of OpenAI Responses API output
+//! - [`ApiConfig`]: Configuration container for `OpenAI` API authentication and default model
+//! - [`ResponseObject`]: Type-safe representation of `OpenAI` Responses API output
 //! - [`VectorStoreDetails`]: Vector store metadata including file processing status
 //! - [`FileInfo`]: File metadata including attributes for hash-based tracking
 //!
 //! ## File Format Support
 //!
-//! The library automatically validates and converts file formats for OpenAI compatibility:
+//! The library automatically validates and converts file formats for `OpenAI` compatibility:
 //!
 //! **Supported extensions** (passed through unchanged):
 //! `c`, `cpp`, `css`, `csv`, `doc`, `docx`, `gif`, `go`, `html`, `java`, `jpeg`, `jpg`,
@@ -53,7 +53,7 @@
 //!
 //! **Unsupported extensions**: Automatically converted to `.txt` for compatibility.
 //!
-//! ## CodeQuery Indexing
+//! ## `CodeQuery` Indexing
 //!
 //! For semantic code search via [`code_query`], the library applies stricter filtering:
 //!
@@ -191,7 +191,7 @@
 //!
 //! ## Environment Requirements
 //!
-//! - **OPENAI_API_KEY**: Required environment variable for authentication
+//! - **`OPENAI_API_KEY`**: Required environment variable for authentication
 //! - **Network**: HTTPS access to `api.openai.com`
 //!
 //! ## Thread Safety
@@ -228,12 +228,12 @@ pub use openai::hash::{compute_bytes_hash, compute_file_hash};
 // Internal types used only within this crate
 use openai::types::{ResponsesCreate, VectorStoreCreate, VectorStoreFileCreate};
 
-/// Base URL for all OpenAI API requests.
+/// Base URL for all `OpenAI` API requests.
 ///
 /// All API endpoints are constructed by appending paths to this base URL.
 pub const BASE_URL: &str = "https://api.openai.com/v1";
 
-/// Uploads a file to OpenAI's file storage system.
+/// Uploads a file to `OpenAI`'s file storage system.
 ///
 /// Supports both local files and remote URLs. The file is uploaded with purpose
 /// "assistants" for use with vector stores and the Responses API.
@@ -246,7 +246,7 @@ pub const BASE_URL: &str = "https://api.openai.com/v1";
 ///
 /// # Returns
 ///
-/// The file ID assigned by OpenAI (e.g., "file-abc123"). Use this ID with
+/// The file ID assigned by `OpenAI` (e.g., "file-abc123"). Use this ID with
 /// [`add_file_to_vector_store`] to index the file for search.
 ///
 /// # File Extension Handling
@@ -260,7 +260,7 @@ pub const BASE_URL: &str = "https://api.openai.com/v1";
 /// Returns an error if:
 /// - **Local file**: Cannot be opened or read (file not found, permission denied)
 /// - **Remote URL**: HTTP request fails, non-2xx response, or download error
-/// - **API error**: OpenAI rejects the upload (invalid format, quota exceeded)
+/// - **API error**: `OpenAI` rejects the upload (invalid format, quota exceeded)
 /// - **Parse error**: Response cannot be deserialized
 ///
 /// # Example
@@ -283,7 +283,7 @@ pub const BASE_URL: &str = "https://api.openai.com/v1";
 /// - Remote files are downloaded entirely before upload
 /// - For very large files, consider streaming uploads (not currently supported)
 pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) -> Result<String> {
-    let url = format!("{}/files", BASE_URL);
+    let url = format!("{BASE_URL}/files");
     let form = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
         let bytes = client
             .get(path_or_url)
@@ -302,7 +302,7 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
     } else {
         let bytes = tokio::fs::read(path_or_url)
             .await
-            .with_context(|| format!("opening {}", path_or_url))?;
+            .with_context(|| format!("opening {path_or_url}"))?;
         let name = std::path::Path::new(path_or_url)
             .file_name()
             .and_then(|s| s.to_str())
@@ -339,7 +339,7 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
 /// * `client` - HTTP client for making API requests
 /// * `cfg` - API configuration containing the authentication key
 /// * `file_paths` - List of local file paths or URLs to upload
-/// * `vector_store_id` - Target vector store ID (e.g., "vs_abc123")
+/// * `vector_store_id` - Target vector store ID (e.g., "`vs_abc123`")
 /// * `concurrent_limit` - Maximum concurrent uploads (recommended: 5-10)
 ///
 /// # Returns
@@ -351,7 +351,7 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
 /// # Processing Flow
 ///
 /// For each file:
-/// 1. Upload to OpenAI's file storage via [`upload_file`]
+/// 1. Upload to `OpenAI`'s file storage via [`upload_file`]
 /// 2. Attach to vector store via [`add_file_to_vector_store`]
 /// 3. Wait for indexing via [`wait_for_vector_store_file_ready`] (30s timeout)
 ///
@@ -419,7 +419,7 @@ pub async fn upload_files_batch(
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!("Failed to upload {}: {}", path, e);
-                        return Err((path, format!("Upload failed: {}", e)));
+                        return Err((path, format!("Upload failed: {e}")));
                     }
                 };
 
@@ -457,7 +457,7 @@ pub async fn upload_files_batch(
                     }
                     Err(e) => {
                         tracing::error!("Failed to attach {} to store: {}", path, e);
-                        Err((path, format!("Attach failed: {}", e)))
+                        Err((path, format!("Attach failed: {e}")))
                     }
                 }
             })
@@ -484,7 +484,7 @@ pub async fn upload_files_batch(
 /// Creates a new vector store with the specified name.
 ///
 /// Vector stores are containers for indexed files that enable semantic search
-/// via the file_search tool in the Responses API.
+/// via the `file_search` tool in the Responses API.
 ///
 /// # Arguments
 ///
@@ -494,7 +494,7 @@ pub async fn upload_files_batch(
 ///
 /// # Returns
 ///
-/// The vector store ID (e.g., "vs_abc123"). Use this ID with:
+/// The vector store ID (e.g., "`vs_abc123`"). Use this ID with:
 /// - [`add_file_to_vector_store`] to attach files
 /// - [`responses_with_file_search`] to query the store
 /// - [`list_vector_store_files`] to list attached files
@@ -513,7 +513,7 @@ pub async fn upload_files_batch(
 /// println!("Created vector store: {}", vs_id);
 /// ```
 pub async fn create_vector_store(client: &Client, cfg: &ApiConfig, name: &str) -> Result<String> {
-    let url = format!("{}/vector_stores", BASE_URL);
+    let url = format!("{BASE_URL}/vector_stores");
     let res = client
         .post(url)
         .bearer_auth(&cfg.api_key)
@@ -561,7 +561,7 @@ pub async fn create_vector_store(client: &Client, cfg: &ApiConfig, name: &str) -
 /// let my_store = stores.iter().find(|s| s.name.as_deref() == Some("my-codebase"));
 /// ```
 pub async fn list_vector_stores(client: &Client, cfg: &ApiConfig) -> Result<Vec<VectorStoreEntry>> {
-    let url = format!("{}/vector_stores", BASE_URL);
+    let url = format!("{BASE_URL}/vector_stores");
     let res = client
         .get(url)
         .bearer_auth(&cfg.api_key)
@@ -594,7 +594,7 @@ pub async fn list_vector_stores(client: &Client, cfg: &ApiConfig) -> Result<Vec<
 /// # Returns
 ///
 /// [`VectorStoreDetails`] containing the store ID and [`FileCounts`] with
-/// in_progress, completed, failed, cancelled, and total counts.
+/// `in_progress`, completed, failed, cancelled, and total counts.
 ///
 /// # Example
 ///
@@ -614,7 +614,7 @@ pub async fn get_vector_store_details(
     cfg: &ApiConfig,
     vs_id: &str,
 ) -> Result<VectorStoreDetails> {
-    let url = format!("{}/vector_stores/{}", BASE_URL, vs_id);
+    let url = format!("{BASE_URL}/vector_stores/{vs_id}");
     let res = client
         .get(&url)
         .bearer_auth(&cfg.api_key)
@@ -723,7 +723,7 @@ async fn add_file_to_vector_store_with_response(
     attributes: Option<serde_json::Map<String, serde_json::Value>>,
     chunking_strategy: Option<serde_json::Value>,
 ) -> Result<VectorStoreFileItem> {
-    let url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
+    let url = format!("{BASE_URL}/vector_stores/{vs_id}/files");
     let res = client
         .post(url)
         .bearer_auth(&cfg.api_key)
@@ -793,7 +793,7 @@ pub async fn add_file_to_vector_store(
 ///   - `path`: Original file path (for change detection)
 ///   - `hash`: SHA256 hash (for change detection)
 ///   - `indexed_at`: ISO 8601 timestamp
-/// * `chunking_strategy` - Optional chunking configuration (OpenAI default if None)
+/// * `chunking_strategy` - Optional chunking configuration (`OpenAI` default if None)
 ///
 /// # Example
 ///
@@ -842,10 +842,7 @@ pub async fn get_vector_store_file(
     vs_id: &str,
     vector_store_file_id: &str,
 ) -> Result<VectorStoreFileItem> {
-    let url = format!(
-        "{}/vector_stores/{}/files/{}",
-        BASE_URL, vs_id, vector_store_file_id
-    );
+    let url = format!("{BASE_URL}/vector_stores/{vs_id}/files/{vector_store_file_id}");
     let res = client
         .get(url)
         .bearer_auth(&cfg.api_key)
@@ -883,17 +880,14 @@ pub async fn wait_for_vector_store_file_ready(
             "in_progress" => {}
             status => {
                 anyhow::bail!(
-                    "vector store file {} has unexpected status '{}'",
-                    vector_store_file_id,
-                    status
+                    "vector store file {vector_store_file_id} has unexpected status '{status}'"
                 );
             }
         }
 
         if start.elapsed() > Duration::from_millis(timeout_ms) {
             anyhow::bail!(
-                "timeout waiting for vector store file {} to finish indexing",
-                vector_store_file_id
+                "timeout waiting for vector store file {vector_store_file_id} to finish indexing"
             );
         }
         sleep(Duration::from_millis(poll_ms)).await;
@@ -935,7 +929,7 @@ pub async fn wait_for_vector_file_ready(
     poll_ms: u64,
     timeout_ms: u64,
 ) -> Result<()> {
-    let url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
+    let url = format!("{BASE_URL}/vector_stores/{vs_id}/files");
     let start = std::time::Instant::now();
     loop {
         let res = client
@@ -1009,14 +1003,14 @@ pub async fn list_vector_store_files(
     cfg: &ApiConfig,
     vs_id: &str,
 ) -> Result<VectorStoreFilesList> {
-    let base_url = format!("{}/vector_stores/{}/files", BASE_URL, vs_id);
+    let base_url = format!("{BASE_URL}/vector_stores/{vs_id}/files");
     let mut all_files = Vec::new();
     let mut after: Option<String> = None;
 
     loop {
         let mut url = base_url.clone();
         if let Some(ref cursor) = after {
-            url = format!("{}?after={}", url, cursor);
+            url = format!("{url}?after={cursor}");
         }
 
         let res = client
@@ -1049,7 +1043,7 @@ pub async fn list_vector_store_files(
 /// Removes a file from a vector store.
 ///
 /// Detaches the file from the vector store and removes it from the search index.
-/// The underlying file in OpenAI's storage is NOT deleted.
+/// The underlying file in `OpenAI`'s storage is NOT deleted.
 ///
 /// # Arguments
 ///
@@ -1074,7 +1068,7 @@ pub async fn delete_vector_store_file(
     vs_id: &str,
     file_id: &str,
 ) -> Result<()> {
-    let url = format!("{}/vector_stores/{}/files/{}", BASE_URL, vs_id, file_id);
+    let url = format!("{BASE_URL}/vector_stores/{vs_id}/files/{file_id}");
     client
         .delete(url)
         .bearer_auth(&cfg.api_key)
@@ -1085,7 +1079,7 @@ pub async fn delete_vector_store_file(
     Ok(())
 }
 
-/// Retrieves metadata for a file in OpenAI's storage.
+/// Retrieves metadata for a file in `OpenAI`'s storage.
 ///
 /// Returns detailed information about an uploaded file, including its
 /// filename, size, and creation timestamp.
@@ -1104,7 +1098,7 @@ pub async fn delete_vector_store_file(
 ///
 /// Returns an error if the file ID is invalid or the file has been deleted.
 pub async fn get_file(client: &Client, cfg: &ApiConfig, file_id: &str) -> Result<FileInfo> {
-    let url = format!("{}/files/{}", BASE_URL, file_id);
+    let url = format!("{BASE_URL}/files/{file_id}");
     let res = client
         .get(url)
         .bearer_auth(&cfg.api_key)
@@ -1179,7 +1173,7 @@ pub async fn list_vector_store_files_with_details(
 
 /// Executes a semantic search query against a vector store using the Responses API.
 ///
-/// Sends a natural language query to OpenAI's Responses API with the file_search tool
+/// Sends a natural language query to `OpenAI`'s Responses API with the `file_search` tool
 /// configured to search the specified vector store. The model generates a response
 /// based on the relevant content found.
 ///
@@ -1223,7 +1217,7 @@ pub async fn responses_with_file_search(
     max_num_results: Option<u32>,
     include_results: bool,
 ) -> Result<serde_json::Value> {
-    let url = format!("{}/responses", BASE_URL);
+    let url = format!("{BASE_URL}/responses");
     let mut tool =
         serde_json::json!({ "type": "file_search", "vector_store_ids": [vector_store_id] });
     if let Some(n) = max_num_results {
@@ -1255,8 +1249,8 @@ pub async fn responses_with_file_search(
 /// One-shot file search: uploads a file, creates a vector store, and queries it.
 ///
 /// Convenience function that performs the complete file search workflow in one call:
-/// 1. Upload the file to OpenAI
-/// 2. Create a new vector store named "knowledge_base"
+/// 1. Upload the file to `OpenAI`
+/// 2. Create a new vector store named "`knowledge_base`"
 /// 3. Attach the file to the vector store
 /// 4. Wait for indexing to complete
 /// 5. Execute the search query
@@ -1337,10 +1331,10 @@ fn normalize_indexed_path(path: &str) -> String {
         return relative.to_string_lossy().to_string();
     }
 
-    path_buf
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string())
+    path_buf.file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().to_string(),
+    )
 }
 
 /// Synchronizes local files with a vector store using hash-based change detection.
@@ -1483,7 +1477,7 @@ pub async fn reindex_files(
 
                 match compute_file_hash(&path).await {
                     Ok(hash) => (idx, Ok((path, hash, filename))),
-                    Err(e) => (idx, Err((path, format!("Failed to hash: {}", e)))),
+                    Err(e) => (idx, Err((path, format!("Failed to hash: {e}")))),
                 }
             })
             .buffer_unordered(concurrent_limit)
@@ -1515,7 +1509,7 @@ pub async fn reindex_files(
                 to_skip.push(path);
             } else {
                 // Same path, different hash - content changed
-                to_delete.insert(file_id.clone(), format!("content changed: {}", path));
+                to_delete.insert(file_id.clone(), format!("content changed: {path}"));
                 path_map.remove(&indexed_path);
                 if let Some(old_hash) = store_hash {
                     hash_map.remove(&old_hash);
@@ -1528,10 +1522,7 @@ pub async fn reindex_files(
         } else if let Some((old_key, file_id)) = hash_map.get(&local_hash).cloned() {
             // Same hash at different location - file was moved
             // Remove from tracking maps before moving `path`/`local_hash` into `to_upload`.
-            to_delete.insert(
-                file_id.clone(),
-                format!("moved from {} to {}", old_key, path),
-            );
+            to_delete.insert(file_id.clone(), format!("moved from {old_key} to {path}"));
             path_map.remove(&old_key);
             hash_map.remove(&local_hash);
             if let Some(ref fname) = filename {
@@ -1548,7 +1539,7 @@ pub async fn reindex_files(
                     // Filename matches but hash differs - content changed
                     to_delete.insert(
                         file_id.clone(),
-                        format!("content changed (legacy): {}", fname),
+                        format!("content changed (legacy): {fname}"),
                     );
                     to_upload.push((path, local_hash));
                 }
@@ -1577,7 +1568,7 @@ pub async fn reindex_files(
 
     let chunks: Vec<_> = to_upload
         .chunks(concurrent_limit)
-        .map(|c| c.to_vec())
+        .map(<[(std::string::String, std::string::String)]>::to_vec)
         .collect();
     for chunk in chunks {
         let chunk_len = chunk.len();
@@ -1586,7 +1577,7 @@ pub async fn reindex_files(
                 // Upload file
                 let file_id = match upload_file(client, cfg, &path).await {
                     Ok(id) => id,
-                    Err(e) => return Err((path.clone(), format!("Upload failed: {}", e))),
+                    Err(e) => return Err((path.clone(), format!("Upload failed: {e}"))),
                 };
 
                 // Create attributes with path, hash, and timestamp for future reindexing
@@ -1612,7 +1603,7 @@ pub async fn reindex_files(
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         if !skip_per_file_wait
                             && let Err(e) = wait_for_vector_file_ready(
                                 client,
@@ -1631,7 +1622,7 @@ pub async fn reindex_files(
                         }
                         Ok((path, file_id, hash))
                     }
-                    Err(e) => Err((path.clone(), format!("Attach failed: {}", e))),
+                    Err(e) => Err((path.clone(), format!("Attach failed: {e}"))),
                 }
             })
             .buffer_unordered(concurrent_limit)
@@ -1675,7 +1666,7 @@ pub async fn reindex_files(
     // Delete all orphan files
     for (file_id, key) in orphan_files {
         match delete_vector_store_file(client, cfg, vector_store_id, &file_id).await {
-            Ok(_) => deleted.push(serde_json::json!({
+            Ok(()) => deleted.push(serde_json::json!({
                 "path": key,
                 "file_id": file_id,
                 "action": "deleted"
@@ -1981,8 +1972,7 @@ pub async fn code_query(
     for path in file_paths {
         if path.starts_with("http://") || path.starts_with("https://") {
             return Err(anyhow!(
-                "remote paths are not supported in CodeQuery: {}",
-                path
+                "remote paths are not supported in CodeQuery: {path}"
             ));
         }
     }
@@ -1998,7 +1988,7 @@ pub async fn code_query(
         for path in file_paths {
             let meta = tokio::fs::metadata(path)
                 .await
-                .with_context(|| format!("Failed to access file path: {}", path))?;
+                .with_context(|| format!("Failed to access file path: {path}"))?;
             if !meta.is_file() {
                 filtered_out.push(serde_json::json!({
                     "path": path,
@@ -2041,7 +2031,7 @@ pub async fn code_query(
             true,
         )
         .await
-        .map_err(|e| anyhow!("code_query reindex failed: {}", e))?;
+        .map_err(|e| anyhow!("code_query reindex failed: {e}"))?;
 
         // Attach filter diagnostics for transparency. This is additive to the existing summary.
         let mut summary = summary;

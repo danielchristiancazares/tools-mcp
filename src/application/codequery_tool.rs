@@ -1,14 +1,14 @@
-//! # CodeQuery Module
+//! # `CodeQuery` Module
 //!
 //! Semantic code search orchestration for the MCP server. This module centralizes all
 //! vector-store coordination so `main.rs` stays focused on MCP protocol wiring.
 //!
 //! ## Overview
 //!
-//! CodeQuery provides intelligent code search by combining:
+//! `CodeQuery` provides intelligent code search by combining:
 //! - **Automatic file discovery**: Walks the repository respecting `.gitignore` rules
 //! - **Hash-based change detection**: Only re-uploads files whose content has changed
-//! - **Vector store management**: Creates, caches, and resolves OpenAI vector stores
+//! - **Vector store management**: Creates, caches, and resolves `OpenAI` vector stores
 //! - **Semantic search**: Queries indexed code using natural language
 //!
 //! ## Architecture
@@ -40,7 +40,7 @@
 //!
 //! ## File Discovery Strategy
 //!
-//! When `file_paths` is not provided, CodeQuery auto-discovers indexable files:
+//! When `file_paths` is not provided, `CodeQuery` auto-discovers indexable files:
 //!
 //! 1. Walks from the git top level when inside a repository, otherwise the current directory
 //!    using the `ignore` crate
@@ -54,13 +54,13 @@
 //! 1. **Name derivation**: Defaults to the git top-level directory name plus a workspace
 //!    fingerprint if not specified
 //! 2. **Cache lookup**: Checks `~/.codex/mcp/stores.json` for known store ID
-//! 3. **API fallback**: Lists stores via OpenAI API if cache misses
+//! 3. **API fallback**: Lists stores via `OpenAI` API if cache misses
 //! 4. **Auto-creation**: Creates new store if none exists with the given name
 //! 5. **Cache update**: Persists newly discovered/created store IDs
 //!
 //! ## Hash-Based Reindexing
 //!
-//! CodeQuery uses SHA-256 content hashes to minimize API calls:
+//! `CodeQuery` uses SHA-256 content hashes to minimize API calls:
 //!
 //! - Each uploaded file has `path` and `hash` attributes in the vector store
 //! - On reindex, local hashes are compared against stored hashes
@@ -111,7 +111,7 @@ struct WorkspaceScope {
     default_store_name: String,
 }
 
-/// Handles the CodeQuery MCP tool invocation.
+/// Handles the `CodeQuery` MCP tool invocation.
 ///
 /// This is the main entry point for semantic code search. It orchestrates:
 /// 1. Input validation and parameter extraction
@@ -125,7 +125,7 @@ struct WorkspaceScope {
 /// | Parameter | Type | Required | Default | Description |
 /// |-----------|------|----------|---------|-------------|
 /// | `query` | string | **Yes** | - | Natural language search query |
-/// | `vector_store_id` | string | No* | - | OpenAI vector store ID |
+/// | `vector_store_id` | string | No* | - | `OpenAI` vector store ID |
 /// | `vector_store_name` | string | No* | git top-level name + fingerprint | Human-readable store name |
 /// | `file_paths` | string[] | No | auto-discover | Files to index |
 /// | `concurrent_limit` | integer | No | 5 | Max concurrent uploads (1-20) |
@@ -191,15 +191,15 @@ pub async fn handle_code_query(
     let vector_store_id_arg = args
         .get("vector_store_id")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let explicit_vector_store_name = args
         .get("vector_store_name")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let mut vector_store_name = explicit_vector_store_name.clone();
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -262,7 +262,7 @@ pub async fn handle_code_query(
 
     let concurrent_limit = args
         .get("concurrent_limit")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(5) as usize;
     if !(1..=20).contains(&concurrent_limit) {
         return crate::tool_outcome::ToolCallOutcome::err(format!(
@@ -272,7 +272,7 @@ pub async fn handle_code_query(
 
     let timeout_ms = args
         .get("timeout_ms")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(60_000);
     if timeout_ms < 1_000 {
         return crate::tool_outcome::ToolCallOutcome::err(format!(
@@ -282,42 +282,39 @@ pub async fn handle_code_query(
 
     let include_results = args
         .get("include_results")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let max_num_results = args
         .get("max_num_results")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(|n| n as u32);
     let model_override = args
         .get("model")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     let client = reqwest::Client::new();
     let cfg = crate::core::ApiConfig::new(api_key, model_override.as_deref().unwrap_or("gpt-4o"));
 
-    let vector_store_id = match vector_store_id_arg {
-        Some(id) => id,
-        None => {
-            let Some(name) = vector_store_name.as_deref() else {
-                return crate::tool_outcome::ToolCallOutcome::err(
-                    "CodeQuery could not determine a vector store name.",
-                );
-            };
+    let vector_store_id = if let Some(id) = vector_store_id_arg {
+        id
+    } else {
+        let Some(name) = vector_store_name.as_deref() else {
+            return crate::tool_outcome::ToolCallOutcome::err(
+                "CodeQuery could not determine a vector store name.",
+            );
+        };
 
-            let cache_lookup_key = default_workspace_scope
-                .as_ref()
-                .map(|scope| scope.cache_key.as_str())
-                .unwrap_or(name);
+        let cache_lookup_key = default_workspace_scope
+            .as_ref()
+            .map_or(name, |scope| scope.cache_key.as_str());
 
-            match resolve_vector_store_id(&client, &cfg, cache_lookup_key, name).await {
-                Ok(id) => id,
-                Err(e) => {
-                    return crate::tool_outcome::ToolCallOutcome::err(format!(
-                        "failed to resolve vector store name '{}': {}",
-                        name, e
-                    ));
-                }
+        match resolve_vector_store_id(&client, &cfg, cache_lookup_key, name).await {
+            Ok(id) => id,
+            Err(e) => {
+                return crate::tool_outcome::ToolCallOutcome::err(format!(
+                    "failed to resolve vector store name '{name}': {e}"
+                ));
             }
         }
     };
@@ -430,7 +427,7 @@ pub async fn handle_code_query(
     }
 }
 
-/// Resolves a vector store name to its OpenAI ID using a tiered lookup strategy.
+/// Resolves a vector store name to its `OpenAI` ID using a tiered lookup strategy.
 ///
 /// This function implements a three-tier resolution strategy to minimize API calls
 /// while ensuring new projects get automatically provisioned:
@@ -444,13 +441,13 @@ pub async fn handle_code_query(
 ///
 /// # Arguments
 ///
-/// * `client` - HTTP client for OpenAI API requests
+/// * `client` - HTTP client for `OpenAI` API requests
 /// * `cfg` - API configuration with authentication credentials
 /// * `name` - Human-readable vector store name to resolve
 ///
 /// # Returns
 ///
-/// The OpenAI vector store ID (e.g., `vs_abc123def456`).
+/// The `OpenAI` vector store ID (e.g., `vs_abc123def456`).
 ///
 /// # Errors
 ///
@@ -514,7 +511,7 @@ fn default_workspace_scope() -> Result<WorkspaceScope> {
     let base_name = root
         .file_name()
         .and_then(|os| os.to_str())
-        .map(|name| name.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| anyhow!("workspace root {} has no usable name", root.display()))?;
     let fingerprint = workspace_fingerprint(&root);
     let short = &fingerprint[..8];

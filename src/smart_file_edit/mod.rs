@@ -1,109 +1,111 @@
-//! Smart, newline-aware file editing helper for MCP.
-//!
-//! This module provides surgical text replacement operations that preserve original line
-//! endings while allowing edits to be specified using a canonical LF-normalized view.
-//! It solves the fundamental problem of cross-platform text editing: callers can work
-//! with consistent LF-only text while the module transparently maintains the file's
-//! original CRLF, LF, or CR line endings.
-//!
-//! # Line Ending Preservation System
-//!
-//! Files on different platforms use different line ending conventions:
-//! - **LF** (`\n`): Unix, Linux, macOS
-//! - **CRLF** (`\r\n`): Windows
-//! - **CR** (`\r`): Classic Mac (rare)
-//!
-//! When editing files, it is critical to preserve the original line ending style to avoid:
-//! - Spurious diffs that show every line as changed
-//! - Breaking tools that expect specific line endings
-//! - Inconsistent formatting within a single file
-//!
-//! This module tracks the line ending style of each file and automatically converts
-//! replacement text to match the dominant style.
-//!
-//! # Canonical LF Processing
-//!
-//! Internally, all file content is normalized to a **canonical LF representation**:
-//!
-//! 1. The file is read as raw bytes
-//! 2. Line boundaries are detected (LF, CRLF, or CR)
-//! 3. A canonical string is built with all newlines normalized to LF
-//! 4. Offset mappings are maintained between canonical positions and file byte positions
-//!
-//! This canonical view enables:
-//! - **Consistent string matching**: Callers can search using LF-only patterns
-//! - **Portable snippets**: The same `old_snippet` works regardless of the file's line endings
-//! - **Accurate byte offsets**: Replacements are written to the exact correct file positions
-//!
-//! # Mixed Newline Handling
-//!
-//! Real-world files sometimes contain mixed line endings (e.g., a file created on Windows
-//! but edited on Unix). The module handles this by:
-//!
-//! 1. **Tracking statistics**: Counting occurrences of each newline type (LF, CRLF, CR)
-//! 2. **Determining dominance**: The most frequently used style becomes the "dominant" style
-//! 3. **Applying consistently**: All new content uses the dominant style
-//!
-//! The priority order when counts are equal: CRLF > LF > CR. This prefers the more
-//! explicit Windows style when ambiguous, as converting CRLF to LF loses information
-//! while LF to CRLF is always safe.
-//!
-//! # Architecture Overview
-//!
-//! ```text
-//!                        +------------------+
-//!                        |   Raw File Bytes |
-//!                        +--------+---------+
-//!                                 |
-//!                                 v
-//!                        +------------------+
-//!                        |   split_lines()  |  Detect line boundaries
-//!                        +--------+---------+  Track newline types
-//!                                 |
-//!                 +---------------+---------------+
-//!                 |                               |
-//!                 v                               v
-//!        +----------------+              +----------------+
-//!        | CanonicalData  |              | NewlineStats   |
-//!        | - LF-only text |              | - LF count     |
-//!        | - Line views   |              | - CRLF count   |
-//!        | - Boundaries   |              | - CR count     |
-//!        +----------------+              +----------------+
-//!                 |                               |
-//!                 +---------------+---------------+
-//!                                 |
-//!                                 v
-//!                        +------------------+
-//!                        |    FileModel     |  Complete file representation
-//!                        +------------------+
-//! ```
-//!
-//! # Usage
-//!
-//! The primary entry point is [`handle_edit`], which replaces an exact substring
-//! (the `old_snippet`) with new content (`new_snippet`). The old snippet must match
-//! exactly in the canonical view. An optional `match_hint` can constrain the search
-//! to specific line ranges for disambiguation.
-//!
-//! ## Example
-//!
-//! ```json
-//! {
-//!   "path": "/path/to/file.rs",
-//!   "old_snippet": "fn old_name(",
-//!   "new_snippet": "fn new_name(",
-//!   "match_hint": { "start_line": 15, "end_line": 25 }
-//! }
-//! ```
-//!
-//! # Error Handling
-//!
-//! The module returns structured JSON responses with a `status` field:
-//! - `"ok"`: Operation succeeded
-//! - `"no_match"`: The `old_snippet` was not found (includes candidate suggestions)
-//! - `"stale_file"`: The file changed since the provided hash was computed
-//!
-//! All errors include descriptive messages and relevant context for debugging.
+/// Smart, newline-aware file editing helper for MCP.
+///
+/// This module provides surgical text replacement operations that preserve original line
+/// endings while allowing edits to be specified using a canonical LF-normalized view.
+/// It solves the fundamental problem of cross-platform text editing: callers can work
+/// with consistent LF-only text while the module transparently maintains the file's
+/// original CRLF, LF, or CR line endings.
+///
+/// # Line Ending Preservation System
+///
+/// Files on different platforms use different line ending conventions:
+/// - **LF** (`\n`): Unix, Linux, macOS
+/// - **CRLF** (`\r\n`): Windows
+/// - **CR** (`\r`): Classic Mac (rare)
+///
+/// When editing files, it is critical to preserve the original line ending style to avoid:
+/// - Spurious diffs that show every line as changed
+/// - Breaking tools that expect specific line endings
+/// - Inconsistent formatting within a single file
+///
+const REPLACEMENT: char = '\u{FFFD}';
+
+// This module tracks the line ending style of each file and automatically converts
+// replacement text to match the dominant style.
+//
+// # Canonical LF Processing
+//
+// Internally, all file content is normalized to a **canonical LF representation**:
+//
+// 1. The file is read as raw bytes
+// 2. Line boundaries are detected (LF, CRLF, or CR)
+// 3. A canonical string is built with all newlines normalized to LF
+// 4. Offset mappings are maintained between canonical positions and file byte positions
+//
+// This canonical view enables:
+// - **Consistent string matching**: Callers can search using LF-only patterns
+// - **Portable snippets**: The same `old_snippet` works regardless of the file's line endings
+// - **Accurate byte offsets**: Replacements are written to the exact correct file positions
+//
+// # Mixed Newline Handling
+//
+// Real-world files sometimes contain mixed line endings (e.g., a file created on Windows
+// but edited on Unix). The module handles this by:
+//
+// 1. **Tracking statistics**: Counting occurrences of each newline type (LF, CRLF, CR)
+// 2. **Determining dominance**: The most frequently used style becomes the "dominant" style
+// 3. **Applying consistently**: All new content uses the dominant style
+//
+// The priority order when counts are equal: CRLF > LF > CR. This prefers the more
+// explicit Windows style when ambiguous, as converting CRLF to LF loses information
+// while LF to CRLF is always safe.
+//
+// # Architecture Overview
+//
+// ```text
+//                        +------------------+
+//                        |   Raw File Bytes |
+//                        +--------+---------+
+//                                 |
+//                                 v
+//                        +------------------+
+//                        |   split_lines()  |  Detect line boundaries
+//                        +--------+---------+  Track newline types
+//                                 |
+//                 +---------------+---------------+
+//                 |                               |
+//                 v                               v
+//        +----------------+              +----------------+
+//        | CanonicalData  |              | NewlineStats   |
+//        | - LF-only text |              | - LF count     |
+//        | - Line views   |              | - CRLF count   |
+//        | - Boundaries   |              | - CR count     |
+//        +----------------+              +----------------+
+//                 |                               |
+//                 +---------------+---------------+
+//                                 |
+//                                 v
+//                        +------------------+
+//                        |    FileModel     |  Complete file representation
+//                        +------------------+
+// ```
+//
+// # Usage
+//
+// The primary entry point is [`handle_edit`], which replaces an exact substring
+// (the `old_snippet`) with new content (`new_snippet`). The old snippet must match
+// exactly in the canonical view. An optional `match_hint` can constrain the search
+// to specific line ranges for disambiguation.
+//
+// ## Example
+//
+// ```json
+// {
+//   "path": "/path/to/file.rs",
+//   "old_snippet": "fn old_name(",
+//   "new_snippet": "fn new_name(",
+//   "match_hint": { "start_line": 15, "end_line": 25 }
+// }
+// ```
+//
+// # Error Handling
+//
+// The module returns structured JSON responses with a `status` field:
+// - `"ok"`: Operation succeeded
+// - `"no_match"`: The `old_snippet` was not found (includes candidate suggestions)
+// - `"stale_file"`: The file changed since the provided hash was computed
+//
+// All errors include descriptive messages and relevant context for debugging.
 use crate::tool_outcome::ToolCallOutcome;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -112,7 +114,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Edit request - just path, old_snippet, new_snippet.
+/// Edit request - just path, `old_snippet`, `new_snippet`.
 #[derive(Deserialize)]
 struct SimpleEditRequest {
     path: String,
@@ -122,11 +124,11 @@ struct SimpleEditRequest {
     match_hint: Option<MatchHint>,
 }
 
-/// Simplified edit handler - replaces old_snippet with new_snippet in a file.
+/// Simplified edit handler - replaces `old_snippet` with `new_snippet` in a file.
 ///
 /// This is the streamlined interface for the Edit tool. No action field needed.
 pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    let req = match ToolCallOutcome::parse_args::<SimpleEditRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<SimpleEditRequest>(&args) {
         Ok(r) => r,
         Err(o) => return o,
     };
@@ -149,7 +151,7 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     match apply_snippet_edit_impl(&internal_req) {
         Ok(result) => {
             let is_error = !matches!(result.status, SnippetStatusKind::Ok);
-            ToolCallOutcome::ok_json_content(result.payload, is_error)
+            ToolCallOutcome::ok_json_content(&result.payload, is_error)
         }
         Err(err) => ToolCallOutcome::err(format!(
             "edit error: {err}. Remediation: ensure 'path' exists and 'old_snippet' matches exactly; if there are multiple matches, provide match_hint."
@@ -237,7 +239,7 @@ struct SnippetResult {
     payload: Value,
 }
 
-/// Test helper: wraps apply_snippet_edit_impl and returns the JSON payload.
+/// Test helper: wraps `apply_snippet_edit_impl` and returns the JSON payload.
 #[cfg(test)]
 fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value> {
     let result = apply_snippet_edit_impl(req)?;
@@ -255,7 +257,7 @@ fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value> {
 /// 6. Writes the modified content back to disk
 ///
 /// Returns a [`SnippetResult`] with status and metadata, allowing
-/// callers to handle partial success (no_match, stale_file) gracefully.
+/// callers to handle partial success (`no_match`, `stale_file`) gracefully.
 fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResult> {
     if req.old_snippet.is_empty() {
         return Err(anyhow!("old_snippet must not be empty"));
@@ -291,14 +293,11 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
         old_snippet.as_str(),
     )?;
 
-    let canonical_start = match maybe_offset {
-        Some(offset) => offset,
-        None => {
-            return Ok(SnippetResult {
-                status: SnippetStatusKind::NoMatch,
-                payload: no_match_payload(&model, old_snippet.as_str(), req.match_hint.as_ref()),
-            });
-        }
+    let Some(canonical_start) = maybe_offset else {
+        return Ok(SnippetResult {
+            status: SnippetStatusKind::NoMatch,
+            payload: no_match_payload(&model, old_snippet.as_str(), req.match_hint.as_ref()),
+        });
     };
 
     let canonical_end = canonical_start + old_snippet.len();
@@ -338,13 +337,11 @@ fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<SnippetResul
     let start_line = model
         .canonical
         .line_index_for_offset(canonical_start)
-        .map(|idx| idx + 1)
-        .unwrap_or(1);
+        .map_or(1, |idx| idx + 1);
     let end_line = model
         .canonical
         .line_index_for_offset(canonical_end.saturating_sub(1))
-        .map(|idx| idx + 1)
-        .unwrap_or(start_line);
+        .map_or(start_line, |idx| idx + 1);
 
     Ok(SnippetResult {
         status: SnippetStatusKind::Ok,
@@ -477,6 +474,7 @@ fn suggest_candidates(model: &FileModel, needle: &str, limit: usize) -> Vec<Valu
         .collect()
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn compute_line_similarity(views: &[LineView], start_idx: usize, needle_lines: &[&str]) -> f64 {
     if needle_lines.is_empty() {
         return 0.0;
@@ -511,7 +509,7 @@ fn canonical_range_for_lines(
     end_line: usize,
 ) -> Result<std::ops::Range<usize>> {
     if start_line == 0 || end_line < start_line {
-        return Err(anyhow!("invalid line range {}-{}", start_line, end_line));
+        return Err(anyhow!("invalid line range {start_line}-{end_line}"));
     }
     if start_line > views.len() || end_line > views.len() {
         return Err(anyhow!("line range exceeds total lines"));
@@ -760,10 +758,9 @@ enum NewlineKind {
 impl NewlineKind {
     fn as_bytes(self) -> &'static [u8] {
         match self {
-            NewlineKind::Lf => b"\n",
             NewlineKind::CrLf => b"\r\n",
             NewlineKind::Cr => b"\r",
-            NewlineKind::None => b"\n",
+            NewlineKind::Lf | NewlineKind::None => b"\n",
         }
     }
 
@@ -969,6 +966,7 @@ fn split_lines(bytes: &[u8]) -> (Vec<LineSlice>, NewlineStats) {
 /// line contains multi-byte UTF-8 characters. For example, in a line
 /// with an emoji (4 bytes), the boundaries would map character index 0
 /// to byte 0, character index 1 to byte 4, etc.
+#[allow(clippy::manual_let_else)]
 fn decode_line(bytes: &[u8]) -> (String, Vec<usize>) {
     if let Ok(text) = std::str::from_utf8(bytes) {
         let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
@@ -979,7 +977,6 @@ fn decode_line(bytes: &[u8]) -> (String, Vec<usize>) {
         return (text.to_string(), boundaries);
     }
 
-    const REPLACEMENT: char = '\u{FFFD}';
     let mut output = String::with_capacity(bytes.len());
     let mut boundaries = Vec::new();
     let mut i = 0usize;

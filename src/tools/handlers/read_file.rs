@@ -24,7 +24,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         show_line_numbers: Option<bool>,
     }
 
-    let req = match ToolCallOutcome::parse_args::<ReadRequest>(args) {
+    let req = match ToolCallOutcome::parse_args::<ReadRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
@@ -102,7 +102,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
         // Keep the file's original line endings from `split_lines_with_endings`.
         if show_line_numbers {
-            let _ = write!(body, "{:>width$}\t{}", line_no, line, width = width);
+            let _ = write!(body, "{line_no:>width$}\t{line}");
         } else {
             body.push_str(line);
         }
@@ -129,7 +129,7 @@ fn split_lines_with_endings(text: &str) -> Vec<&str> {
     while i < bytes.len() {
         match bytes[i] {
             b'\n' => {
-                lines.push(&text[start..i + 1]);
+                lines.push(&text[start..=i]);
                 start = i + 1;
                 i += 1;
             }
@@ -139,7 +139,7 @@ fn split_lines_with_endings(text: &str) -> Vec<&str> {
                     start = i + 2;
                     i += 2;
                 } else {
-                    lines.push(&text[start..i + 1]);
+                    lines.push(&text[start..=i]);
                     start = i + 1;
                     i += 1;
                 }

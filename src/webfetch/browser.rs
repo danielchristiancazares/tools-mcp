@@ -2,7 +2,7 @@
 //!
 //! This module provides a managed Chrome/Chromium browser pool that handles the
 //! complexity of headless browser automation for web scraping. It uses the
-//! Chrome DevTools Protocol (CDP) via the `chromiumoxide` crate.
+//! Chrome `DevTools` Protocol (CDP) via the `chromiumoxide` crate.
 //!
 //! ## Architecture
 //!
@@ -271,8 +271,7 @@ impl BrowserPool {
             Ok(Ok(html)) => Ok(html),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!(
-                "Browser rendering timed out after {:?}",
-                NAVIGATION_TIMEOUT
+                "Browser rendering timed out after {NAVIGATION_TIMEOUT:?}"
             )),
         }
     }
@@ -286,7 +285,7 @@ impl BrowserPool {
     ///
     /// Call this before attempting browser rendering to provide graceful
     /// fallback to HTTP-only mode when Chrome is not installed.
-    pub async fn is_available() -> bool {
+    pub fn is_available() -> bool {
         find_chrome_binary().is_some()
     }
 }
@@ -325,7 +324,7 @@ impl Drop for BrowserPool {
 ///
 /// # Returns
 ///
-/// A `Browser` handle connected via Chrome DevTools Protocol (CDP).
+/// A `Browser` handle connected via Chrome `DevTools` Protocol (CDP).
 ///
 /// # Errors
 ///
@@ -372,7 +371,7 @@ async fn spawn_browser() -> Result<Browser> {
             "--safebrowsing-disable-auto-update".to_string(),
         ])
         .build()
-        .map_err(|e| anyhow!("Failed to build browser config: {}", e))?;
+        .map_err(|e| anyhow!("Failed to build browser config: {e}"))?;
 
     let (browser, mut handler) = Browser::launch(config)
         .await
@@ -473,7 +472,7 @@ async fn configure_stealth(page: &Page) -> Result<()> {
 
     // Inject JavaScript patches to mask headless browser indicators.
     // These run before any page JavaScript executes.
-    let stealth_script = r#"
+    let stealth_script = r"
         // Override navigator.webdriver - headless browsers set this to true
         Object.defineProperty(navigator, 'webdriver', {
             get: () => false
@@ -488,7 +487,7 @@ async fn configure_stealth(page: &Page) -> Result<()> {
         Object.defineProperty(navigator, 'languages', {
             get: () => ['en-US', 'en']
         });
-    "#;
+    ";
 
     page.evaluate(stealth_script)
         .await
@@ -623,26 +622,6 @@ fn find_chrome_binary() -> Option<String> {
         }
     }
 
-    // Try PATH lookup via which (Unix) or where (Windows)
-    fn find_in_path(bin: &str) -> Option<String> {
-        let cmd = if cfg!(target_os = "windows") {
-            "where"
-        } else {
-            "which"
-        };
-        let output = std::process::Command::new(cmd).arg(bin).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let first = stdout.lines().next()?.trim();
-        if first.is_empty() {
-            None
-        } else {
-            Some(first.to_string())
-        }
-    }
-
     for bin in [
         "google-chrome",
         "chrome",
@@ -651,7 +630,7 @@ fn find_chrome_binary() -> Option<String> {
         "msedge",
         "microsoft-edge",
     ] {
-        if let Some(p) = find_in_path(bin) {
+        if let Some(p) = find_binary_in_path(bin) {
             return Some(p);
         }
     }
@@ -659,12 +638,31 @@ fn find_chrome_binary() -> Option<String> {
     None
 }
 
+fn find_binary_in_path(bin: &str) -> Option<String> {
+    let cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    let output = std::process::Command::new(cmd).arg(bin).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?.trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Requires Chrome/Chromium installation
+    #[ignore = "requires Chrome/Chromium installation"]
     async fn test_browser_pool_creation() {
         let pool = BrowserPool::new();
         assert!(
@@ -674,17 +672,17 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Chrome/Chromium installation
+    #[ignore = "requires Chrome/Chromium installation"]
     async fn test_chrome_detection() {
-        let is_available = BrowserPool::is_available().await;
-        println!("Chrome available: {}", is_available);
+        let is_available = BrowserPool::is_available();
+        println!("Chrome available: {is_available}");
         // Don't assert - this depends on system configuration
     }
 
     #[tokio::test]
-    #[ignore] // Requires Chrome/Chromium installation and network
+    #[ignore = "requires Chrome/Chromium installation and network"]
     async fn test_render_simple_page() {
-        if !BrowserPool::is_available().await {
+        if !BrowserPool::is_available() {
             println!("Skipping test - Chrome not available");
             return;
         }
@@ -701,7 +699,7 @@ mod tests {
                 assert!(html.len() > 100, "Should have substantial HTML content");
             }
             Err(e) => {
-                println!("Render failed (might be network issue): {}", e);
+                println!("Render failed (might be network issue): {e}");
             }
         }
     }

@@ -23,7 +23,7 @@
 //!    - `127.0.0.0/8` (loopback)
 //!    - `169.254.0.0/16` (link-local)
 //!    - `100.64.0.0/10` (carrier-grade NAT)
-//!    - IPv6 equivalents (::1, fc00::/7, fe80::/10)
+//!    - IPv6 equivalents (`::1`, `fc00::/7`, `fe80::/10`)
 //!
 //! 4. **DNS resolution validation**: Resolves hostnames and checks all
 //!    returned IPs. Blocks if ANY resolved IP is private/reserved.
@@ -239,8 +239,7 @@ async fn validate_url_ssrf_and_resolve(url: &str) -> Result<Option<(String, Sock
         "http" | "https" => {}
         scheme => {
             return Err(anyhow!(
-                "URL scheme '{}' not allowed (only http/https permitted)",
-                scheme
+                "URL scheme '{scheme}' not allowed (only http/https permitted)"
             ));
         }
     }
@@ -258,7 +257,7 @@ async fn validate_url_ssrf_and_resolve(url: &str) -> Result<Option<(String, Sock
     // If hostname is an IP address, check if it's private and skip DNS pinning.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_ip(ip) {
-            return Err(anyhow!("Cannot fetch from private IP address: {}", ip));
+            return Err(anyhow!("Cannot fetch from private IP address: {ip}"));
         }
         return Ok(None);
     }
@@ -270,14 +269,13 @@ async fn validate_url_ssrf_and_resolve(url: &str) -> Result<Option<(String, Sock
 
     let addrs = tokio::net::lookup_host((host, port))
         .await
-        .with_context(|| format!("DNS resolution failed for host '{}':", host))?;
+        .with_context(|| format!("DNS resolution failed for host '{host}':"))?;
 
     let mut chosen: Option<SocketAddr> = None;
     for addr in addrs {
         if is_private_ip(addr.ip()) {
             return Err(anyhow!(
-                "Resolved host '{}' maps to a private/reserved IP; refusing to fetch",
-                host
+                "Resolved host '{host}' maps to a private/reserved IP; refusing to fetch"
             ));
         }
         if chosen.is_none() {
@@ -304,10 +302,10 @@ fn get_robots_url(url: &str) -> Result<String> {
     let host_str = match host {
         Host::Domain(d) => d.to_string(),
         Host::Ipv4(ip) => ip.to_string(),
-        Host::Ipv6(ip) => format!("[{}]", ip),
+        Host::Ipv6(ip) => format!("[{ip}]"),
     };
-    let port = parsed.port().map(|p| format!(":{}", p)).unwrap_or_default();
-    Ok(format!("{}://{}{}/robots.txt", scheme, host_str, port))
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Ok(format!("{scheme}://{host_str}{port}/robots.txt"))
 }
 
 /// Fetches and caches robots.txt content for a domain.
@@ -317,7 +315,7 @@ fn get_robots_url(url: &str) -> Result<String> {
 /// - Results are cached by origin (scheme://host:port)
 /// - Both successful fetches AND 404s are cached (None = no robots.txt)
 /// - Cache is bounded to 1024 entries; cleared entirely when full
-/// - Cache uses RwLock for concurrent read access
+/// - Cache uses `RwLock` for concurrent read access
 ///
 /// ## Return Values
 ///
@@ -331,7 +329,7 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
     let host_str = match host {
         Host::Domain(d) => d.to_string(),
         Host::Ipv4(ip) => ip.to_string(),
-        Host::Ipv6(ip) => format!("[{}]", ip),
+        Host::Ipv6(ip) => format!("[{ip}]"),
     };
     let port = parsed
         .port_or_known_default()
@@ -458,7 +456,7 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
 
         // Check robots.txt
         if !is_allowed_by_robots(&pinned_client, &current_url).await? {
-            return Err(anyhow!("URL disallowed by robots.txt: {}", current_url));
+            return Err(anyhow!("URL disallowed by robots.txt: {current_url}"));
         }
 
         let mut builder = pinned_client
@@ -493,14 +491,11 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow!("redirect without Location header from {}", current_url))?;
+                .ok_or_else(|| anyhow!("redirect without Location header from {current_url}"))?;
 
             let base = Url::parse(&current_url)?;
             let next = base.join(location).with_context(|| {
-                format!(
-                    "invalid redirect Location '{}' from {}",
-                    location, current_url
-                )
+                format!("invalid redirect Location '{location}' from {current_url}")
             })?;
             current_url = next.to_string();
             redirects_followed += 1;
@@ -510,18 +505,14 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
         if status == StatusCode::NOT_FOUND {
             return Err(anyhow!("HTTP 404: resource not found"));
         } else if !status.is_success() {
-            return Err(anyhow!(
-                "http error {} when fetching {}",
-                status,
-                current_url
-            ));
+            return Err(anyhow!("http error {status} when fetching {current_url}"));
         }
 
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let fetched_at = Utc::now();
         let bytes = response.bytes().await?;
         return Ok(FetchedBody {

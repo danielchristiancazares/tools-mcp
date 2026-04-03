@@ -21,14 +21,14 @@ pub const DEFAULT_GLOB_LIMIT: usize = 1000;
 /// Maximum limit for glob file matches.
 pub const MAX_GLOB_LIMIT: usize = 10_000;
 
-/// Default timeout for PowerShell commands.
+/// Default timeout for `PowerShell` commands.
 pub const DEFAULT_PWSH_TIMEOUT_MS: u64 = 60_000;
 
-/// Maximum PowerShell command timeout.
+/// Maximum `PowerShell` command timeout.
 pub const MAX_PWSH_TIMEOUT_MS: u64 = 300_000;
 
-/// Maximum stdout capture for PowerShell commands.
+/// Maximum stdout capture for `PowerShell` commands.
 pub const MAX_PWSH_STDOUT_BYTES: usize = 1_000_000;
 
-/// Maximum stderr capture for PowerShell commands.
+/// Maximum stderr capture for `PowerShell` commands.
 pub const MAX_PWSH_STDERR_BYTES: usize = 500_000;

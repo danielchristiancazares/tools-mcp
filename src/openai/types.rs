@@ -1,25 +1,25 @@
-//! OpenAI API type definitions.
+//! `OpenAI` API type definitions.
 //!
-//! This module contains all the public types used for OpenAI API interactions,
+//! This module contains all the public types used for `OpenAI` API interactions,
 //! including response structures, configuration, and file metadata.
 
 use serde::{Deserialize, Serialize};
 
-/// Represents a complete response from OpenAI's Responses API.
+/// Represents a complete response from `OpenAI`'s Responses API.
 ///
 /// This struct captures the full response payload from a Responses API call,
 /// including the generated output, status information, and optional error/usage data.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ResponseObject {
-    /// Unique identifier for this response (e.g., "resp_abc123").
+    /// Unique identifier for this response (e.g., `"resp_abc123"`).
     pub id: String,
-    /// Object type, always "response" for Responses API.
+    /// Object type, always `"response"` for the Responses API.
     pub object: String,
     /// Unix timestamp (seconds) when the response was created.
     pub created_at: i64,
-    /// Current status: "completed", "failed", "in_progress", etc.
+    /// Current status: "completed", "failed", "`in_progress`", etc.
     pub status: String,
-    /// Model used to generate the response (e.g., "gpt-4o").
+    /// Model used to generate the response (e.g., `"gpt-4o"`).
     pub model: String,
     /// List of output items produced by the model.
     pub output: Vec<OutputItem>,
@@ -60,7 +60,7 @@ pub struct MessageOutput {
     pub content: Vec<ContentItem>,
 }
 
-/// Output from a file_search tool invocation.
+/// Output from a `file_search` tool invocation.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FileSearchOutput {
     /// Unique identifier for this tool call.
@@ -78,10 +78,10 @@ pub struct FileSearchOutput {
 /// A content block within a message output.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ContentItem {
-    /// The type of content: "output_text", "refusal", etc.
+    /// The type of content: `"output_text"`, `"refusal"`, etc.
     #[serde(rename = "type")]
     pub content_type: String,
-    /// The text content (present for "output_text" type).
+    /// The text content (present for "`output_text`" type).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// Annotations attached to this content.
@@ -91,6 +91,7 @@ pub struct ContentItem {
 
 impl ResponseObject {
     /// Extracts the main text content from the response, optionally including search results.
+    #[must_use]
     pub fn extract_text(&self, include_results: bool) -> String {
         use std::fmt::Write as _;
 
@@ -119,7 +120,7 @@ impl ResponseObject {
                 for (i, r) in results.iter().take(5).enumerate() {
                     if let (Some(filename), Some(score)) = (
                         r.get("filename").and_then(|v| v.as_str()),
-                        r.get("score").and_then(|v| v.as_f64()),
+                        r.get("score").and_then(serde_json::Value::as_f64),
                     ) {
                         let _ = write!(
                             result,
@@ -157,6 +158,7 @@ impl ResponseObject {
 ///
 /// This is a fast-path for callers that already have a `serde_json::Value` response and want to
 /// avoid deserializing into [`ResponseObject`] just to extract text.
+#[must_use]
 pub fn extract_text_from_response_value(
     response: &serde_json::Value,
     include_results: bool,
@@ -201,7 +203,7 @@ pub fn extract_text_from_response_value(
             for (i, r) in results.iter().take(5).enumerate() {
                 let (Some(filename), Some(score)) = (
                     r.get("filename").and_then(|v| v.as_str()),
-                    r.get("score").and_then(|v| v.as_f64()),
+                    r.get("score").and_then(serde_json::Value::as_f64),
                 ) else {
                     continue;
                 };
@@ -235,10 +237,10 @@ pub fn extract_text_from_response_value(
     result
 }
 
-/// Configuration for OpenAI API authentication and defaults.
+/// Configuration for `OpenAI` API authentication and defaults.
 #[derive(Clone)]
 pub struct ApiConfig {
-    /// OpenAI API key for authentication.
+    /// `OpenAI` API key for authentication.
     pub api_key: String,
     /// Default model to use when not explicitly specified.
     pub default_model: String,
@@ -254,7 +256,7 @@ impl ApiConfig {
     }
 }
 
-/// Response from OpenAI's file upload endpoint.
+/// Response from `OpenAI`'s file upload endpoint.
 #[derive(Deserialize, Debug)]
 pub struct FileObj {
     /// Unique file identifier (e.g., "file-abc123").
@@ -264,7 +266,7 @@ pub struct FileObj {
 /// Response from vector store creation.
 #[derive(Deserialize, Debug)]
 pub struct VectorStore {
-    /// Unique vector store identifier (e.g., "vs_abc123").
+    /// Unique vector store identifier (e.g., "`vs_abc123`").
     pub id: String,
 }
 
@@ -336,7 +338,7 @@ pub struct VectorStoreFilesList {
 pub struct VectorStoreFileItem {
     /// Unique identifier for this vector store file relationship.
     pub id: String,
-    /// Indexing status: "in_progress", "completed", "failed", "cancelled".
+    /// Indexing status: "`in_progress`", "completed", "failed", "cancelled".
     pub status: String,
     /// Nested file object (present in some API responses).
     #[serde(default)]

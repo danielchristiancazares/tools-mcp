@@ -1,10 +1,10 @@
-//! Default WebFetch adapter: delegates to [`crate::webfetch::run_fetch`] unchanged.
+//! Default `WebFetch` adapter: delegates to [`crate::webfetch::run_fetch`] unchanged.
 
 use crate::ports::WebFetcher;
 use anyhow::Result;
 use std::pin::Pin;
 
-/// Runs the existing WebFetch pipeline (SSRF, robots, cache, browser fallback, chunking).
+/// Runs the existing `WebFetch` pipeline (SSRF, robots, cache, browser fallback, chunking).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RunFetchWebFetcher;
 

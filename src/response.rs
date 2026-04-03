@@ -98,6 +98,7 @@ impl RpcResponse<'static> {
     /// ```ignore
     /// RpcResponse::ok(Some(json!(1)), json!({"status": "ready"}))
     /// ```
+    #[must_use]
     pub fn ok(id: Option<Value>, result: Value) -> RpcResponse<'static> {
         RpcResponse {
             jsonrpc: "2.0",
@@ -225,7 +226,7 @@ impl RpcResponse<'static> {
     /// If serialization fails, a fallback error message is returned instead.
     pub fn ok_json_content(
         id: Option<Value>,
-        json_value: Value,
+        json_value: &Value,
         is_error: bool,
     ) -> RpcResponse<'static> {
         static PRETTY_JSON: OnceLock<bool> = OnceLock::new();
@@ -236,11 +237,11 @@ impl RpcResponse<'static> {
         });
 
         let json_text = if pretty {
-            serde_json::to_string_pretty(&json_value)
+            serde_json::to_string_pretty(json_value)
         } else {
-            serde_json::to_string(&json_value)
+            serde_json::to_string(json_value)
         }
-        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
         RpcResponse::ok(
             id,
             serde_json::json!({
@@ -275,11 +276,15 @@ impl RpcResponse<'static> {
     /// ```ignore
     /// let args: MyToolArgs = RpcResponse::parse(id.clone(), args)?;
     /// ```
+    /// # Errors
+    ///
+    /// Returns an error response when argument parsing fails due to unknown fields,
+    /// missing fields, or incompatible types.
     pub fn parse<T: serde::de::DeserializeOwned>(
         id: Option<Value>,
-        args: Value,
+        args: &Value,
     ) -> Result<T, Box<RpcResponse<'static>>> {
-        serde_json::from_value::<T>(args).map_err(|e| {
+        serde_json::from_value::<T>(args.clone()).map_err(|e| {
             let msg = e.to_string();
             // Serde's error strings are informative but not always prescriptive.
             // Add short remediation hints for the most common failure modes.

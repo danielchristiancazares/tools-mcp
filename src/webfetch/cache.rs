@@ -1,4 +1,4 @@
-//! Disk-based caching for WebFetch responses.
+//! Disk-based caching for `WebFetch` responses.
 //!
 //! This module provides persistent caching of fetched web content to avoid
 //! redundant network requests. Cached entries include the response body,
@@ -48,7 +48,7 @@ use std::path::PathBuf;
 // Cache Directory Management
 // ============================================================================
 
-/// Returns the root directory for WebFetch cache files.
+/// Returns the root directory for `WebFetch` cache files.
 ///
 /// Uses the platform's temp directory for cross-platform compatibility
 /// and to ensure the cache is cleaned up on system restart (on some systems).
@@ -95,7 +95,7 @@ pub fn cache_path_for(url: &str) -> Result<PathBuf> {
 /// A cached HTTP response with metadata.
 ///
 /// This structure is serialized to JSON for disk storage. The body is stored
-/// as raw bytes, which serde_json encodes as a byte array.
+/// as raw bytes, which `serde_json` encodes as a byte array.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CachedFetch {
     /// The Content-Type header from the original response.

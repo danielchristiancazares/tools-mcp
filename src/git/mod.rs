@@ -174,22 +174,21 @@ pub(crate) async fn run_git(
         tokio::spawn(async move { read_to_end_limited(stderr, max_stderr_bytes).await });
 
     let mut timed_out = false;
-    let status = match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(res) => res?,
-        Err(_) => {
+    let status =
+        if let Ok(res) = time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+            res?
+        } else {
             timed_out = true;
             let _ = child.kill().await;
             match time::timeout(Duration::from_millis(2_000), child.wait()).await {
                 Ok(res) => res?,
                 Err(_) => {
                     return Err(anyhow::anyhow!(
-                        "git command timed out after {} ms and did not terminate",
-                        timeout_ms
+                        "git command timed out after {timeout_ms} ms and did not terminate"
                     ));
                 }
             }
-        }
-    };
+        };
 
     let exit_code = status.code();
 

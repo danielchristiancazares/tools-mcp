@@ -1,16 +1,16 @@
-//! File extension validation and classification for OpenAI operations.
+//! File extension validation and classification for `OpenAI` operations.
 //!
 //! This module provides functions to determine:
-//! - Which file extensions are allowed for upload to OpenAI
+//! - Which file extensions are allowed for upload to `OpenAI`
 //! - Which extensions indicate binary content (unsuitable for code search)
-//! - Which extensions indicate source code (suitable for CodeQuery indexing)
+//! - Which extensions indicate source code (suitable for `CodeQuery` indexing)
 
 use std::borrow::Cow;
 use std::path::Path;
 
-/// Checks if a file extension is allowed for direct upload to OpenAI.
+/// Checks if a file extension is allowed for direct upload to `OpenAI`.
 ///
-/// OpenAI's Files API only accepts specific file formats. The check is case-insensitive.
+/// `OpenAI`'s Files API only accepts specific file formats. The check is case-insensitive.
 ///
 /// # Allowed Extensions
 ///
@@ -19,6 +19,7 @@ use std::path::Path;
 /// Images: `gif`, `jpeg`, `jpg`, `png`, `webp`
 /// Archives: `tar`, `zip`
 /// Other: `pkl`
+#[must_use]
 pub fn is_allowed_upload_ext(ext: &str) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
@@ -54,7 +55,7 @@ pub fn is_allowed_upload_ext(ext: &str) -> bool {
     )
 }
 
-/// Checks if a file extension indicates binary content unsuitable for CodeQuery indexing.
+/// Checks if a file extension indicates binary content unsuitable for `CodeQuery` indexing.
 ///
 /// # Categories Blocked
 ///
@@ -64,6 +65,7 @@ pub fn is_allowed_upload_ext(ext: &str) -> bool {
 /// - **Executables**: exe, dll, so, dylib, a, lib, o, obj, class, jar, wasm
 /// - **Binary data**: pkl, db, sqlite, sqlite3
 /// - **Office/PDF**: pdf, doc, docx, ppt, pptx, xls, xlsx
+#[must_use]
 pub fn is_codequery_binary_ext(ext: &str) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
@@ -84,11 +86,12 @@ pub fn is_codequery_binary_ext(ext: &str) -> bool {
     )
 }
 
-/// Checks if a file extension indicates source code suitable for CodeQuery indexing.
+/// Checks if a file extension indicates source code suitable for `CodeQuery` indexing.
 ///
 /// # Supported Languages
 ///
 /// Rust, C/C++, Go, Java/Kotlin, Swift, Python, Ruby, PHP, JavaScript/TypeScript
+#[must_use]
 pub fn is_codequery_indexable_ext(ext: &str) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
@@ -111,25 +114,26 @@ pub fn is_codequery_indexable_ext(ext: &str) -> bool {
     )
 }
 
-/// Checks if a filename (without extension) should be indexed by CodeQuery.
+/// Checks if a filename (without extension) should be indexed by `CodeQuery`.
 ///
-/// Currently always returns `false` - CodeQuery only indexes files with explicit code extensions.
+/// Currently always returns `false` - `CodeQuery` only indexes files with explicit code extensions.
 #[inline]
+#[must_use]
 pub fn is_codequery_indexable_filename(_file_name: &str) -> bool {
     false
 }
 
-/// Determines if a file path should be indexed by CodeQuery.
+/// Determines if a file path should be indexed by `CodeQuery`.
 ///
 /// Applies multiple rules:
 /// 1. Dotfiles excluded (files starting with `.`)
 /// 2. Markdown excluded (`.md` files)
 /// 3. Binary extensions blocked
 /// 4. Only explicit code extensions pass
+#[must_use]
 pub fn is_codequery_indexable_path(path: &Path) -> bool {
-    let file_name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name,
-        None => return false,
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
     };
 
     // Skip dotfiles
@@ -142,9 +146,8 @@ pub fn is_codequery_indexable_path(path: &Path) -> bool {
         return true;
     }
 
-    let ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => e,
-        None => return false,
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
     };
 
     // Skip markdown (documentation, not code)
@@ -161,9 +164,10 @@ pub fn is_codequery_indexable_path(path: &Path) -> bool {
     is_codequery_indexable_ext(ext)
 }
 
-/// Computes the filename to use for OpenAI upload, converting unsupported extensions to `.txt`.
+/// Computes the filename to use for `OpenAI` upload, converting unsupported extensions to `.txt`.
 ///
 /// If the file's extension is not in the allowed list, the filename is modified to use `.txt`.
+#[must_use]
 pub fn compute_upload_filename(original_filename: &str) -> Cow<'_, str> {
     let p = Path::new(original_filename);
 
@@ -177,9 +181,9 @@ pub fn compute_upload_filename(original_filename: &str) -> Cow<'_, str> {
             .unwrap_or(original_filename);
 
         if stem == original_filename {
-            Cow::Owned(format!("{}.txt", original_filename))
+            Cow::Owned(format!("{original_filename}.txt"))
         } else {
-            Cow::Owned(format!("{}.txt", stem))
+            Cow::Owned(format!("{stem}.txt"))
         }
     }
 }
