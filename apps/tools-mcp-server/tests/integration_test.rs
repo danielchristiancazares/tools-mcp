@@ -1,116 +1,13 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use support::{
+    read_server_response, send_mcp_message, send_mcp_message_with_headers, spawn_server,
+};
 
 const READ_HANDLER_PATH: &str = "crates/tools-mcp-local/src/tools/handlers/read_file.rs";
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("apps dir")
-        .parent()
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn spawn_server() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tools-mcp-server"));
-    command
-        .current_dir(workspace_root())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    command
-}
-
-fn read_server_response<R: BufRead>(reader: &mut R) -> Result<String, Box<dyn std::error::Error>> {
-    let mut content_length = None;
-    let mut line_response = None;
-
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            break;
-        }
-
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>()?);
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            if let Some(len) = content_length {
-                let mut buffer = vec![0u8; len];
-                reader.read_exact(&mut buffer)?;
-                return Ok(String::from_utf8(buffer)?);
-            }
-            continue;
-        }
-
-        line_response = Some(line);
-        break;
-    }
-
-    line_response.ok_or_else(|| "No response received".into())
-}
-
-/// Helper function to send a message to the MCP server and get response
-fn send_mcp_message(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut child = spawn_server().spawn()?;
-
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-
-    // Send the message
-    let msg_str = message.to_string();
-    stdin.write_all(msg_str.as_bytes())?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-
-    // Close stdin to signal EOF to the server
-    drop(stdin);
-
-    // Read response with timeout
-    let mut reader = BufReader::new(stdout);
-    let response = read_server_response(&mut reader)?;
-
-    // Kill the child process (in case it hasn't exited)
-    let _ = child.kill();
-    let _ = child.wait(); // Clean up zombie
-
-    // Parse and return the JSON response
-    Ok(serde_json::from_str(&response)?)
-}
-
-/// Helper to send message with Content-Length header
-fn send_mcp_message_with_headers(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut child = spawn_server().spawn()?;
-
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-
-    // Send with Content-Length header
-    let msg_str = message.to_string();
-    let header = format!("Content-Length: {}\r\n\r\n", msg_str.len());
-    stdin.write_all(header.as_bytes())?;
-    stdin.write_all(msg_str.as_bytes())?;
-    stdin.flush()?;
-
-    // Close stdin to signal EOF
-    drop(stdin);
-
-    // Read response with headers
-    let mut reader = BufReader::new(stdout);
-    let response_str = read_server_response(&mut reader)?;
-
-    // Kill the child process and clean up
-    let _ = child.kill();
-    let _ = child.wait();
-
-    Ok(serde_json::from_str(&response_str)?)
-}
 
 #[test]
 fn test_ping() {
@@ -143,7 +40,7 @@ fn test_mcp_initialize() {
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 2);
-    assert!(response["result"]["serverInfo"]["name"].is_string());
+    assert_eq!(response["result"]["serverInfo"]["name"], "tools-mcp-server");
     assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
 }
 
@@ -210,6 +107,54 @@ fn test_ping_tool_call() {
         Some("pong")
     );
     assert_eq!(response["result"]["isError"], false);
+}
+
+#[test]
+fn test_unknown_fields_are_rejected_for_tool_requests() {
+    let ping_request = json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Ping",
+            "arguments": {
+                "bogus": true
+            }
+        }
+    });
+    let ping_response = send_mcp_message(&ping_request).expect("Ping should reject unknown field");
+    assert_eq!(ping_response["jsonrpc"], "2.0");
+    assert_eq!(ping_response["id"], 8);
+    assert_eq!(ping_response["result"]["isError"], true);
+    assert!(
+        ping_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown fields are not allowed")
+    );
+
+    let git_status_request = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "GitStatus",
+            "arguments": {
+                "bogus": true
+            }
+        }
+    });
+    let git_status_response =
+        send_mcp_message(&git_status_request).expect("GitStatus should reject unknown field");
+    assert_eq!(git_status_response["jsonrpc"], "2.0");
+    assert_eq!(git_status_response["id"], 9);
+    assert_eq!(git_status_response["result"]["isError"], true);
+    assert!(
+        git_status_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown fields are not allowed")
+    );
 }
 
 #[test]

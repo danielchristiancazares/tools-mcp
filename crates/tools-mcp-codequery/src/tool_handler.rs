@@ -95,6 +95,7 @@
 use anyhow::{Result, anyhow};
 use ignore::{DirEntry, WalkBuilder};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -109,6 +110,29 @@ struct WorkspaceScope {
     root: PathBuf,
     cache_key: String,
     default_store_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeQueryRequest {
+    #[serde(default)]
+    vector_store_id: Option<String>,
+    #[serde(default)]
+    vector_store_name: Option<String>,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    file_paths: Vec<String>,
+    #[serde(default)]
+    concurrent_limit: Option<u64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    max_num_results: Option<u64>,
+    #[serde(default)]
+    include_results: Option<bool>,
 }
 
 /// Handles the `CodeQuery` MCP tool invocation.
@@ -167,6 +191,11 @@ struct WorkspaceScope {
 /// let response = handle_code_query(Some(json!(1)), args).await;
 /// ```
 pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+    let req = match ToolCallOutcome::parse_args::<CodeQueryRequest>(&args) {
+        Ok(req) => req,
+        Err(o) => return o,
+    };
+
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
         return ToolCallOutcome::err_with(
@@ -185,20 +214,20 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
         );
     }
 
-    let vector_store_id_arg = args
-        .get("vector_store_id")
-        .and_then(|v| v.as_str())
+    let vector_store_id_arg = req
+        .vector_store_id
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(std::string::ToString::to_string);
-    let explicit_vector_store_name = args
-        .get("vector_store_name")
-        .and_then(|v| v.as_str())
+    let explicit_vector_store_name = req
+        .vector_store_name
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(std::string::ToString::to_string);
     let mut vector_store_name = explicit_vector_store_name.clone();
-    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let query = req.query.as_str();
 
     if let Err(o) = validation::validate_non_empty(query, "query", None) {
         return o;
@@ -227,15 +256,7 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
         None
     };
 
-    let mut file_paths: Vec<String> = args
-        .get("file_paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|val| val.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut file_paths = req.file_paths;
 
     if file_paths.is_empty() {
         match discover_default_file_paths(
@@ -260,38 +281,23 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
         }
     }
 
-    let concurrent_limit = args
-        .get("concurrent_limit")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(5) as usize;
+    let concurrent_limit = req.concurrent_limit.unwrap_or(5) as usize;
     if !(1..=20).contains(&concurrent_limit) {
         return ToolCallOutcome::err(format!(
             "concurrent_limit must be between 1 and 20 (got {concurrent_limit}). Use a smaller value to reduce API concurrency."
         ));
     }
 
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(60_000);
+    let timeout_ms = req.timeout_ms.unwrap_or(60_000);
     if timeout_ms < 1_000 {
         return ToolCallOutcome::err(format!(
             "timeout_ms must be at least 1000 milliseconds (got {timeout_ms}). Increase timeout_ms for large repos or slow networks."
         ));
     }
 
-    let include_results = args
-        .get("include_results")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let max_num_results = args
-        .get("max_num_results")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| n as u32);
-    let model_override = args
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string);
+    let include_results = req.include_results.unwrap_or(false);
+    let max_num_results = req.max_num_results.map(|n| n as u32);
+    let model_override = req.model;
 
     let client = reqwest::Client::new();
     let cfg = openai_file_search_core::ApiConfig::new(

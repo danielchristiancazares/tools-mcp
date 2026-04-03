@@ -116,6 +116,7 @@ use tools_mcp_core::ToolCallOutcome;
 
 /// Edit request - just path, `old_snippet`, `new_snippet`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SimpleEditRequest {
     path: String,
     old_snippet: String,

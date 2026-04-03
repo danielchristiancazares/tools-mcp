@@ -69,6 +69,7 @@ fn classify_success(
 /// - Exit code semantics: 0 = matches found, 1 = no matches, 2 = error.
 pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct RgRequest {
         /// Regex (or literal if `fixed_strings=true`).
         pattern: String,

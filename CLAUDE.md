@@ -301,35 +301,35 @@ async fn test_file_search_flow() {
 
 ## Primary Components
 
-1. **MCP Server** (`src/main.rs`, `src/tool_registry.rs`)
+1. **MCP Server** (`apps/tools-mcp-server/src/main.rs`, `crates/tools-mcp-core/src/tool_registry.rs`)
    - JSON-RPC protocol over stdin/stdout
    - Tool registration and dispatch system
    - Protocol alias handling for compatibility
 
-2. **OpenAI Vector Store Client** (`src/lib.rs`)
+2. **OpenAI Vector Store Client** (`crates/openai-file-search-core/src/lib.rs`)
    - File upload with automatic extension handling
    - Vector store creation and management
    - Semantic search via Responses API
    - Hash-based reindexing with change detection
 
-3. **CodeQuery** (`src/codequery/`)
+3. **CodeQuery** (`crates/tools-mcp-codequery/src/`)
    - Semantic code search orchestration
    - Automatic file discovery respecting .gitignore
    - Vector store caching and resolution
    - Incremental update processing
 
-4. **WebFetch** (`src/webfetch/`)
+4. **WebFetch** (`crates/tools-mcp-webfetch/src/webfetch/`)
    - HTTP-first with automatic browser fallback
    - SSRF protection and robots.txt compliance
    - HTML to Markdown conversion
    - Token-aware chunking for LLM consumption
 
-5. **Smart File Edit** (`src/smart_file_edit/`)
+5. **Smart File Edit** (`crates/tools-mcp-local/src/smart_file_edit/`)
    - Line ending preservation (LF/CRLF/CR)
    - Canonical LF processing with original format retention
    - Snippet replacement and unified diff support
 
-6. **Git Tools** (`src/git_tools.rs`)
+6. **Git Tools** (`crates/tools-mcp-git/src/tools.rs`, `crates/tools-mcp-git/src/git/mod.rs`)
    - GitStatus, GitDiff, GitRestore, GitAdd, GitCommit
    - Porcelain output parsing
    - Timeout and output limit enforcement

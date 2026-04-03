@@ -18,7 +18,8 @@ define_mcp_tool! {
             "branch": {"type": "boolean", "default": true, "description": "Include branch info (`-b`) in porcelain mode"},
             "untracked": {"type": "boolean", "default": true, "description": "Include untracked files in porcelain mode (when false, uses `-uno`)"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_status
 }
@@ -42,7 +43,8 @@ define_mcp_tool! {
             "to_ref": {"type": "string", "description": "Ending ref (tag/branch/commit) for ref-to-ref comparison"},
             "output_dir": {"type": "string", "description": "Directory to write per-file patches (creates if missing). Required with from_ref/to_ref."}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_diff
 }
@@ -60,7 +62,8 @@ define_mcp_tool! {
             "staged": {"type": "boolean", "default": false, "description": "Restore the index/staging area (`--staged`)"},
             "worktree": {"type": "boolean", "default": true, "description": "Restore the working tree (`--worktree`) (default true)"}
         },
-        "required": ["paths"]
+        "required": ["paths"],
+        "additionalProperties": false
     },
     handler: handle_git_restore
 }
@@ -78,7 +81,8 @@ define_mcp_tool! {
             "working_dir": {"type": "string", "description": "Optional working directory"},
             "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_add
 }
@@ -96,7 +100,8 @@ define_mcp_tool! {
             "working_dir": {"type": "string", "description": "Optional working directory"},
             "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds"}
         },
-        "required": ["type", "message"]
+        "required": ["type", "message"],
+        "additionalProperties": false
     },
     handler: handle_git_commit
 }
@@ -120,7 +125,8 @@ define_mcp_tool! {
             "path": {"type": "string", "description": "Show commits affecting this path"},
             "max_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "default": 200000, "description": "Maximum output bytes"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_log
 }
@@ -142,7 +148,8 @@ define_mcp_tool! {
             "rename": {"type": "string", "description": "Rename this branch (requires new_name)"},
             "new_name": {"type": "string", "description": "New name when renaming a branch"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_branch
 }
@@ -161,7 +168,8 @@ define_mcp_tool! {
             "commit": {"type": "string", "description": "Checkout a specific commit (detached HEAD)"},
             "paths": {"type": "array", "items": {"type": "string"}, "description": "Restore these paths from HEAD or specified commit"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_checkout
 }
@@ -180,7 +188,8 @@ define_mcp_tool! {
             "index": {"type": "integer", "minimum": 0, "description": "Stash index for pop/apply/drop/show"},
             "include_untracked": {"type": "boolean", "default": false, "description": "Include untracked files (with push)"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_stash
 }
@@ -200,7 +209,8 @@ define_mcp_tool! {
             "format": {"type": "string", "description": "Pretty-print format for commit info"},
             "max_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "default": 200000, "description": "Maximum output bytes"}
         },
-        "required": []
+        "required": [],
+        "additionalProperties": false
     },
     handler: handle_git_show
 }
@@ -220,7 +230,8 @@ define_mcp_tool! {
             "commit": {"type": "string", "description": "Blame at specific commit instead of HEAD"},
             "max_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "default": 200000, "description": "Maximum output bytes"}
         },
-        "required": ["path"]
+        "required": ["path"],
+        "additionalProperties": false
     },
     handler: handle_git_blame
 }

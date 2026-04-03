@@ -1,61 +1,10 @@
 //! Golden-style contract tests: freeze observable MCP protocol and tool response shapes.
 //! These complement `integration_test.rs` with explicit structural assertions.
 
+mod support;
+
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("apps dir")
-        .parent()
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn spawn_server() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tools-mcp-server"));
-    command
-        .current_dir(workspace_root())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    command
-}
-
-fn send_mcp_message(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut child = spawn_server().spawn()?;
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let msg_str = message.to_string();
-    stdin.write_all(msg_str.as_bytes())?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    drop(stdin);
-    let mut reader = BufReader::new(stdout);
-    let mut response = String::new();
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break;
-        }
-        if line.starts_with("Content-Length:") || line.trim().is_empty() {
-            continue;
-        }
-        response = line;
-        break;
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    if response.is_empty() {
-        Err("No response received".into())
-    } else {
-        Ok(serde_json::from_str(&response)?)
-    }
-}
+use support::send_mcp_message;
 
 #[test]
 fn golden_initialize_has_tools_capabilities_and_protocol_version() {
@@ -70,7 +19,7 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
     assert_eq!(response["id"], 9001);
     let result = response["result"].as_object().expect("result object");
     assert_eq!(result["protocolVersion"], "2025-03-26");
-    assert!(result["serverInfo"]["name"].is_string());
+    assert_eq!(result["serverInfo"]["name"], "tools-mcp-server");
     assert!(result["serverInfo"]["version"].is_string());
     let caps = result["capabilities"].as_object().expect("capabilities");
     assert_eq!(caps["tools"]["list"], true);
@@ -181,6 +130,30 @@ fn golden_tools_list_returns_tools_array() {
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"Ping"));
+}
+
+#[test]
+fn golden_all_object_tool_schemas_disallow_unknown_fields() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9009,
+        "method": "mcp/tools/list",
+        "params": {}
+    });
+    let response = send_mcp_message(&request).expect("tools list");
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("<unknown>");
+        let schema = tool["inputSchema"].as_object().expect("inputSchema object");
+        if schema.get("type").and_then(Value::as_str) == Some("object") {
+            assert_eq!(
+                schema.get("additionalProperties"),
+                Some(&Value::Bool(false)),
+                "tool {name} must set additionalProperties=false"
+            );
+        }
+    }
 }
 
 #[test]

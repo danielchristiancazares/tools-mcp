@@ -101,6 +101,12 @@ pub struct BrowserPool {
     browser: Arc<Mutex<Option<BrowserInstance>>>,
 }
 
+impl Default for BrowserPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Internal state tracking for a browser process.
 ///
 /// Tracks metrics used to decide when the browser should be restarted

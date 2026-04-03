@@ -116,7 +116,8 @@ define_mcp_tool! {
                 "description": "Overwrite destination if it exists"
             }
         },
-        "required": ["source", "destination"]
+        "required": ["source", "destination"],
+        "additionalProperties": false
     },
     handler: handle_move
 }
@@ -386,7 +387,8 @@ define_mcp_tool! {
                 "description": "Copy directories recursively"
             }
         },
-        "required": ["source", "destination"]
+        "required": ["source", "destination"],
+        "additionalProperties": false
     },
     handler: handle_copy
 }
@@ -661,7 +663,8 @@ define_mcp_tool! {
                 "description": "Show detailed information (size, modified time)"
             }
         },
-        "required": ["path"]
+        "required": ["path"],
+        "additionalProperties": false
     },
     handler: handle_listdir
 }

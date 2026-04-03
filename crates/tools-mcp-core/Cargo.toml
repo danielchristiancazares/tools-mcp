@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [lib]
-doctest = false
+doctest = true
 
 [dependencies]
 anyhow.workspace = true

@@ -336,7 +336,7 @@ pub struct CodeQueryOptions<'a> {
 
 ### codequery/mod.rs - Semantic Code Search
 
-**Location**: `src/codequery/mod.rs`
+**Location**: `crates/tools-mcp-codequery/src/tool_handler.rs`
 
 Orchestrates semantic code search by combining file indexing with OpenAI's vector store queries.
 
@@ -375,7 +375,7 @@ The following directories are automatically excluded from file discovery:
 
 ### codequery/cache.rs - Vector Store ID Caching
 
-**Location**: `src/codequery/cache.rs`
+**Location**: `crates/tools-mcp-codequery/src/codequery_cache.rs`
 
 Provides disk-based caching for vector store IDs to avoid repeated API lookups.
 
@@ -393,7 +393,7 @@ pub fn cache_store_id(name: &str, id: &str)
 
 ### webfetch/mod.rs - Web Content Fetching
 
-**Location**: `src/webfetch/mod.rs`
+**Location**: `crates/tools-mcp-webfetch/src/webfetch/mod.rs`
 
 Orchestrates web content fetching with hybrid rendering (HTTP-first with browser fallback).
 
@@ -429,7 +429,7 @@ static BROWSER_POOL: OnceCell<Arc<browser::BrowserPool>> = OnceCell::const_new()
 
 ### webfetch/http.rs - HTTP Client with Security
 
-**Location**: `src/webfetch/http.rs`
+**Location**: `crates/tools-mcp-webfetch/src/webfetch/http.rs`
 
 Provides secure HTTP fetching with SSRF protection and robots.txt compliance.
 
@@ -482,7 +482,7 @@ pub fn build_http_client() -> Result<Client>
 
 ### webfetch/heuristics.rs - JS-Heavy Site Detection
 
-**Location**: `src/webfetch/heuristics.rs`
+**Location**: `crates/tools-mcp-webfetch/src/webfetch/heuristics.rs`
 
 Detects JavaScript-heavy websites that require browser rendering.
 
@@ -522,7 +522,7 @@ pub fn analyze_js_heavy(
 
 ### smart_file_edit/mod.rs - Newline-Aware File Editing
 
-**Location**: `src/smart_file_edit/mod.rs`
+**Location**: `crates/tools-mcp-local/src/smart_file_edit/mod.rs`
 
 Provides surgical file editing that preserves original line endings.
 
@@ -606,7 +606,7 @@ impl NewlineStats {
 
 ### git/mod.rs - Git Operations
 
-**Location**: `src/git/mod.rs`
+**Location**: `crates/tools-mcp-git/src/git/mod.rs`
 
 Provides git command execution with timeout and output management.
 
@@ -693,7 +693,7 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'s
 
 ### tools/handlers/ripgrep.rs - File Search
 
-**Location**: `src/tools/handlers/ripgrep.rs`
+**Location**: `crates/tools-mcp-local/src/tools/handlers/ripgrep.rs`
 
 Provides file content search using ugrep.
 
@@ -728,7 +728,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
 
 ### read_file.rs - File Reading
 
-**Location**: `src/tools/handlers/read_file.rs`
+**Location**: `crates/tools-mcp-local/src/tools/handlers/read_file.rs`
 
 ```rust
 /// Reads file contents with optional line range
@@ -750,7 +750,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
 
 ### write.rs - File Creation
 
-**Location**: `src/tools/write.rs`
+**Location**: `crates/tools-mcp-local/src/tools/write.rs`
 
 ```rust
 /// Creates a new file
@@ -772,7 +772,7 @@ pub async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static
 
 ### delete.rs - File Deletion
 
-**Location**: `src/tools/delete.rs`
+**Location**: `crates/tools-mcp-local/src/tools/delete.rs`
 
 ```rust
 /// Deletes a file (DESTRUCTIVE)
@@ -790,7 +790,7 @@ pub async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'stati
 
 ### glob.rs - File Globbing
 
-**Location**: `src/tools/glob.rs`
+**Location**: `crates/tools-mcp-local/src/tools/glob.rs`
 
 ```rust
 /// Lists files matching a glob pattern
@@ -811,7 +811,7 @@ pub async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static>
 
 ### outline.rs - C++ Structure Extraction
 
-**Location**: `src/tools/outline.rs`
+**Location**: `crates/tools-mcp-local/src/tools/outline.rs`
 
 ```rust
 /// Extracts C++ structure without implementation bodies
@@ -877,17 +877,18 @@ At a high level, CodeQuery is split across the feature crate `crates/tools-mcp-c
 - `apps/tools-mcp-server/src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `apps/tools-mcp-server/src/mcp_server.rs`.
 - `crates/tools-mcp-codequery/src/tool_handler.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `openai_file_search_core` via the feature crate's `CodeQueryEngine`.
 - `crates/tools-mcp-codequery/src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
-- `crates/openai-file-search-core/src/lib.rs`: OpenAI REST calls (files + vector stores + Responses API), plus the change-based reindexing algorithm.
+- `crates/openai-file-search-core/src/lib.rs`: public crate root and stable re-export surface for the reusable OpenAI/vector-store client.
+- `crates/openai-file-search-core/src/files.rs`, `vector_stores.rs`, `responses.rs`, `reindex.rs`: implementation modules for uploads, vector stores, Responses API calls, and change-based reindexing.
 
 **Data flow (single CodeQuery call)**
 ```text
 MCP client
-  -> src/adapters/inbound/mcp_server.rs (route tool)
-    -> src/application/codequery_tool.rs::handle_code_query (validate args, choose store, choose files)
-      -> src/lib.rs::code_query (sync files, then query with file_search)
-        -> src/lib.rs::reindex_with_retry / reindex_files (optional)
-        -> src/lib.rs::wait_for_vector_store_ready (poll once for batch indexing)
-        -> src/lib.rs::responses_with_file_search (Responses API w/ file_search tool)
+  -> apps/tools-mcp-server/src/mcp_server.rs (route tool)
+    -> crates/tools-mcp-codequery/src/tool_handler.rs::handle_code_query (validate args, choose store, choose files)
+      -> crates/openai-file-search-core/src/reindex.rs::code_query (sync files, then query with file_search)
+        -> crates/openai-file-search-core/src/reindex.rs::reindex_with_retry / reindex_files (optional)
+        -> crates/openai-file-search-core/src/vector_stores.rs::wait_for_vector_store_ready (poll once for batch indexing)
+        -> crates/openai-file-search-core/src/responses.rs::responses_with_file_search (Responses API w/ file_search tool)
       <- returns: answer text (+ optional JSON reindex summary)
 ```
 
@@ -895,7 +896,7 @@ MCP client
 - If `vector_store_id` is provided, CodeQuery uses it directly.
 - Otherwise, it uses `vector_store_name`:
   - If omitted, it defaults to the git top-level directory name plus a workspace fingerprint (so same-named repos do not collide).
-  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `src/codequery_cache.rs`).
+  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `crates/tools-mcp-codequery/src/codequery_cache.rs`).
   - If not cached, it lists vector stores and matches by name; if no match exists, it creates a new vector store and caches its ID.
   - Note: the cache path is based on `HOME` (so on Windows you may need `HOME` set for caching to work).
 
@@ -903,10 +904,10 @@ MCP client
 - If `file_paths` is omitted/empty, CodeQuery walks the git top level recursively when inside a repository, otherwise the current directory, and collects indexable files.
 - It skips common "noise" directories (e.g., `.git/`, `node_modules/`, `target/`, `dist/`) and hidden directories.
 - It indexes:
-  - source code files with allowed extensions (see `src/lib.rs` `is_codequery_indexable_ext`).
+  - source code files with allowed extensions (see `crates/openai-file-search-core/src/openai/file_ext.rs` `is_codequery_indexable_ext`).
 
 **Change-based reindexing algorithm**
-When `file_paths` is non-empty, `src/lib.rs::code_query` syncs local files into the chosen vector store before asking the question:
+When `file_paths` is non-empty, `crates/openai-file-search-core/src/reindex.rs::code_query` syncs local files into the chosen vector store before asking the question:
 - Lists current vector-store files and builds lookups by `attributes.path`, `attributes.hash`, and `filename` (for legacy entries).
 - Computes SHA-256 for each local file.
 - Decides actions:
@@ -1242,7 +1243,7 @@ The server handles the following notifications (no response sent):
 {
   "protocolVersion": "2025-03-26",
   "serverInfo": {
-    "name": "mcp-echo-server",
+    "name": "tools-mcp-server",
     "version": "1.0.0"
   },
   "capabilities": {

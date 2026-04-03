@@ -22,7 +22,8 @@ define_mcp_tool! {
             "timeout_ms": {"type": "integer", "minimum": 100, "default": 20000, "description": "Overall timeout in milliseconds"},
             "fuzzy": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Fuzzy match tolerance (1-4 edits)"}
         },
-        "required": ["pattern"]
+        "required": ["pattern"],
+        "additionalProperties": false
     },
     handler: handle_ripgrep
 }

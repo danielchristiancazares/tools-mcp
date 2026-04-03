@@ -105,7 +105,7 @@ pub(crate) async fn looks_binary_by_content(path: &str) -> Result<bool> {
 /// # Example
 ///
 /// ```
-/// use file_search_core::compute_bytes_hash;
+/// use openai_file_search_core::compute_bytes_hash;
 ///
 /// let hash = compute_bytes_hash(b"hello world");
 /// assert_eq!(hash.len(), 64);  // SHA256 produces 64 hex chars

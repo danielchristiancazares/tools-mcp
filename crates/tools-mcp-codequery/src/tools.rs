@@ -18,7 +18,8 @@ define_mcp_tool! {
             "max_num_results": {"type": "integer", "minimum": 1, "description": "Limit vector search matches"},
             "include_results": {"type": "boolean", "default": false, "description": "Include retrieved snippets in the response payload"}
         },
-        "required": ["query"]
+        "required": ["query"],
+        "additionalProperties": false
     },
     handler: handle_code_query
 }

@@ -77,7 +77,7 @@ pub async fn dispatch_jsonrpc_request(
             let init = InitializeResult {
                 protocol_version: "2025-03-26".into(),
                 server_info: ServerInfo {
-                    name: "mcp-echo-server".into(),
+                    name: "tools-mcp-server".into(),
                     version: option_env!("APP_VERSION").unwrap_or("0.9.0").into(),
                 },
                 capabilities: Capabilities {

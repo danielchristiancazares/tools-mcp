@@ -18,9 +18,11 @@ define_mcp_tool! {
                 "properties": {
                     "start_line": {"type": "integer", "minimum": 1},
                     "end_line": {"type": "integer", "minimum": 1}
-                }
+                },
+                "additionalProperties": false
             }
-        }
+        },
+        "additionalProperties": false
     },
     handler: handle_edit
 }

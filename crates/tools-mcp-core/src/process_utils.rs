@@ -25,7 +25,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use tools_mcp::process_utils::run_pwsh_command;
+//! use tools_mcp_core::process_utils::run_pwsh_command;
 //!
 //! # async fn example() -> Result<(), String> {
 //! // Run a PowerShell command
@@ -79,7 +79,7 @@ use tokio::time;
 /// # Examples
 ///
 /// ```
-/// use tools_mcp::process_utils::strip_ansi_codes;
+/// use tools_mcp_core::process_utils::strip_ansi_codes;
 ///
 /// // Remove color codes
 /// let colored = "\x1b[31mError:\x1b[0m file not found";
@@ -183,7 +183,7 @@ pub fn strip_ansi_codes(s: &str) -> String {
 /// # Examples
 ///
 /// ```no_run
-/// # use tools_mcp::process_utils::ProcessResult;
+/// # use tools_mcp_core::process_utils::ProcessResult;
 /// # async fn example() {
 /// # let result: ProcessResult = todo!();
 /// // Check for successful completion
@@ -278,7 +278,7 @@ pub struct ProcessResult {
 ///
 /// ```no_run
 /// use tokio::io::AsyncReadExt;
-/// use tools_mcp::process_utils::read_to_end_limited;
+/// use tools_mcp_core::process_utils::read_to_end_limited;
 ///
 /// # async fn example() -> std::io::Result<()> {
 /// let data = b"Hello, world! This is a long string.";
@@ -360,7 +360,7 @@ where
 /// # Examples
 ///
 /// ```no_run
-/// use tools_mcp::process_utils::run_pwsh_command;
+/// use tools_mcp_core::process_utils::run_pwsh_command;
 ///
 /// # async fn example() -> Result<(), String> {
 /// // Simple command
