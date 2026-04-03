@@ -4,7 +4,7 @@ use tools_mcp_core::define_mcp_tool;
 define_mcp_tool! {
     EditTool,
     name: "Edit",
-    description: "Replace a snippet in a file. Finds old_snippet and replaces with new_snippet, preserving line endings.",
+    description: "Replace a snippet in a file. If match_hint is provided, search is limited to that line range. Preserves line endings.",
     schema: {
         "type": "object",
         "required": ["path", "old_snippet", "new_snippet"],
@@ -14,7 +14,7 @@ define_mcp_tool! {
             "new_snippet": {"type": "string", "description": "Replacement text (use LF newlines)"},
             "match_hint": {
                 "type": "object",
-                "description": "Optional line range hint to help locate the snippet",
+                "description": "Optional line range hint that restricts the search to that inclusive line range",
                 "properties": {
                     "start_line": {"type": "integer", "minimum": 1},
                     "end_line": {"type": "integer", "minimum": 1}

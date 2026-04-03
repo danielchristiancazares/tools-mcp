@@ -552,7 +552,7 @@ fn handle_get_region(req: &GetRegionRequest) -> Result<Value>
 /// - Canonical LF processing for consistent matching
 /// - Original newline preservation in output
 /// - Staleness detection via file_hash
-/// - match_hint for guided search (start_line, end_line)
+/// - match_hint to restrict search to a specific line range
 ///
 /// # Response Statuses
 /// - ok: Edit applied successfully
@@ -1011,7 +1011,8 @@ Edit files while preserving original newline bytes and whitespace.
     - `match_hint` – `{ start_line, end_line }` to restrict the search range.
     - `region_id` – any caller-chosen identifier to help correlate edits.
   - **Behavior**:
-    - Searches the canonical LF view for `old_snippet` (within `match_hint` if provided).
+    - Searches the canonical LF view for `old_snippet`.
+    - If `match_hint` is provided, restricts the search to that inclusive line range and does not fall back to a whole-file search.
     - Rewrites the corresponding byte range using the file's dominant newline style, preserving other bytes.
     - Returns:
       - `status`: `"ok"`, `"no_match"`, or `"stale_file"`.

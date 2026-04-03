@@ -103,7 +103,7 @@ use std::path::{Path, PathBuf};
 use crate::adapters::outbound::FileSearchCoreEngine;
 use crate::codequery_cache::{cache_store_id, load_store_id_from_cache};
 use crate::ports::CodeQueryEngine;
-use tools_mcp_core::{ToolCallOutcome, validation};
+use tools_mcp_core::{ToolCallOutcome, truncate_chars_with_ellipsis, validation};
 
 #[derive(Debug, Clone)]
 struct WorkspaceScope {
@@ -371,11 +371,7 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
             // Avoid dumping huge server responses into the primary message; keep a bounded
             // `details` field for debugging while still giving the model actionable hints.
             const MAX_DETAILS_CHARS: usize = 1200;
-            let details = if error_message.len() > MAX_DETAILS_CHARS {
-                format!("{}…", &error_message[..MAX_DETAILS_CHARS])
-            } else {
-                error_message.clone()
-            };
+            let details = truncate_chars_with_ellipsis(&error_message, MAX_DETAILS_CHARS);
 
             let mut remediation: Vec<String> = Vec::new();
             if lower.contains("http 401")

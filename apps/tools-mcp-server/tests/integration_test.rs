@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use support::{
-    read_server_response, send_mcp_message, send_mcp_message_with_headers, spawn_server,
+    read_server_response, send_mcp_message, send_mcp_message_with_headers,
+    send_raw_line_and_parse_response, spawn_server,
 };
 
 const READ_HANDLER_PATH: &str = "crates/tools-mcp-local/src/tools/handlers/read_file.rs";
@@ -473,43 +474,14 @@ fn test_error_handling_unknown_method() {
 }
 
 #[test]
-fn test_error_handling_invalid_json_returns_parse_error() {
-    let mut child = spawn_server().spawn().expect("failed to spawn mcp server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-
-    stdin
-        .write_all(br#"{"jsonrpc":"2.0","id":99,"method":"ping""#)
-        .expect("write invalid json");
-    stdin.write_all(b"\n").expect("write newline");
-    stdin.flush().expect("flush");
-    drop(stdin);
-
-    let mut reader = BufReader::new(stdout);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).expect("read line");
-        if bytes_read == 0 {
-            break;
-        }
-        if line.starts_with("Content-Length:") || line.trim().is_empty() {
-            continue;
-        }
-        response = line;
-        break;
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    assert!(!response.is_empty(), "expected parse error response");
-    let json_response: Value = serde_json::from_str(&response).expect("parse response");
+fn test_invalid_json_returns_parse_error_response() {
+    let json_response =
+        send_raw_line_and_parse_response(br#"{"jsonrpc":"2.0","id":99,"method":"ping""#)
+            .expect("parse response");
     assert_eq!(json_response["jsonrpc"], "2.0");
-    assert!(json_response["id"].is_null());
+    assert_eq!(json_response["id"], Value::Null);
     assert_eq!(json_response["error"]["code"], -32700);
+    assert_eq!(json_response["error"]["message"], "Parse error");
 }
 
 #[test]
@@ -530,46 +502,6 @@ fn test_error_handling_unknown_tool() {
     assert_eq!(response["id"], 6);
     // Tool errors are returned in result, not error
     assert!(response["result"]["isError"].is_null() || response["error"].is_object());
-}
-
-#[test]
-fn test_invalid_json_returns_parse_error_response() {
-    let mut child = spawn_server().spawn().expect("Failed to spawn");
-
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-
-    stdin
-        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping""#)
-        .unwrap();
-    stdin.write_all(b"\n").unwrap();
-    stdin.flush().unwrap();
-    drop(stdin);
-
-    let mut reader = BufReader::new(stdout);
-    let mut response = String::new();
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).unwrap();
-        if bytes_read == 0 {
-            break;
-        }
-        if line.starts_with("Content-Length:") || line.trim().is_empty() {
-            continue;
-        }
-        response = line;
-        break;
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    assert!(!response.is_empty(), "expected parse-error response");
-    let json_response: Value = serde_json::from_str(&response).expect("Failed to parse response");
-    assert_eq!(json_response["jsonrpc"], "2.0");
-    assert_eq!(json_response["id"], Value::Null);
-    assert_eq!(json_response["error"]["code"], -32700);
-    assert_eq!(json_response["error"]["message"], "Parse error");
 }
 
 #[test]
@@ -757,6 +689,45 @@ fn test_webfetch_blocks_localhost_ssrf() {
     );
 
     assert_eq!(response["result"]["error_type"], "ssrf_blocked");
+}
+
+#[test]
+fn test_edit_match_hint_is_strict_and_leaves_file_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("strict-edit.txt");
+    std::fs::write(&path, "line1\ntarget\nline3\ntarget\nline5\n").expect("write file");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Edit",
+            "arguments": {
+                "path": path.to_string_lossy().to_string(),
+                "old_snippet": "target",
+                "new_snippet": "SHOULD_NOT_APPLY",
+                "match_hint": {
+                    "start_line": 1,
+                    "end_line": 1
+                }
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call Edit");
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 32);
+    assert_eq!(response["result"]["isError"], true);
+
+    let payload_text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Edit payload text");
+    let payload: Value = serde_json::from_str(payload_text).expect("parse Edit payload");
+    assert_eq!(payload["status"], "no_match");
+
+    let current = std::fs::read_to_string(&path).expect("read file");
+    assert_eq!(current, "line1\ntarget\nline3\ntarget\nline5\n");
 }
 
 #[cfg(test)]

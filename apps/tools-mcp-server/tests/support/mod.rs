@@ -76,6 +76,28 @@ pub fn send_mcp_message(message: &Value) -> Result<Value, Box<dyn std::error::Er
 }
 
 #[allow(dead_code)]
+pub fn send_raw_line_and_parse_response(
+    raw_line: &[u8],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut child = spawn_server().spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    stdin.write_all(raw_line)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    drop(stdin);
+
+    let mut reader = BufReader::new(stdout);
+    let response = read_server_response(&mut reader)?;
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    Ok(serde_json::from_str(&response)?)
+}
+
+#[allow(dead_code)]
 pub fn send_mcp_message_with_headers(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
     let mut child = spawn_server().spawn()?;
     let mut stdin = child.stdin.take().expect("stdin");

@@ -167,9 +167,9 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 ///
 /// # Match Behavior
 ///
-/// 1. If `match_hint` is provided, searches only within those lines first
-/// 2. If no match in the hint region, falls back to searching the entire file
-/// 3. Returns `no_match` status if the snippet is not found anywhere
+/// 1. If `match_hint` is provided, searches only within those lines
+/// 2. If no match exists in the hinted range, returns `no_match`
+/// 3. Without a hint, searches the entire file
 ///
 /// # Staleness Check
 ///
@@ -201,8 +201,8 @@ struct ApplySnippetEditRequest {
 /// Line range hint for disambiguating snippet matches.
 ///
 /// When a file contains multiple occurrences of `old_snippet`, the match hint
-/// narrows the search to a specific region. The search first checks within
-/// the hinted range, then falls back to the entire file if no match is found.
+/// narrows the search to a specific region. When present, the search is
+/// restricted to that hinted range and does not fall back to the entire file.
 ///
 /// Both line numbers are 1-indexed and inclusive.
 #[derive(Deserialize, Serialize)]
