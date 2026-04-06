@@ -59,7 +59,15 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
     let text = String::from_utf8_lossy(&data);
 
     if text.is_empty() {
-        return ToolCallOutcome::err(format!("file is empty: {}", path.display()));
+        let payload = json!({
+            "content": [{"type": "text", "text": ""}],
+            "isError": false,
+            "path": path.display().to_string(),
+            "start_line": 0,
+            "end_line": 0,
+            "total_lines": 0
+        });
+        return ToolCallOutcome::ok(payload);
     }
 
     let lines = split_lines_with_endings(&text);
@@ -88,7 +96,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
     let resolved_end = end.min(line_count);
     let width = resolved_end.max(1).to_string().len();
-    let show_line_numbers = req.show_line_numbers.unwrap_or(true);
+    let show_line_numbers = req.show_line_numbers.unwrap_or(false);
 
     let mut body = String::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -169,5 +177,85 @@ mod tests {
     fn split_lines_with_endings_handles_mixed_newlines() {
         let lines = split_lines_with_endings("a\r\nb\nc\rd");
         assert_eq!(lines, vec!["a\r\n", "b\n", "c\r", "d"]);
+    }
+
+    // REGRESSION: show_line_numbers should default to false (raw content).
+    #[tokio::test]
+    async fn read_file_show_line_numbers_defaults_to_false() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello\nworld\n").expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+        let text = outcome.0["content"][0]["text"].as_str().unwrap();
+
+        // Default should be raw content (no line numbers).
+        assert!(
+            !text.contains("\t"),
+            "show_line_numbers should default to false, but output contains tab-separated line numbers"
+        );
+    }
+
+    // REGRESSION: Empty files should return empty content, not an error.
+    #[tokio::test]
+    async fn read_file_empty_file_returns_empty_content() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, b"").expect("write empty file");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+        let is_error = outcome.0["isError"].as_bool().unwrap();
+        let text = outcome.0["content"][0]["text"].as_str().unwrap();
+
+        assert!(!is_error, "empty file should not be an error");
+        assert_eq!(text, "", "empty file should return empty content");
+    }
+
+    // BUG: split_lines_with_endings does not handle an empty string correctly.
+    // An empty input should produce an empty Vec or a Vec with one empty string,
+    // but the current implementation returns an empty Vec which is ambiguous.
+    #[test]
+    fn split_lines_with_endings_empty_input_returns_empty_vec() {
+        let lines = split_lines_with_endings("");
+        // BUG: Returns empty vec, but arguably should return vec![""] to represent
+        // "one empty line" — this is ambiguous with "no lines at all".
+        assert!(
+            lines.is_empty(),
+            "BUG CONFIRMED: empty input returns empty vec (ambiguous with 'no lines')"
+        );
+    }
+
+    // BUG: The `end_line` validation allows end_line=0 which should be invalid
+    // (lines are 1-indexed), but the check only catches it after computing resolved_end.
+    #[tokio::test]
+    async fn read_file_end_line_zero_returns_error() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello\nworld\n").expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "end_line": 0,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+        let is_error = outcome.0["isError"].as_bool().unwrap();
+
+        // This correctly returns an error for end_line=0, which is good.
+        assert!(is_error, "end_line=0 should be an error");
     }
 }

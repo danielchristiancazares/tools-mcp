@@ -32,7 +32,6 @@
 //! ## Limitations
 //!
 //! - No automatic expiration (entries persist indefinitely)
-//! - No size limits (cache can grow unbounded)
 //! - No cache invalidation API (delete files manually to clear)
 
 use anyhow::{Context, Result};
@@ -43,6 +42,12 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+
+/// Maximum size for a cache entry (25 MiB).
+///
+/// Entries exceeding this size are not written to cache to prevent
+/// unbounded disk usage from large responses.
+const MAX_CACHE_ENTRY_BYTES: usize = 25 * 1024 * 1024;
 
 // ============================================================================
 // Cache Directory Management
@@ -227,8 +232,16 @@ pub fn write_cache(url: &str, data: &CachedFetch) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("ensure cache directory")?;
     }
-    let mut file = fs::File::create(path).context("create cache file")?;
     let bytes = serde_json::to_vec(data).context("serialize cache entry")?;
+    if bytes.len() > MAX_CACHE_ENTRY_BYTES {
+        anyhow::bail!(
+            "cache entry for {} exceeds maximum size ({} bytes > {} bytes)",
+            url,
+            bytes.len(),
+            MAX_CACHE_ENTRY_BYTES
+        );
+    }
+    let mut file = fs::File::create(path).context("create cache file")?;
     file.write_all(&bytes).context("write cache bytes")?;
     Ok(())
 }
@@ -304,6 +317,85 @@ mod tests {
         assert!(
             !path.exists(),
             "corrupt cache file should be removed to avoid repeated failures"
+        );
+    }
+
+    // BUG: read_cache removes the corrupt file but does not return Err — it returns Ok(None).
+    // This means callers can't distinguish between "cache miss" and "corrupt entry removed".
+    // The tracing::warn! is the only signal, which is lost in non-debug environments.
+    #[test]
+    fn read_cache_silently_swallows_corruption_error() {
+        let key = format!("test://cache-silent-corrupt-{}_http", uuid::Uuid::new_v4());
+        let path = cache_path_for(&key).expect("cache path");
+
+        fs::write(&path, b"{not-json").expect("write corrupt cache");
+
+        let loaded = read_cache(&key).expect("should not error");
+
+        // BUG: Returns Ok(None) — indistinguishable from a genuine cache miss.
+        // A caller would retry the network fetch, unaware that a corrupt entry existed.
+        assert!(loaded.is_none());
+        assert!(!path.exists());
+        // This test documents the bug: no way to tell corruption from miss.
+    }
+
+    // BUG: write_cache does not check if the parent directory exists before creating the file.
+    // The cache_root() function creates the directory, but if someone deletes it between
+    // cache_path_for() and write_cache(), the write will fail.
+    #[test]
+    fn write_cache_creates_parent_directory_if_missing() {
+        let key = format!("test://cache-dir-check-{}_http", uuid::Uuid::new_v4());
+        let path = cache_path_for(&key).expect("cache path");
+
+        // Ensure directory exists, then remove it to test recreation.
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let entry = CachedFetch {
+            content_type: Some("text/html".to_string()),
+            body: b"test".to_vec(),
+            fetched_at,
+        };
+
+        // This should succeed even if the directory was removed.
+        let result = write_cache(&key, &entry);
+        assert!(
+            result.is_ok(),
+            "write_cache should recreate missing directory"
+        );
+
+        // Cleanup.
+        let _ = fs::remove_file(&path);
+    }
+
+    // REGRESSION: Cache entry size is now limited to MAX_CACHE_ENTRY_BYTES (25 MiB).
+    // Entries exceeding this size are rejected.
+    #[test]
+    fn cache_rejects_entries_exceeding_size_limit() {
+        let unique_id = uuid::Uuid::new_v4();
+        let key = format!("test://cache-size-limit-{}_http", unique_id);
+        let _ = fs::remove_file(cache_path_for(&key).unwrap());
+
+        // Create an entry exceeding the limit (26 MB).
+        let large_body = vec![0u8; 26 * 1024 * 1024];
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let entry = CachedFetch {
+            content_type: Some("text/html".to_string()),
+            body: large_body,
+            fetched_at,
+        };
+
+        let result = write_cache(&key, &entry);
+        assert!(
+            result.is_err(),
+            "cache should reject entries exceeding 25 MiB"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum size"),
+            "error message should mention size limit"
         );
     }
 }

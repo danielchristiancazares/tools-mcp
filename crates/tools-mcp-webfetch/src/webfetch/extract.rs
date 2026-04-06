@@ -114,8 +114,8 @@ fn looks_like_html(content_type: Option<&str>, bytes: &[u8]) -> bool {
     {
         return true;
     }
-    // Fall back to content sniffing for the first 256 bytes
-    let prefix_len = bytes.len().min(256);
+    // Fall back to content sniffing for the first 512 bytes
+    let prefix_len = bytes.len().min(512);
     let sample = &bytes[..prefix_len];
     contains_ignore_ascii_case(sample, b"<html")
         || contains_ignore_ascii_case(sample, b"<!doctype html")
@@ -377,5 +377,33 @@ mod tests {
         assert_eq!(doc.title, None);
         assert_eq!(doc.language, None);
         assert_eq!(doc.markdown, "plain text\nline 2\n");
+    }
+
+    // BUG: clean_markdown's whitespace normalization drops the trailing newline
+    // from single-line content, which changes the semantics of the output.
+    #[test]
+    fn clean_markdown_drops_final_newline_from_single_line_content() {
+        let html = "<p>Hello</p>";
+        let result = super::clean_markdown(html);
+        // The result should not end with a newline, but the original content did.
+        // This is a design choice bug — trailing newlines are stripped.
+        assert!(
+            !result.ends_with('\n'),
+            "BUG CONFIRMED: clean_markdown strips trailing newline"
+        );
+    }
+
+    // REGRESSION: HTML sniffing window increased from 256 to 512 bytes.
+    #[test]
+    fn looks_like_html_detects_doctype_within_512_bytes() {
+        let prefix = " ".repeat(300);
+        let content = format!("{prefix}<!DOCTYPE html><html><body>test</body></html>");
+        let bytes = content.as_bytes();
+
+        let is_html = super::looks_like_html(None, bytes);
+        assert!(
+            is_html,
+            "HTML with doctype within 512 bytes should be detected"
+        );
     }
 }

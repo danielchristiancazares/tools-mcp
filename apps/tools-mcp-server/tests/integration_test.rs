@@ -158,7 +158,7 @@ fn test_unknown_fields_are_rejected_for_tool_requests() {
 }
 
 #[test]
-fn test_read_file_line_numbers_by_default() {
+fn test_read_file_no_line_numbers_by_default() {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 40,
@@ -183,8 +183,8 @@ fn test_read_file_line_numbers_by_default() {
         .as_str()
         .expect("missing Read content text");
     assert!(
-        text.starts_with("1\t"),
-        "expected line number prefix by default"
+        !text.starts_with("1\t"),
+        "expected no line number prefix by default (raw content)"
     );
     assert!(
         text.contains("File reading handler implementation."),
@@ -196,7 +196,7 @@ fn test_read_file_line_numbers_by_default() {
 }
 
 #[test]
-fn test_read_file_no_line_numbers_when_disabled() {
+fn test_read_file_shows_line_numbers_when_enabled() {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 41,
@@ -207,7 +207,7 @@ fn test_read_file_no_line_numbers_when_disabled() {
                 "path": READ_HANDLER_PATH,
                 "start_line": 1,
                 "end_line": 1,
-                "show_line_numbers": false
+                "show_line_numbers": true
             }
         }
     });
@@ -222,12 +222,12 @@ fn test_read_file_no_line_numbers_when_disabled() {
         .as_str()
         .expect("missing Read content text");
     assert!(
-        !text.starts_with("1\t"),
-        "should not have line number prefix when disabled"
+        text.starts_with("1\t"),
+        "expected line number prefix when show_line_numbers is true"
     );
     assert!(
-        text.starts_with("//! File reading handler implementation."),
-        "expected raw file content without line numbers"
+        text.contains("File reading handler implementation."),
+        "expected Read source content"
     );
     assert_eq!(response["result"]["start_line"], 1);
     assert_eq!(response["result"]["end_line"], 1);

@@ -622,7 +622,7 @@ mod tests {
         let robots = "User-agent: *\nDisallow: /search?q=secret\n";
         let mut matcher = DefaultMatcher::default();
         assert!(!matcher.one_agent_allowed_by_robots(
-            &robots,
+            robots,
             USER_AGENT,
             &robots_match_path(&parsed)
         ));

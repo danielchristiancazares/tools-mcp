@@ -371,11 +371,7 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
             // Avoid dumping huge server responses into the primary message; keep a bounded
             // `details` field for debugging while still giving the model actionable hints.
             const MAX_DETAILS_CHARS: usize = 1200;
-            let details = if error_message.len() > MAX_DETAILS_CHARS {
-                format!("{}…", &error_message[..MAX_DETAILS_CHARS])
-            } else {
-                error_message.clone()
-            };
+            let details = truncate_error_details(&error_message, MAX_DETAILS_CHARS);
 
             let mut remediation: Vec<String> = Vec::new();
             if lower.contains("http 401")
@@ -432,6 +428,18 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
             )
         }
     }
+}
+
+/// Truncates an error message to `max_chars` characters at a valid UTF-8 boundary.
+///
+/// Appends an ellipsis (`…`) when truncation occurs. This avoids panicking when
+/// `max_chars` falls in the middle of a multi-byte UTF-8 character.
+fn truncate_error_details(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}…")
 }
 
 /// Resolves a vector store name to its `OpenAI` ID using a tiered lookup strategy.
@@ -790,5 +798,40 @@ mod tests {
 
         let discovered_joined = discovered.join("\n");
         assert!(discovered_joined.contains("root.rs"));
+    }
+
+    #[test]
+    fn truncate_error_details_handles_utf8_boundary() {
+        // Build a string where a 3-byte UTF-8 character (€) starts at byte 1199.
+        // The old buggy code would slice at byte 1200 and panic.
+        let prefix = "a".repeat(1198);
+        let input = format!("{prefix}€tail"); // € is 3 bytes, so it spans bytes 1198-1200
+        assert!(input.len() > 1200);
+
+        // This must not panic and must produce valid UTF-8.
+        let result = truncate_error_details(&input, 1200);
+        assert!(result.chars().count() == 1201); // 1200 chars + ellipsis
+        assert!(result.ends_with('…'));
+        // Verify the result is valid UTF-8 (it is, since it's a String).
+        assert!(result.contains('€'));
+    }
+
+    #[test]
+    fn truncate_error_details_returns_unchanged_when_short() {
+        let input = "short error";
+        let result = truncate_error_details(input, 1200);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn truncate_error_details_handles_multibyte_chars() {
+        // String of 5 emoji characters (each 4 bytes in UTF-8)
+        let input = "🎉🎊🎈🎁🎀";
+        assert_eq!(input.len(), 20); // 5 * 4 bytes
+        assert_eq!(input.chars().count(), 5);
+
+        let result = truncate_error_details(input, 3);
+        assert_eq!(result.chars().count(), 4); // 3 chars + ellipsis
+        assert_eq!(result, "🎉🎊🎈…");
     }
 }

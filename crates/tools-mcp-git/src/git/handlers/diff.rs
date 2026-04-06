@@ -118,6 +118,23 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
                     binary: false,
                 });
             }
+            'C' => {
+                let old_path = tokens.get(idx).ok_or_else(|| {
+                    format!("git diff --name-status missing old path for status {status_token}")
+                })?;
+                let new_path = tokens.get(idx + 1).ok_or_else(|| {
+                    format!("git diff --name-status missing new path for status {status_token}")
+                })?;
+                idx += 2;
+                entries.push(DiffManifestEntry {
+                    path: (*new_path).to_string(),
+                    status: "copied".to_string(),
+                    old_path: Some((*old_path).to_string()),
+                    insertions: 0,
+                    deletions: 0,
+                    binary: false,
+                });
+            }
             _ => {
                 return Err(format!(
                     "git diff --name-status returned unsupported status token {status_token}"
@@ -539,5 +556,27 @@ mod tests {
         assert_eq!(entries[0].deletions, 0);
         assert_eq!(entries[0].old_path.as_deref(), Some("src/old.txt"));
         assert_eq!(entries[0].path, "src/new.txt");
+    }
+
+    #[test]
+    fn parse_name_status_z_handles_copy_entries() {
+        let entries = parse_name_status_z("C100\0src/original.txt\0src/copy.txt\0")
+            .expect("copy entry should parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "copied");
+        assert_eq!(entries[0].old_path.as_deref(), Some("src/original.txt"));
+        assert_eq!(entries[0].path, "src/copy.txt");
+    }
+
+    #[test]
+    fn apply_numstat_z_populates_copy_counts() {
+        let mut entries = parse_name_status_z("C100\0src/original.txt\0src/copy.txt\0")
+            .expect("copy entry should parse");
+        apply_numstat_z(&mut entries, "10\t5\t\0src/original.txt\0src/copy.txt\0")
+            .expect("copy numstat should parse");
+        assert_eq!(entries[0].insertions, 10);
+        assert_eq!(entries[0].deletions, 5);
+        assert_eq!(entries[0].old_path.as_deref(), Some("src/original.txt"));
+        assert_eq!(entries[0].path, "src/copy.txt");
     }
 }

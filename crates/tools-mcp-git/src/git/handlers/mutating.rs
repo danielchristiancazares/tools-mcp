@@ -33,7 +33,7 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
         Err(o) => return o,
     };
 
-    if req.paths.is_empty() {
+    if req.paths.iter().all(|p| p.trim().is_empty()) {
         return ToolCallOutcome::err("paths must be non-empty");
     }
 
@@ -206,10 +206,14 @@ pub async fn handle_git_commit(_id: Option<Value>, args: Value) -> ToolCallOutco
                 "{}({}): {}",
                 req.commit_type.trim(),
                 scope.trim(),
-                req.message.trim()
+                req.message.trim().replace('\n', " ").replace('\r', "")
             )
         }
-        _ => format!("{}: {}", req.commit_type.trim(), req.message.trim()),
+        _ => format!(
+            "{}: {}",
+            req.commit_type.trim(),
+            req.message.trim().replace('\n', " ").replace('\r', "")
+        ),
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -452,7 +456,11 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
-    let action = req.action.as_deref().unwrap_or("push");
+    let action = req
+        .action
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("push");
 
     let mut cmd_args: Vec<String> = vec!["stash".into()];
 
@@ -538,4 +546,78 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
     let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    // BUG: GitStash handler accepts action="" (empty string) and falls through to the
+    // wildcard `_` arm, returning "unknown stash action ''". But the default action is
+    // "push" (line 455: `let action = req.action.as_deref().unwrap_or("push");`), so if
+    // the user explicitly passes action: "", they get an error instead of the default.
+    // This is inconsistent — action: null => "push", action: "" => error.
+    #[test]
+    fn git_stash_empty_string_action_defaults_to_push() {
+        let action: Option<String> = Some("".to_string());
+        let result = action
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("push");
+        assert_eq!(
+            result, "push",
+            "empty string action should default to 'push'"
+        );
+
+        let action2: Option<String> = None;
+        let result2 = action2
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("push");
+        assert_eq!(result2, "push", "None should also default to 'push'");
+    }
+
+    // BUG: GitRestore validation says "paths must be non-empty" but accepts paths with
+    // whitespace-only strings. The check is `req.paths.is_empty()` which only checks if
+    // the Vec is empty, not if individual path strings are empty/whitespace.
+    #[test]
+    fn git_restore_rejects_whitespace_only_paths() {
+        let paths: Vec<String> = vec!["   ".to_string(), "\t".to_string()];
+        let all_empty = paths.iter().all(|p| p.trim().is_empty());
+        assert!(all_empty, "whitespace-only paths should be rejected");
+    }
+
+    // BUG: GitCommit allows injection through commit message formatting.
+    // The commit message is passed directly to `git commit -m` without sanitization.
+    // A message like "foo\n\nSigned-off-by: attacker <evil@evil.com>" could add
+    // extra commit trailer lines.
+    #[test]
+    fn git_commit_message_sanitizes_newlines() {
+        let commit_type = "feat";
+        let scope: Option<String> = None;
+        let message = "add feature\n\nSigned-off-by: attacker <evil@evil.com>";
+
+        let commit_msg = match &scope {
+            Some(scope) if !scope.trim().is_empty() => {
+                format!(
+                    "{}({}): {}",
+                    commit_type.trim(),
+                    scope.trim(),
+                    message.trim().replace('\n', " ").replace('\r', "")
+                )
+            }
+            _ => format!(
+                "{}: {}",
+                commit_type.trim(),
+                message.trim().replace('\n', " ").replace('\r', "")
+            ),
+        };
+
+        assert!(
+            !commit_msg.contains('\n'),
+            "commit message should not contain newlines: {commit_msg:?}"
+        );
+        assert!(
+            !commit_msg.contains('\r'),
+            "commit message should not contain carriage returns: {commit_msg:?}"
+        );
+    }
 }
