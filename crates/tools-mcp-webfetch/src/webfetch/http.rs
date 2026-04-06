@@ -1,36 +1,21 @@
 //! HTTP fetching with SSRF protection and robots.txt compliance.
 //!
-//! This module provides secure HTTP fetching capabilities with multiple layers
+//! This module provides a high-level HTTP client that implements several layers
 //! of protection against Server-Side Request Forgery (SSRF) attacks and
-//! automatic robots.txt compliance.
-//!
-//! ## Security Features
+//! ensures compliance with `robots.txt` exclusion rules.
 //!
 //! ### SSRF Protection
 //!
 //! The module implements comprehensive SSRF validation:
 //!
-//! 1. **Scheme validation**: Only `http://` and `https://` are allowed.
-//!    Blocks `file://`, `ftp://`, `gopher://`, etc.
-//!
-//! 2. **Hostname validation**: Blocks `localhost`, `localhost.localdomain`,
-//!    and similar local hostname variations.
-//!
-//! 3. **IP address validation**: Blocks private and reserved IP ranges:
-//!    - `10.0.0.0/8` (private)
-//!    - `172.16.0.0/12` (private)
-//!    - `192.168.0.0/16` (private)
-//!    - `127.0.0.0/8` (loopback)
-//!    - `169.254.0.0/16` (link-local)
-//!    - `100.64.0.0/10` (carrier-grade NAT)
-//!    - IPv6 equivalents (`::1`, `fc00::/7`, `fe80::/10`)
-//!
-//! 4. **DNS resolution validation**: Resolves hostnames and checks all
-//!    returned IPs. Blocks if ANY resolved IP is private/reserved.
-//!    This prevents DNS rebinding attacks where `evil.com` resolves to `127.0.0.1`.
-//!
-//! 5. **Address pinning**: The resolved address is pinned for the HTTP request
-//!    to prevent time-of-check/time-of-use (TOCTOU) attacks.
+//! 1. **Scheme validation**: Only `http` and `https` schemes are allowed.
+//! 2. **Hostname validation**: Localhost hostnames are blocked.
+//! 3. **IP literal validation**: Direct requests to private or reserved IP ranges
+//!    (RFC 1918, loopback, link-local, multicast, etc.) are blocked.
+//! 4. **DNS validation**: Hostnames are resolved, and ALL returned IP addresses
+//!    are checked against private/reserved ranges.
+//! 5. **DNS Rebinding Mitigation**: For hostname-based URLs, the resolved IP is
+//!    pinned for the duration of the request.
 //!
 //! ### Redirect Handling
 //!
@@ -88,6 +73,13 @@ const MAX_REDIRECTS: usize = 5;
 /// Maximum cached robots.txt entries before eviction.
 /// Uses simple clear-on-full strategy to bound memory usage.
 const ROBOTS_CACHE_MAX_ENTRIES: usize = 1024;
+
+/// Maximum allowed size for a fetched web document (25 MiB).
+///
+/// This limit is applied during HTTP fetching to prevent memory exhaustion
+/// from oversized responses. It is intentionally larger than the MCP message
+/// limit to allow for content extraction and chunking before final delivery.
+pub const MAX_RESPONSE_BYTES: usize = 25 * 1024 * 1024;
 
 // ============================================================================
 // Global State
@@ -162,8 +154,10 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || ipv4.is_broadcast()  // 255.255.255.255
                 || ipv4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
                 || ipv4.is_unspecified()   // 0.0.0.0
+                || ipv4.is_multicast()     // 224.0.0.0/4
                 || ipv4.octets()[0] == 0   // 0/8 "This network"
                 || ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0 == 0x40) // 100.64/10 CGNAT
+                || ipv4.octets()[0] >= 240 // 240.0.0.0/4 Reserved/Experimental
         }
         IpAddr::V6(ipv6) => {
             // IPv4-mapped addresses (::ffff:x.x.x.x) must be checked as IPv4
@@ -172,6 +166,7 @@ fn is_private_ip(ip: IpAddr) -> bool {
             }
             ipv6.is_loopback()      // ::1
                 || ipv6.is_unspecified() // ::
+                || ipv6.is_multicast()   // ff00::/8
                 || ((ipv6.segments()[0] & 0xfe00) == 0xfc00) // fc00::/7 unique local
                 || ((ipv6.segments()[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
         }
@@ -422,6 +417,7 @@ fn robots_match_path(parsed: &Url) -> String {
 /// - SSRF validation on initial URL AND every redirect hop
 /// - Address pinning to prevent DNS rebinding attacks
 /// - robots.txt compliance check before fetching
+/// - Maximum response size limit (25 MiB) to prevent OOM/DoS
 ///
 /// ## Redirect Handling
 ///
@@ -445,6 +441,7 @@ fn robots_match_path(parsed: &Url) -> String {
 /// - HTTP request fails (network error, timeout)
 /// - HTTP response is 404 or other error status
 /// - Too many redirects (> 5)
+/// - Response size exceeds `MAX_RESPONSE_BYTES`
 pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
     let mut current_url = req.url.clone();
     let mut redirects_followed = 0usize;
@@ -474,7 +471,7 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
                 .header(header::PRAGMA, "no-cache");
         }
 
-        let response = builder.send().await?;
+        let mut response = builder.send().await?;
         let status = response.status();
 
         // Handle redirects manually
@@ -514,9 +511,24 @@ pub async fn fetch_document(req: &FetchRequest) -> Result<FetchedBody> {
             .and_then(|v| v.to_str().ok())
             .map(std::string::ToString::to_string);
         let fetched_at = Utc::now();
-        let bytes = response.bytes().await?;
+
+        // Bounded body read to prevent OOM from oversized web pages.
+        let mut bytes = Vec::new();
+        let mut total_read = 0usize;
+        while let Some(chunk) = response.chunk().await? {
+            if total_read + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(anyhow!(
+                    "Response from {} exceeds maximum allowed size ({} MiB)",
+                    current_url,
+                    MAX_RESPONSE_BYTES / 1024 / 1024
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+            total_read += chunk.len();
+        }
+
         return Ok(FetchedBody {
-            body: bytes.to_vec(),
+            body: bytes,
             content_type,
             fetched_at,
         });
@@ -564,6 +576,18 @@ mod tests {
             .await
             .expect_err("expected SSRF validation to reject private IP");
         assert!(err.to_string().contains("private IP"));
+
+        // Multicast range
+        let err = validate_url_ssrf("http://224.0.0.1/")
+            .await
+            .expect_err("expected SSRF validation to reject multicast IP");
+        assert!(err.to_string().contains("private IP"));
+
+        // Reserved range
+        let err = validate_url_ssrf("http://240.0.0.1/")
+            .await
+            .expect_err("expected SSRF validation to reject reserved IP");
+        assert!(err.to_string().contains("private IP"));
     }
 
     #[tokio::test]
@@ -598,7 +622,7 @@ mod tests {
         let robots = "User-agent: *\nDisallow: /search?q=secret\n";
         let mut matcher = DefaultMatcher::default();
         assert!(!matcher.one_agent_allowed_by_robots(
-            robots,
+            &robots,
             USER_AGENT,
             &robots_match_path(&parsed)
         ));

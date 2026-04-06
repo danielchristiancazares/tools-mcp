@@ -126,11 +126,13 @@ pub fn strip_ansi_codes(s: &str) -> String {
 
                         if ch == '\x1b' {
                             // Check for ST (String Terminator): ESC followed by backslash
-                            chars.next();
+                            chars.next(); // consume ESC
                             if chars.peek() == Some(&'\\') {
-                                chars.next();
+                                chars.next(); // consume backslash
+                                break;
                             }
-                            break;
+                            // Not an ST, continue parsing the OSC sequence
+                            continue;
                         }
 
                         chars.next();
@@ -533,4 +535,18 @@ pub fn build_process_result_response(
     }
 
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi_codes_nested_osc_csi() {
+        // OSC sequence containing an ESC but not an ST (ESC \), followed by BEL.
+        // Old buggy behavior would stop at the first ESC and leave "[31mcolor" in output.
+        let input = "\x1b]test\x1b[31mcolor\x07actual_content";
+        let result = strip_ansi_codes(input);
+        assert_eq!(result, "actual_content");
+    }
 }

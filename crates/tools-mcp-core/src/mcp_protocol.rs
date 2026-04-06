@@ -101,15 +101,40 @@ where
 
     // Parse headers or detect raw JSON
     loop {
-        let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|err| McpReadError {
+        let mut line_bytes = Vec::new();
+        let mut bytes_read = 0;
+
+        // Bounded read to prevent DoS from oversized lines without newlines.
+        // We read byte-by-byte from the BufReader, which is efficient due to buffering.
+        loop {
+            if bytes_read > MAX_MCP_MESSAGE_BYTES {
+                return Err(McpReadError {
+                    error: io::Error::new(
+                        ErrorKind::InvalidData,
+                        "message line exceeds maximum allowed size",
+                    ),
+                    response_has_headers: saw_headers || saw_non_empty_non_json_line,
+                    should_continue: false,
+                });
+            }
+
+            let mut b = [0u8; 1];
+            let n = reader.read(&mut b).await.map_err(|err| McpReadError {
                 error: err,
                 response_has_headers: saw_headers || saw_non_empty_non_json_line,
                 should_continue: false,
             })?;
+
+            if n == 0 {
+                break;
+            }
+
+            bytes_read += n;
+            line_bytes.push(b[0]);
+            if b[0] == b'\n' {
+                break;
+            }
+        }
 
         // Clean EOF - no more messages
         if bytes_read == 0 {
@@ -126,18 +151,7 @@ where
             return Ok(None);
         }
 
-        // DoS protection: reject oversized lines
-        if line.len() > MAX_MCP_MESSAGE_BYTES {
-            return Err(McpReadError {
-                error: io::Error::new(
-                    ErrorKind::InvalidData,
-                    "message line exceeds maximum allowed size",
-                ),
-                response_has_headers: saw_headers || saw_non_empty_non_json_line,
-                should_continue: false,
-            });
-        }
-
+        let line = String::from_utf8_lossy(&line_bytes).into_owned();
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
 
         // Empty line signals end of headers. If we've seen header-like lines but no
@@ -366,6 +380,22 @@ mod tests {
         assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.response_has_headers);
         assert!(err.should_continue);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_rejects_oversized_line_early() {
+        // Create a line that is slightly over the limit without any newline.
+        let input = vec![b'a'; MAX_MCP_MESSAGE_BYTES + 1];
+        // Note: no newline character.
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected oversized line error");
+        assert!(
+            err.error
+                .to_string()
+                .contains("exceeds maximum allowed size")
+        );
     }
 
     #[tokio::test]
