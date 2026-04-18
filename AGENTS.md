@@ -4,14 +4,14 @@
 Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for code search (OpenAI vector stores), web fetching, git operations, and newline-safe file editing.
 
 ## Project Structure
-- `apps/tools-mcp-server/` — binary crate with stdin/stdout loop, JSON-RPC routing, and feature-crate composition.
-- `crates/tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process_utils`, config).
-- `crates/openai-file-search-core/` — OpenAI/vector-store client library.
-- `crates/tools-mcp-codequery/` — CodeQuery tool and vector-store cache/orchestration.
-- `crates/tools-mcp-webfetch/` — WebFetch pipeline and tool registration.
-- `crates/tools-mcp-local/` — local file/search/edit tools, including `smart_file_edit`.
-- `crates/tools-mcp-git/` — git tool implementations.
-- `apps/tools-mcp-server/tests/` — server integration and golden contract tests.
+- `tools-mcp-server/` — binary crate with stdin/stdout loop, JSON-RPC routing, and feature-crate composition.
+- `tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process_utils`, config).
+- `openai-file-search-core/` — OpenAI/vector-store client library.
+- `tools-mcp-codequery/` — CodeQuery tool and vector-store cache/orchestration.
+- `tools-mcp-webfetch/` — WebFetch pipeline and tool registration.
+- `tools-mcp-local/` — local file/search/edit tools, including `smart_file_edit`.
+- `tools-mcp-git/` — git tool implementations.
+- `tools-mcp-server/tests/` — server integration and golden contract tests.
 - `target/` — build output (generated).
 
 ## Commands
@@ -29,7 +29,7 @@ Env vars:
 ## Style & Testing
 - Keep changes `cargo fmt`-clean; follow standard Rust naming (`snake_case`, `CamelCase`).
 - Keep network/OpenAI tests ignored by default; run with `OPENAI_API_KEY` via `cargo test --workspace -- --ignored`.
-- If you change tool schemas or response shapes, update `README.md` and `apps/tools-mcp-server/tests/integration_test.rs`.
+- If you change tool schemas or response shapes, update `README.md` and `tools-mcp-server/tests/integration_test.rs`.
 
 ## Commits & Pull Requests
 - Prefer Conventional Commits (e.g., `feat(webfetch): ...`, `perf(webfetch): ...`).

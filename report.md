@@ -6,8 +6,8 @@ Comprehensive codebase review of `tools`, focusing on cleanliness, architecture,
 
 ## Overall Assessment
 
-- Code structure is clean and modular: transport (MCP) logic resides in `apps/tools-mcp-server/src/main.rs`, OpenAI/vector store orchestration in `crates/openai-file-search-core/src/lib.rs`, CodeQuery logic in `crates/tools-mcp-codequery/src/*`, and WebFetch functionality in `crates/tools-mcp-webfetch/src/webfetch/*`.
-- Error handling uses `anyhow::Result` with contextual messages; retries and backoff are in place for vector store reindexing (`crates/openai-file-search-core/src/lib.rs:1029`).
+- Code structure is clean and modular: transport (MCP) logic resides in `tools-mcp-server/src/main.rs`, OpenAI/vector store orchestration in `openai-file-search-core/src/lib.rs`, CodeQuery logic in `tools-mcp-codequery/src/*`, and WebFetch functionality in `tools-mcp-webfetch/src/webfetch/*`.
+- Error handling uses `anyhow::Result` with contextual messages; retries and backoff are in place for vector store reindexing (`openai-file-search-core/src/lib.rs:1029`).
 - Unit and integration tests cover key behaviors; OpenAI-dependent tests are gated with `#[ignore]`.
 - No overengineering observed; responsibilities are well separated.
 
@@ -15,30 +15,30 @@ Comprehensive codebase review of `tools`, focusing on cleanliness, architecture,
 
 ### High Severity
 
-- **SSRF bypass via hostname resolution** (`crates/tools-mcp-webfetch/src/webfetch/http.rs:62`)
+- **SSRF bypass via hostname resolution** (`tools-mcp-webfetch/src/webfetch/http.rs:62`)
   - Original SSRF guard rejected localhost/private literal IPs but skipped DNS resolution, allowing hostnames that resolve to private networks. Hardened validation by resolving hostnames via `tokio::net::lookup_host` and rejecting private/reserved IPs. [Tokio v1.x lookup_host docs](https://docs.rs/tokio/1/tokio/net/fn.lookup_host.html)
 
 ### Medium Severity
 
-- **Vector store wait scope** (`crates/openai-file-search-core/src/lib.rs:646`)
+- **Vector store wait scope** (`openai-file-search-core/src/lib.rs:646`)
   - `wait_for_vector_file_ready` waits for *all* store files to reach `completed`. In multi-tenant or legacy stores this may block indefinitely on unrelated items. Consider enhancing the API to wait only on files uploaded in the current operation.
 
 ### Low Severity
 
-- **Clippy performance warning** (`crates/openai-file-search-core/src/lib.rs:374`)
+- **Clippy performance warning** (`openai-file-search-core/src/lib.rs:374`)
   - `split('/').last()` traverses entire iterator; replaced with `rsplit('/').next()` per `clippy::double-ended-iterator-last` guidance.
-- **Integration test clippy warnings** (`apps/tools-mcp-server/tests/integration_test.rs`)
+- **Integration test clippy warnings** (`tools-mcp-server/tests/integration_test.rs`)
   - Removed needless references in `.args`, replaced temporary `vec!` with array literal, and swapped `expect(format!(...))` for `unwrap_or_else(|| panic!(...))` to satisfy `clippy::needless-borrows-for-generic-args`, `clippy::useless-vec`, and `clippy::expect-fun-call`.
-- **Robots cache ergonomics** (`crates/tools-mcp-webfetch/src/webfetch/http.rs:132`)
+- **Robots cache ergonomics** (`tools-mcp-webfetch/src/webfetch/http.rs:132`)
   - Optional improvement: convert `Mutex<Option<HashMap<...>>>` to `once_cell::sync::Lazy`. Deferred because current approach works and change is cosmetic.
 
 ## Applied Changes
 
 | File | Summary |
 | --- | --- |
-| `crates/tools-mcp-webfetch/src/webfetch/http.rs` | Made `validate_url_ssrf` async, added DNS resolution + private IP rejection, documented rationale, and awaited validation in `fetch_document`. |
-| `crates/openai-file-search-core/src/lib.rs` | Replaced `split('/').last()` with `rsplit('/').next()` to avoid full iterator traversal. Added comment explaining choice. |
-| `apps/tools-mcp-server/tests/integration_test.rs` | Adjusted `.args` calls, converted alias list to array, replaced `expect(format!(...))` with `unwrap_or_else(|| panic!(...))` for clippy compliance. |
+| `tools-mcp-webfetch/src/webfetch/http.rs` | Made `validate_url_ssrf` async, added DNS resolution + private IP rejection, documented rationale, and awaited validation in `fetch_document`. |
+| `openai-file-search-core/src/lib.rs` | Replaced `split('/').last()` with `rsplit('/').next()` to avoid full iterator traversal. Added comment explaining choice. |
+| `tools-mcp-server/tests/integration_test.rs` | Adjusted `.args` calls, converted alias list to array, replaced `expect(format!(...))` with `unwrap_or_else(|| panic!(...))` for clippy compliance. |
 
 ## Testing & Verification
 

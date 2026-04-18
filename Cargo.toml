@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "apps/tools-mcp-server",
-    "crates/openai-file-search-core",
-    "crates/tools-mcp-codequery",
-    "crates/tools-mcp-core",
-    "crates/tools-mcp-git",
-    "crates/tools-mcp-local",
-    "crates/tools-mcp-webfetch",
+    "tools-mcp-server",
+    "openai-file-search-core",
+    "tools-mcp-codequery",
+    "tools-mcp-core",
+    "tools-mcp-git",
+    "tools-mcp-local",
+    "tools-mcp-webfetch",
 ]
 resolver = "2"
 

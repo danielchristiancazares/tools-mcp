@@ -139,16 +139,13 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 ### Module Organization
 
 ```text
-apps/
-  tools-mcp-server/        # Binary crate: stdin/stdout loop, routing, composition
-
-crates/
-  tools-mcp-core/          # Shared MCP/runtime support and tool registry
-  openai-file-search-core/ # OpenAI/vector-store client library
-  tools-mcp-codequery/     # CodeQuery tool, cache, OpenAI integration adapter
-  tools-mcp-webfetch/      # WebFetch tool and fetch pipeline
-  tools-mcp-local/         # Read/Edit/Write/Delete/Glob/Search/Outline/Pwsh and smart_file_edit
-  tools-mcp-git/           # Git tool implementations
+tools-mcp-server/        # Binary crate: stdin/stdout loop, routing, composition
+tools-mcp-core/          # Shared MCP/runtime support and tool registry
+openai-file-search-core/ # OpenAI/vector-store client library
+tools-mcp-codequery/     # CodeQuery tool, cache, OpenAI integration adapter
+tools-mcp-webfetch/      # WebFetch tool and fetch pipeline
+tools-mcp-local/         # Read/Edit/Write/Delete/Glob/Search/Outline/Pwsh and smart_file_edit
+tools-mcp-git/           # Git tool implementations
 ```
 
 ---
@@ -157,7 +154,7 @@ crates/
 
 ### main.rs - MCP Server Implementation
 
-**Location**: `apps/tools-mcp-server/src/main.rs`
+**Location**: `tools-mcp-server/src/main.rs`
 
 The main module implements the MCP server, handling protocol communication and routing requests to appropriate tool handlers.
 
@@ -213,7 +210,7 @@ Supported method aliases for broad client compatibility:
 
 ### lib.rs - OpenAI API Client
 
-**Location**: `crates/openai-file-search-core/src/lib.rs`
+**Location**: `openai-file-search-core/src/lib.rs`
 **Library Name**: `openai_file_search_core`
 
 Provides the core functionality for interacting with OpenAI's vector stores and file search APIs.
@@ -343,7 +340,7 @@ pub struct CodeQueryOptions<'a> {
 
 ### codequery/mod.rs - Semantic Code Search
 
-**Location**: `crates/tools-mcp-codequery/src/tool_handler.rs`
+**Location**: `tools-mcp-codequery/src/tool_handler.rs`
 
 Orchestrates semantic code search by combining file indexing with OpenAI's vector store queries.
 
@@ -382,7 +379,7 @@ The following directories are automatically excluded from file discovery:
 
 ### codequery/cache.rs - Vector Store ID Caching
 
-**Location**: `crates/tools-mcp-codequery/src/codequery_cache.rs`
+**Location**: `tools-mcp-codequery/src/codequery_cache.rs`
 
 Provides disk-based caching for vector store IDs to avoid repeated API lookups.
 
@@ -400,7 +397,7 @@ pub fn cache_store_id(name: &str, id: &str)
 
 ### webfetch/mod.rs - Web Content Fetching
 
-**Location**: `crates/tools-mcp-webfetch/src/webfetch/mod.rs`
+**Location**: `tools-mcp-webfetch/src/webfetch/mod.rs`
 
 Orchestrates web content fetching with hybrid rendering (HTTP-first with browser fallback).
 
@@ -436,7 +433,7 @@ static BROWSER_POOL: OnceCell<Arc<browser::BrowserPool>> = OnceCell::const_new()
 
 ### webfetch/http.rs - HTTP Client with Security
 
-**Location**: `crates/tools-mcp-webfetch/src/webfetch/http.rs`
+**Location**: `tools-mcp-webfetch/src/webfetch/http.rs`
 
 Provides secure HTTP fetching with SSRF protection and robots.txt compliance.
 
@@ -489,7 +486,7 @@ pub fn build_http_client() -> Result<Client>
 
 ### webfetch/heuristics.rs - JS-Heavy Site Detection
 
-**Location**: `crates/tools-mcp-webfetch/src/webfetch/heuristics.rs`
+**Location**: `tools-mcp-webfetch/src/webfetch/heuristics.rs`
 
 Detects JavaScript-heavy websites that require browser rendering.
 
@@ -529,7 +526,7 @@ pub fn analyze_js_heavy(
 
 ### smart_file_edit/mod.rs - Newline-Aware File Editing
 
-**Location**: `crates/tools-mcp-local/src/smart_file_edit/mod.rs`
+**Location**: `tools-mcp-local/src/smart_file_edit/mod.rs`
 
 Internal implementation for the `Edit` tool that provides surgical file editing while preserving original line endings (LF, CRLF, or CR).
 
@@ -574,7 +571,7 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ### git/mod.rs - Git Operations
 
-**Location**: `crates/tools-mcp-git/src/git/mod.rs`
+**Location**: `tools-mcp-git/src/git/mod.rs`
 
 Provides git command execution with timeout and output management.
 
@@ -661,7 +658,7 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> ToolCallOutcom
 
 ### search.rs - File Search
 
-**Location**: `crates/tools-mcp-local/src/tools/search.rs`
+**Location**: `tools-mcp-local/src/tools/search.rs`
 
 Provides file content search using ugrep.
 
@@ -696,7 +693,7 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ### read_file.rs - File Reading
 
-**Location**: `crates/tools-mcp-local/src/tools/handlers/read_file.rs`
+**Location**: `tools-mcp-local/src/tools/handlers/read_file.rs`
 
 ```rust
 /// Reads file contents with optional line range
@@ -718,7 +715,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ### write.rs - File Creation
 
-**Location**: `crates/tools-mcp-local/src/tools/write.rs`
+**Location**: `tools-mcp-local/src/tools/write.rs`
 
 ```rust
 /// Creates a new file
@@ -740,7 +737,7 @@ pub async fn handle_write(id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ### delete.rs - File Deletion
 
-**Location**: `crates/tools-mcp-local/src/tools/delete.rs`
+**Location**: `tools-mcp-local/src/tools/delete.rs`
 
 ```rust
 /// Deletes a file (DESTRUCTIVE)
@@ -758,7 +755,7 @@ pub async fn handle_delete(id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ### glob.rs - File Globbing
 
-**Location**: `crates/tools-mcp-local/src/tools/glob.rs`
+**Location**: `tools-mcp-local/src/tools/glob.rs`
 
 ```rust
 /// Lists files matching a glob pattern
@@ -779,7 +776,7 @@ pub async fn handle_glob(id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ### outline.rs - C++ Structure Extraction
 
-**Location**: `crates/tools-mcp-local/src/tools/outline.rs`
+**Location**: `tools-mcp-local/src/tools/outline.rs`
 
 ```rust
 /// Extracts C++ structure without implementation bodies
@@ -839,24 +836,24 @@ Index code and query an OpenAI vector store in a single call.
 
 #### CodeQuery Architecture
 
-At a high level, CodeQuery is split across the feature crate `crates/tools-mcp-codequery/` and the reusable OpenAI/vector-store client crate `crates/openai-file-search-core/`.
+At a high level, CodeQuery is split across the feature crate `tools-mcp-codequery/` and the reusable OpenAI/vector-store client crate `openai-file-search-core/`.
 
 **Key modules**
-- `apps/tools-mcp-server/src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `apps/tools-mcp-server/src/mcp_server.rs`.
-- `crates/tools-mcp-codequery/src/tool_handler.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `openai_file_search_core` via the feature crate's `CodeQueryEngine`.
-- `crates/tools-mcp-codequery/src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
-- `crates/openai-file-search-core/src/lib.rs`: public crate root and stable re-export surface for the reusable OpenAI/vector-store client.
-- `crates/openai-file-search-core/src/files.rs`, `vector_stores.rs`, `responses.rs`, `reindex.rs`: implementation modules for uploads, vector stores, Responses API calls, and change-based reindexing.
+- `tools-mcp-server/src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `tools-mcp-server/src/mcp_server.rs`.
+- `tools-mcp-codequery/src/tool_handler.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `openai_file_search_core` via the feature crate's `CodeQueryEngine`.
+- `tools-mcp-codequery/src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
+- `openai-file-search-core/src/lib.rs`: public crate root and stable re-export surface for the reusable OpenAI/vector-store client.
+- `openai-file-search-core/src/files.rs`, `vector_stores.rs`, `responses.rs`, `reindex.rs`: implementation modules for uploads, vector stores, Responses API calls, and change-based reindexing.
 
 **Data flow (single CodeQuery call)**
 ```text
 MCP client
-  -> apps/tools-mcp-server/src/mcp_server.rs (route tool)
-    -> crates/tools-mcp-codequery/src/tool_handler.rs::handle_code_query (validate args, choose store, choose files)
-      -> crates/openai-file-search-core/src/reindex.rs::code_query (sync files, then query with file_search)
-        -> crates/openai-file-search-core/src/reindex.rs::reindex_with_retry / reindex_files (optional)
-        -> crates/openai-file-search-core/src/vector_stores.rs::wait_for_vector_store_ready (poll once for batch indexing)
-        -> crates/openai-file-search-core/src/responses.rs::responses_with_file_search (Responses API w/ file_search tool)
+  -> tools-mcp-server/src/mcp_server.rs (route tool)
+    -> tools-mcp-codequery/src/tool_handler.rs::handle_code_query (validate args, choose store, choose files)
+      -> openai-file-search-core/src/reindex.rs::code_query (sync files, then query with file_search)
+        -> openai-file-search-core/src/reindex.rs::reindex_with_retry / reindex_files (optional)
+        -> openai-file-search-core/src/vector_stores.rs::wait_for_vector_store_ready (poll once for batch indexing)
+        -> openai-file-search-core/src/responses.rs::responses_with_file_search (Responses API w/ file_search tool)
       <- returns: answer text (+ optional JSON reindex summary)
 ```
 
@@ -864,7 +861,7 @@ MCP client
 - If `vector_store_id` is provided, CodeQuery uses it directly.
 - Otherwise, it uses `vector_store_name`:
   - If omitted, it defaults to the git top-level directory name plus a workspace fingerprint (so same-named repos do not collide).
-  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `crates/tools-mcp-codequery/src/codequery_cache.rs`).
+  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `tools-mcp-codequery/src/codequery_cache.rs`).
   - If not cached, it lists vector stores and matches by name; if no match exists, it creates a new vector store and caches its ID.
   - Note: the cache path is based on `HOME` (so on Windows you may need `HOME` set for caching to work).
 
@@ -872,10 +869,10 @@ MCP client
 - If `file_paths` is omitted/empty, CodeQuery walks the git top level recursively when inside a repository, otherwise the current directory, and collects indexable files.
 - It skips common "noise" directories (e.g., `.git/`, `node_modules/`, `target/`, `dist/`) and hidden directories.
 - It indexes:
-  - source code files with allowed extensions (see `crates/openai-file-search-core/src/openai/file_ext.rs` `is_codequery_indexable_ext`).
+  - source code files with allowed extensions (see `openai-file-search-core/src/openai/file_ext.rs` `is_codequery_indexable_ext`).
 
 **Change-based reindexing algorithm**
-When `file_paths` is non-empty, `crates/openai-file-search-core/src/reindex.rs::code_query` syncs local files into the chosen vector store before asking the question:
+When `file_paths` is non-empty, `openai-file-search-core/src/reindex.rs::code_query` syncs local files into the chosen vector store before asking the question:
 - Lists current vector-store files and builds lookups by `attributes.path`, `attributes.hash`, and `filename` (for legacy entries).
 - Computes SHA-256 for each local file.
 - Decides actions:

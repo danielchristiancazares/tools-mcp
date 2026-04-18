@@ -7,7 +7,7 @@ use support::{
     read_server_response, send_mcp_message, send_mcp_message_with_headers, spawn_server,
 };
 
-const READ_HANDLER_PATH: &str = "crates/tools-mcp-local/src/tools/handlers/read_file.rs";
+const READ_HANDLER_PATH: &str = "tools-mcp-local/src/tools/handlers/read_file.rs";
 
 #[test]
 fn test_ping() {

@@ -11,11 +11,11 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tools-mcp-codequery = { path = "../../crates/tools-mcp-codequery" }
-tools-mcp-core = { path = "../../crates/tools-mcp-core" }
-tools-mcp-git = { path = "../../crates/tools-mcp-git" }
-tools-mcp-local = { path = "../../crates/tools-mcp-local" }
-tools-mcp-webfetch = { path = "../../crates/tools-mcp-webfetch" }
+tools-mcp-codequery = { path = "../tools-mcp-codequery" }
+tools-mcp-core = { path = "../tools-mcp-core" }
+tools-mcp-git = { path = "../tools-mcp-git" }
+tools-mcp-local = { path = "../tools-mcp-local" }
+tools-mcp-webfetch = { path = "../tools-mcp-webfetch" }
 
 [dev-dependencies]
 serde_json.workspace = true
