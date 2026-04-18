@@ -4,7 +4,7 @@ mod services;
 mod tools;
 mod webfetch_tool;
 
-pub mod webfetch;
+mod webfetch;
 
 use tools_mcp_core::ToolRegistry;
 

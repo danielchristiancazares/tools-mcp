@@ -34,7 +34,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use tools_mcp::webfetch::http::{fetch_document, validate_url_ssrf};
+//! use crate::webfetch::http::{fetch_document, validate_url_ssrf};
 //!
 //! // Validate URL before any operation
 //! validate_url_ssrf("https://example.com/page").await?;

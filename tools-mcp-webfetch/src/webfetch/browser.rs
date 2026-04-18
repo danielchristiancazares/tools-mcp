@@ -95,8 +95,8 @@ const NETWORK_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 ///     let html = pool.render_page("https://example.com").await?;
 /// }
 /// ```
-pub struct BrowserPool {
-    /// The managed browser instance, wrapped in Arc<Mutex> for thread-safe access.
+pub(crate) struct BrowserPool {
+    /// The managed browser instance, wrapped in `Arc<Mutex>` for thread-safe access.
     /// `None` indicates the browser has not been spawned yet or was shut down.
     browser: Arc<Mutex<Option<BrowserInstance>>>,
 }

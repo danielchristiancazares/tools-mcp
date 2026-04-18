@@ -72,7 +72,7 @@
 //! ## Example Usage
 //!
 //! ```ignore
-//! use tools_mcp::webfetch::{run_fetch, FetchRequest};
+//! use crate::webfetch::{run_fetch, FetchRequest};
 //!
 //! let request = FetchRequest {
 //!     url: "https://example.com".to_string(),

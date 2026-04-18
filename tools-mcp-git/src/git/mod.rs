@@ -60,6 +60,7 @@ use tokio::process::Command;
 use tokio::time;
 use tools_mcp_core::config::{MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES};
 use tools_mcp_core::process_utils::read_to_end_limited;
+use tracing::{debug, warn};
 
 /// Execute a Git command with timeout and output capture.
 ///
@@ -136,6 +137,14 @@ pub(crate) async fn run_git(
     ];
     args.extend(subcommand_args);
 
+    debug!(
+        git_bin = %git_bin,
+        args = ?args,
+        working_dir = ?working_dir,
+        timeout_ms,
+        "running git command"
+    );
+
     let mut cmd = Command::new(&git_bin);
     cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -156,6 +165,7 @@ pub(crate) async fn run_git(
     }
 
     let mut child = cmd.spawn().map_err(|e| {
+        warn!(git_bin = %git_bin, error = %e, "failed to spawn git");
         anyhow::anyhow!("failed to spawn {git_bin}. Is Git installed and on PATH? error: {e}")
     })?;
 
@@ -179,6 +189,7 @@ pub(crate) async fn run_git(
             res?
         } else {
             timed_out = true;
+            warn!(timeout_ms, args = ?args, "git command timed out, killing process");
             let _ = child.kill().await;
             match time::timeout(Duration::from_millis(2_000), child.wait()).await {
                 Ok(res) => res?,
@@ -199,8 +210,25 @@ pub(crate) async fn run_git(
         .await
         .unwrap_or_else(|_| Ok((Vec::new(), false)))?;
 
+    if truncated_stdout {
+        warn!(max_stdout_bytes, args = ?args, "git stdout truncated");
+    }
+    if truncated_stderr {
+        warn!(max_stderr_bytes, args = ?args, "git stderr truncated");
+    }
+
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    if !status.success() && !timed_out {
+        let stderr_head: String = stderr.lines().next().unwrap_or("").chars().take(200).collect();
+        debug!(
+            exit_code = ?exit_code,
+            args = ?args,
+            stderr_head = %stderr_head,
+            "git command exited non-zero"
+        );
+    }
 
     Ok(types::GitExecResult {
         git_bin,

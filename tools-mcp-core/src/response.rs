@@ -20,7 +20,6 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::OnceLock;
 
 /// Outgoing JSON-RPC 2.0 response to an MCP client.
 ///
@@ -205,50 +204,6 @@ impl RpcResponse<'static> {
             }
         }
         RpcResponse::ok(id, payload)
-    }
-
-    /// Creates a success response with JSON as text content.
-    ///
-    /// Useful for tools that return structured data that should be human-readable
-    /// in the response.
-    ///
-    /// By default this serializes **compact JSON** to reduce output size and token usage.
-    /// Set `TOOLS_PRETTY_JSON=true` (or `1`/`yes`/`on`) to force pretty-printed output.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Request identifier to echo back
-    /// * `json_value` - The JSON value to serialize and return as text
-    /// * `is_error` - Whether this represents an error condition
-    ///
-    /// # Note
-    ///
-    /// If serialization fails, a fallback error message is returned instead.
-    pub fn ok_json_content(
-        id: Option<Value>,
-        json_value: &Value,
-        is_error: bool,
-    ) -> RpcResponse<'static> {
-        static PRETTY_JSON: OnceLock<bool> = OnceLock::new();
-        let pretty = *PRETTY_JSON.get_or_init(|| {
-            std::env::var("TOOLS_PRETTY_JSON")
-                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(false)
-        });
-
-        let json_text = if pretty {
-            serde_json::to_string_pretty(json_value)
-        } else {
-            serde_json::to_string(json_value)
-        }
-        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
-        RpcResponse::ok(
-            id,
-            serde_json::json!({
-                "content": [{"type": "text", "text": json_text}],
-                "isError": is_error
-            }),
-        )
     }
 
     /// Parses request arguments into a typed struct.

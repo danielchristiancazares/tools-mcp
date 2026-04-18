@@ -80,7 +80,8 @@ impl ToolCallOutcome {
         ToolCallOutcome(payload)
     }
 
-    /// JSON serialized as text content (same behavior as [`crate::response::RpcResponse::ok_json_content`]).
+    /// JSON serialized as text content. Honors `TOOLS_PRETTY_JSON` (`1`/`true`/`yes`/`on`)
+    /// for pretty-printed output; defaults to compact JSON to minimize token usage.
     pub fn ok_json_content(json_value: &Value, is_error: bool) -> Self {
         static PRETTY_JSON: OnceLock<bool> = OnceLock::new();
         let pretty = *PRETTY_JSON.get_or_init(|| {
