@@ -183,7 +183,7 @@ define_mcp_tool! {
         "properties": {
             "working_dir": {"type": "string", "description": "Optional working directory"},
             "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds"},
-            "action": {"type": "string", "enum": ["push", "pop", "apply", "drop", "list", "show", "clear"], "default": "push", "description": "Stash action to perform"},
+            "action": {"type": "string", "enum": ["push", "save", "pop", "apply", "drop", "list", "show", "clear"], "default": "push", "description": "Stash action to perform (save is an alias for push)"},
             "message": {"type": "string", "description": "Message for the stash (with push)"},
             "index": {"type": "integer", "minimum": 0, "description": "Stash index for pop/apply/drop/show"},
             "include_untracked": {"type": "boolean", "default": false, "description": "Include untracked files (with push)"}

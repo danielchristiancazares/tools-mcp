@@ -22,7 +22,7 @@ define_mcp_tool! {
             },
             "show_line_numbers": {
                 "type": "boolean",
-                "description": "Include line numbers in output (default: true)"
+                "description": "Include line numbers in output (default: false)"
             }
         },
         "required": ["path"],

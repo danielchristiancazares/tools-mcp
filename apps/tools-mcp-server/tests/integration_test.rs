@@ -774,113 +774,30 @@ mod api_tests {
 
     #[test]
     #[ignore = "requires OPENAI_API_KEY"]
-    fn test_create_store_tool() {
+    fn test_code_query_with_api_key() {
         if skip_if_no_api_key() {
             return;
         }
 
-        let store_name = format!("test-store-{}", uuid::Uuid::new_v4());
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 20,
-            "method": "mcp/tools/call",
-            "params": {
-                "name": "create-store",
-                "arguments": {
-                    "name": store_name
-                }
-            }
-        });
-
-        let response = send_mcp_message(&request).expect("Failed to create store");
-
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["result"]["isError"], false);
-        assert!(
-            response["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains(&store_name)
-        );
-    }
-
-    #[test]
-    #[ignore = "requires OPENAI_API_KEY"]
-    fn test_list_stores_tool() {
-        if skip_if_no_api_key() {
-            return;
-        }
-
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 21,
-            "method": "mcp/tools/call",
-            "params": {
-                "name": "list-stores",
-                "arguments": {}
-            }
-        });
-
-        let response = send_mcp_message(&request).expect("Failed to list stores");
-
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["result"]["isError"], false);
-
-        // Parse the JSON string in the response
-        let content_str = response["result"]["content"][0]["text"].as_str().unwrap();
-        let stores: Value = serde_json::from_str(content_str).unwrap();
-        assert!(stores["vector_stores"].is_array());
-    }
-
-    #[test]
-    #[ignore = "requires OPENAI_API_KEY"]
-    fn test_code_query_without_reindex() {
-        if skip_if_no_api_key() {
-            return;
-        }
-
+        // Use CodeQuery with auto-discovery; it will create a vector store if needed.
         let store_name = format!("test-code-query-{}", uuid::Uuid::new_v4());
-        let create_request = json!({
-            "jsonrpc": "2.0",
-            "id": 60,
-            "method": "mcp/tools/call",
-            "params": {
-                "name": "create-store",
-                "arguments": {
-                    "name": store_name
-                }
-            }
-        });
-
-        let create_response =
-            send_mcp_message(&create_request).expect("Failed to create store for CodeQuery test");
-        assert_eq!(create_response["jsonrpc"], "2.0");
-        let store_info_text = create_response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("missing store info text");
-        let store_info: Value =
-            serde_json::from_str(store_info_text).expect("failed to parse store info json");
-        let vector_store_id = store_info["vector_store_id"]
-            .as_str()
-            .expect("missing vector_store_id")
-            .to_string();
-
         let query_request = json!({
             "jsonrpc": "2.0",
             "id": 61,
             "method": "mcp/tools/call",
             "params": {
-                "name": "query",
+                "name": "CodeQuery",
                 "arguments": {
-                    "vector_store_ids": [vector_store_id],
-                    "query": "Summarize repository purpose.",
+                    "vector_store_name": store_name,
+                    "query": "What is the main purpose of this codebase?",
+                    "file_paths": ["Cargo.toml"],
                     "include_results": false
                 }
             }
         });
 
         let query_response =
-            send_mcp_message(&query_request).expect("Failed to call query with API key");
+            send_mcp_message(&query_request).expect("Failed to call CodeQuery with API key");
         assert_eq!(query_response["jsonrpc"], "2.0");
         assert_eq!(query_response["id"], 61);
         assert_eq!(query_response["result"]["isError"], false);

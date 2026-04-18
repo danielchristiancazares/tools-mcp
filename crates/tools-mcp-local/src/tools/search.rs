@@ -1,4 +1,4 @@
-use super::handlers::handle_ripgrep;
+use super::handlers::handle_search;
 use tools_mcp_core::define_mcp_tool;
 
 define_mcp_tool! {
@@ -25,5 +25,5 @@ define_mcp_tool! {
         "required": ["pattern"],
         "additionalProperties": false
     },
-    handler: handle_ripgrep
+    handler: handle_search
 }

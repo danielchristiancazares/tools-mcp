@@ -92,7 +92,7 @@ fn classify_success(
 /// - This tool executes `ugrep` directly (no shell).
 /// - Uses text output with -n -H for simpler parsing.
 /// - Exit code semantics: 0 = matches found, 1 = no matches, 2 = error.
-pub async fn handle_ripgrep(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+pub async fn handle_search(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RgRequest {

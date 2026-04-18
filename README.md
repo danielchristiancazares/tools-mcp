@@ -38,8 +38,8 @@
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
 - **Search** - Fast local regex search via ugrep with both line-oriented output and structured match records.
 - **Read** - Line-numbered file reader (optionally a line range) for quick inspection.
-- **SmartFileEdit** - Canonical LF view + byte-precise patch tool (including unified diffs) that preserves original newline bytes and whitespace when editing files via MCP.
-- **Bash** - Run shell commands via bash with timeout and stdout/stderr capture.
+- **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
+- **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
 - **GitStatus / GitDiff / GitRestore** - Local Git status/diff/restore helpers with timeout and output truncation.
 - **Ping** - Lightweight health check for MCP clients.
 - JSON-RPC 2.0 transport over stdin/stdout with optional `Content-Length` framing for Codex-compatible MCP clients.
@@ -70,8 +70,8 @@
 
 ```bash
 # Clone and enter the repo
-git clone https://github.com/your-org/tools.git
-cd tools
+git clone https://github.com/danielchristiancazares/tools-mcp.git
+cd tools-mcp
 
 # Build the workspace
 cargo build --workspace --release
@@ -93,16 +93,25 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 | Find code by pattern/regex | Search |
 | Fetch web content | WebFetch |
 | Read file contents | Read |
-| Edit existing files | Edit |
+| Edit existing files | Edit (simple snippet replacement) |
 | Create new files | Write |
 | Delete files | Delete |
+| Move/rename files | Move |
+| Copy files | Copy |
+| List directory contents | ListDir |
 | Find files by pattern | Glob |
-| Run shell commands | Bash |
+| Run shell commands | Pwsh |
 | Check git status | GitStatus |
 | View diffs | GitDiff |
 | Revert changes | GitRestore |
 | Stage files | GitAdd |
 | Commit changes | GitCommit |
+| View commit history | GitLog |
+| Manage branches | GitBranch |
+| Switch branches | GitCheckout |
+| Stash changes | GitStash |
+| Show commit details | GitShow |
+| Show line authors | GitBlame |
 | Extract C++ structure | Outline |
 
 ---
@@ -120,7 +129,7 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
         v                        v
    stdin/stdout           +------+------+------+------+
                           |      |      |      |      |
-                    WebFetch CodeQuery Git  Ripgrep  Edit
+                     WebFetch CodeQuery Git  Search   Edit
                           |      |      |      |      |
                     +-----+------+------+------+------+
                     | HTTP/Browser | OpenAI API | Local FS |
@@ -163,12 +172,9 @@ struct RpcRequest {
     params: Value,          // Method parameters
 }
 
-/// JSON-RPC response structure
-struct RpcResponse<'a> {
-    jsonrpc: &'a str,
-    id: Option<Value>,
-    result: Option<Value>,
-    error: Option<RpcError>,
+/// Tool execution outcome structure
+struct ToolCallOutcome {
+    result: Value,
 }
 
 /// Tool definition for MCP tools/list response
@@ -197,6 +203,7 @@ Supported method aliases for broad client compatibility:
 
 | Method Category | Aliases |
 |----------------|---------|
+| Ping | `ping`, `mcp/ping` |
 | Initialize | `mcp/initialize`, `initialize`, `server/initialize` |
 | Tools List | `mcp/tools/list`, `tools/list`, `server/tools/list`, `mcp/capabilities`, `capabilities` |
 | Tool Call | `mcp/tools/call`, `tools/call`, `server/tools/call` |
@@ -359,7 +366,7 @@ Orchestrates semantic code search by combining file indexing with OpenAI's vecto
 ///
 /// # Indexable Extensions
 /// rs, c, h, cpp, hpp, go, java, kt, kts, swift, py, rb, php, js, jsx, ts, tsx
-pub async fn handle_code_query(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_code_query(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 #### Skip Directories
@@ -524,58 +531,18 @@ pub fn analyze_js_heavy(
 
 **Location**: `crates/tools-mcp-local/src/smart_file_edit/mod.rs`
 
-Provides surgical file editing that preserves original line endings.
+Internal implementation for the `Edit` tool that provides surgical file editing while preserving original line endings (LF, CRLF, or CR).
 
-#### Operations
+#### Internal Architecture
 
-**get_region**: Extract a file region with metadata
+The module handles the complexity of cross-platform text editing:
 
-```rust
-/// Returns file region with canonical text and metadata
-///
-/// # Response Fields
-/// - plain_text: Raw text without line numbers
-/// - canonical_text: Text with line numbers (for reference)
-/// - file_hash: SHA-256 hash for staleness detection
-/// - region_id: UUID for tracking
-/// - newline_style: Detected line ending style (LF, CRLF, CR)
-/// - byte_range: Start/end byte offsets
-fn handle_get_region(req: &GetRegionRequest) -> Result<Value>
-```
+1. **Canonical LF Processing**: File content is normalized to LF internally for consistent string matching
+2. **Offset Mapping**: Maintains bidirectional mappings between canonical positions and file byte positions
+3. **Line Ending Detection**: Tracks statistics to determine the dominant newline style
+4. **Byte-Precise Replacement**: Writes replacement bytes while preserving the original file's line ending style
 
-**apply_snippet_edit**: Replace text while preserving newlines
-
-```rust
-/// Replaces old_snippet with new_snippet
-///
-/// # Features
-/// - Canonical LF processing for consistent matching
-/// - Original newline preservation in output
-/// - Staleness detection via file_hash
-/// - match_hint for guided search (start_line, end_line)
-///
-/// # Response Statuses
-/// - ok: Edit applied successfully
-/// - no_match: old_snippet not found (includes candidate suggestions)
-/// - stale_file: File changed since get_region
-fn handle_apply_snippet_edit(req: &ApplySnippetEditRequest) -> Result<Value>
-```
-
-**apply_unified_diff**: Apply unified diff format patches
-
-```rust
-/// Applies a unified diff to a file
-///
-/// # Diff Format
-/// Expects standard unified diff with @@ hunk headers
-///
-/// # Processing
-/// Each hunk is converted to a snippet edit and applied sequentially
-/// File hash is updated between hunks for consistency
-fn handle_apply_unified_diff(req: &ApplyUnifiedDiffRequest) -> Result<Value>
-```
-
-#### Newline Handling
+#### Key Internal Types
 
 ```rust
 /// Detected newline styles
@@ -586,20 +553,21 @@ enum NewlineKind {
     None,  // No newlines in file
 }
 
-/// Statistics for mixed newline detection
-struct NewlineStats {
-    lf: usize,
-    crlf: usize,
-    cr: usize,
+/// Complete in-memory file representation
+struct FileModel {
+    bytes: Vec<u8>,           // Raw file content
+    hash: String,             // SHA-256 hash for staleness detection
+    canonical: CanonicalData, // LF-normalized view
+    newline_stats: NewlineStats,
 }
+```
 
-impl NewlineStats {
-    /// Returns the most common newline style (dominant)
-    fn dominant(&self) -> NewlineKind
+#### Public Interface
 
-    /// Returns dominant style, defaulting to LF if no newlines
-    fn default_kind(&self) -> NewlineKind
-}
+```rust
+/// Simplified edit handler used by the Edit tool
+/// Replaces old_snippet with new_snippet while preserving newlines
+pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -631,7 +599,7 @@ Provides git command execution with timeout and output management.
 /// - clean: bool - True if no changes
 /// - stdout/stderr: Raw command output
 /// - exit_code: Process exit code
-pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_git_status(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 #### GitDiff
@@ -646,7 +614,7 @@ pub async fn handle_git_status(id: Option<Value>, args: Value) -> RpcResponse<'s
 /// - unified: i64? - Context lines (-U<N>)
 /// - paths: String[]? - Specific paths to diff
 /// - max_bytes: usize (default: 200000) - Max stdout capture
-pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_git_diff(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 #### GitRestore
@@ -658,7 +626,7 @@ pub async fn handle_git_diff(id: Option<Value>, args: Value) -> RpcResponse<'sta
 /// - paths: String[] (required) - Files to restore
 /// - staged: bool (default: false) - Restore staging area
 /// - worktree: bool (default: true) - Restore working tree
-pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_git_restore(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 #### GitAdd
@@ -670,7 +638,7 @@ pub async fn handle_git_restore(id: Option<Value>, args: Value) -> RpcResponse<'
 /// - paths: String[]? - Files to stage
 /// - all: bool (default: false) - Stage all changes (-A)
 /// - update: bool (default: false) - Stage modified/deleted only (-u)
-pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_git_add(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 #### GitCommit
@@ -686,14 +654,14 @@ pub async fn handle_git_add(id: Option<Value>, args: Value) -> RpcResponse<'stat
 /// # Commit Message Format
 /// With scope: "type(scope): message"
 /// Without scope: "type: message"
-pub async fn handle_git_commit(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_git_commit(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
 
-### tools/handlers/ripgrep.rs - File Search
+### search.rs - File Search
 
-**Location**: `crates/tools-mcp-local/src/tools/handlers/ripgrep.rs`
+**Location**: `crates/tools-mcp-local/src/tools/search.rs`
 
 Provides file content search using ugrep.
 
@@ -721,7 +689,7 @@ Provides file content search using ugrep.
 ///
 /// # Response Format
 /// Returns structured matches with file paths, line numbers, and content
-pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -737,13 +705,13 @@ pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> RpcResponse<'stat
 /// - path: String (required) - File path to read
 /// - start_line: usize (1-based) - First line to read
 /// - end_line: usize (1-based, inclusive) - Last line to read
-/// - show_line_numbers: bool (default: true) - Prefix lines with numbers
+/// - show_line_numbers: bool (default: false) - Prefix lines with numbers
 ///
 /// # Response
 /// - content: File text (with optional line numbers)
 /// - total_lines: Total lines in file
 /// - start_line/end_line: Actual range returned
-pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_read_file(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -765,7 +733,7 @@ pub async fn handle_read_file(id: Option<Value>, args: Value) -> RpcResponse<'st
 ///
 /// # Response
 /// - bytes: Number of bytes written
-pub async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_write(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -783,7 +751,7 @@ pub async fn handle_write(id: Option<Value>, args: Value) -> RpcResponse<'static
 /// # Restrictions
 /// - Only files can be deleted (not directories)
 /// - Fails if file doesn't exist
-pub async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_delete(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -804,7 +772,7 @@ pub async fn handle_delete(id: Option<Value>, args: Value) -> RpcResponse<'stati
 /// # Features
 /// - Respects .gitignore
 /// - Sorted output for consistency
-pub async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_glob(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -835,7 +803,7 @@ pub async fn handle_glob(id: Option<Value>, args: Value) -> RpcResponse<'static>
 /// # Access Control
 /// For classes: default private, for structs: default public
 /// Access specifiers (public:, protected:, private:) are preserved
-pub async fn handle_outline(id: Option<Value>, args: Value) -> RpcResponse<'static>
+pub async fn handle_outline(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -933,14 +901,14 @@ Fetch and normalize external web content with caching and JS-aware rendering.
 - **Required**:
   - `url` – absolute URL to fetch.
 - **Optional**:
-  - `max_chunk_tokens` (integer, ≥200) – approximate token budget per chunk. If omitted, a default budget is used.
+  - `max_chunk_tokens` (integer, default 600) – approximate token budget per chunk. Uses OpenAI's `cl100k_base` tokenizer (GPT-4 compatible).
   - `no_cache` (boolean) – when true, bypasses the on-disk cache and forces a fresh fetch.
   - `force_browser` (boolean) – when true, forces headless browser rendering even if heuristics do not flag the page as JS-heavy.
 - **Behavior**:
   - Builds a hardened HTTP client, validates the URL against SSRF rules, and enforces `robots.txt`.
   - Caches responses under `/tmp/tools-webfetch` keyed by URL + method.
   - Extracts readable content and produces Markdown.
-  - Uses heuristics to detect JavaScript-heavy pages and, where possible, re-renders them via a headless Chrome/Chromium browser.
+  - Uses heuristics to detect JavaScript-heavy pages and, where possible, re-renders them via a headless Chrome/Chromium browser. Browser rendering is disabled by default unless the `WEBFETCH_ENABLE_BROWSER_UNSAFE=true` environment variable is set.
   - Splits content into token-aware chunks with headings.
 - **Response shape** (`FetchResponse`):
   - `url` – final URL.
@@ -957,14 +925,25 @@ Fast local regex search using ugrep.
 
 - **Tool name**: `Search`
 - **Required**:
-  - `pattern` - ripgrep pattern (regex by default).
+  - `pattern` - regex pattern to search for.
 - **Optional**:
   - `path` - file or directory root (default: current working directory).
   - `case` - `"smart"` (default), `"sensitive"`, or `"insensitive"`.
-  - `fixed_strings`, `word_regexp`, `glob`, `hidden`, `follow`, `no_ignore`, `context`, `max_results`, `timeout_ms`.
+  - `fixed_strings` (boolean, default `false`) - treat pattern as a literal string (`-F`).
+  - `word_regexp` (boolean, default `false`) - match on word boundaries only (`-w`).
+  - `glob` (string[]) - glob filters to include files.
+  - `hidden` (boolean, default `false`) - search hidden files/directories.
+  - `follow` (boolean, default `false`) - follow symlinks.
+  - `no_ignore` (boolean, default `false`) - do not respect ignore files like `.gitignore`.
+  - `context` (integer, minimum `0`, default `0`) - lines of context on both sides.
+  - `max_results` (integer, minimum `1`, maximum `10000`, default `200`) - maximum match/context events to return.
+  - `timeout_ms` (integer, minimum `100`, default `20000`) - overall timeout in milliseconds.
+  - `fuzzy` (integer, minimum `1`, maximum `4`) - fuzzy match tolerance (1-4 edits).
+- **Response**:
+  - `content[0].text` - readable text output.
+  - `matches` - structured match results.
 - **Notes**:
   - Requires `ugrep` to be installed and discoverable on PATH on the machine running the MCP server.
-  - Uses `ugrep` and returns both a readable `content[0].text` and structured `matches`.
 
 ### Read
 
@@ -975,82 +954,92 @@ Read a local file (optionally a line range) for quick inspection without uploads
   - `path` - filesystem path to read.
 - **Optional**:
   - `start_line`, `end_line` (1-based, inclusive).
-  - `show_line_numbers` (default: true) - set to `false` for raw content.
+  - `show_line_numbers` (default: false) - set to `true` to include line numbers.
 - **Response**:
-  - `content[0].text` is line-numbered by default (similar to `nl -ba` / `cat -n`).
-  - Includes `start_line`, `end_line`, and `total_lines`.
+  - `content[0].text` is raw file content by default (set `show_line_numbers: true` for numbered output similar to `nl -ba` / `cat -n`).
+  - Includes `path`, `start_line`, `end_line`, and `total_lines`.
 
-### SmartFileEdit
+### Edit
 
-Edit files while preserving original newline bytes and whitespace.
+Edit files by replacing a snippet, preserving original newline bytes and whitespace.
 
-- **Tool name**: `SmartFileEdit`
-- **Required base fields**:
-  - `action` - one of `"get_region"`, `"apply_snippet_edit"`, `"apply_unified_diff"`.
-  - `path` - filesystem path to inspect or edit.
-
-#### Actions
-
-- `get_region`
-  - **Optional**: `start_line`, `end_line` (1-based) to select a range; defaults to the whole file.
-  - **Returns**:
-    - `plain_text` – raw LF-normalized text for the selected region.
-    - `canonical_text` – numbered lines (LF).
-    - `file_hash` – `sha256:...` hash of the file.
-    - `region_id` – opaque region identifier.
-    - `canonical_range` and `byte_range` for the region.
-    - `newline_style` and `file_size_bytes`.
-
-- `apply_snippet_edit`
-  - **Required**:
-    - `old_snippet` – canonical LF snippet to replace.
-    - `new_snippet` – canonical LF replacement.
-  - **Recommended**:
-    - `file_hash` – from the last `get_region`/edit; used to detect stale files.
-  - **Optional**:
-    - `match_hint` – `{ start_line, end_line }` to restrict the search range.
-    - `region_id` – any caller-chosen identifier to help correlate edits.
-  - **Behavior**:
-    - Searches the canonical LF view for `old_snippet` (within `match_hint` if provided).
-    - Rewrites the corresponding byte range using the file's dominant newline style, preserving other bytes.
-    - Returns:
-      - `status`: `"ok"`, `"no_match"`, or `"stale_file"`.
-      - `replaced_byte_range`, `lines`, `bytes_written`, `file_hash_before`, `file_hash_after`, `newline_kind`.
-      - When `status = "no_match"`, includes suggested candidate ranges.
-
-- `apply_unified_diff`
-  - **Required**:
-    - `diff` – unified diff hunks for a single file (e.g., output similar to `git diff` but without needing `---/+++` headers).
-  - **Optional**:
-    - `file_hash` – expected hash before applying the first hunk.
-  - **Behavior**:
-    - Parses each `@@ -old_start,old_len +new_start,new_len @@` hunk.
-    - For each hunk, builds `old_snippet` / `new_snippet` and applies it via `apply_snippet_edit` using line-based hints.
-    - Requires at least one context or removal line per hunk (pure additions with zero context are not supported yet).
-  - **Response**:
-    - On success:
-      - `status: "ok"`, `hunks_applied`, `file_hash_before`, `file_hash_after`, and per-hunk results.
-    - On failure:
-      - `status: "no_match"` or `"stale_file"`, plus `failed_hunk` and detailed payload from the underlying snippet edit.
-
-### Bash
-
-Run shell commands via bash with timeout and stdout/stderr capture.
-
-- **Tool name**: `Bash`
+- **Tool name**: `Edit`
 - **Required**:
-  - `command` - shell command to run (executed as: `bash -lc "<command>"`).
+  - `path` - filesystem path to edit.
+  - `old_snippet` - exact text to find and replace (must use LF newlines).
+  - `new_snippet` - replacement text (use LF newlines; file's original line endings are preserved).
 - **Optional**:
-  - `timeout_ms` - timeout in milliseconds (default 30000).
-  - `working_dir` - optional working directory for the command.
+  - `match_hint` - `{ start_line, end_line }` to restrict the search range when multiple matches exist.
+- **Behavior**:
+  - Searches for `old_snippet` in the file (within `match_hint` range if provided).
+  - Replaces with `new_snippet` while preserving the file's dominant line ending style (LF, CRLF, or CR).
+  - Returns structured result with status, byte range replaced, and hash values.
 - **Response**:
-  - Returns a JSON summary (including `stdout`, `stderr`, `exit_code`) in `content[0].text` (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
+  - `status`: `"ok"`, `"no_match"`, or `"stale_file"`.
+  - On success: `replaced_byte_range`, `lines`, `bytes_written`, `file_hash_before`, `file_hash_after`, `newline_kind`, `action`, `region_id`.
+  - On no_match: includes suggested candidate ranges with similarity scores.
 
-### ping
+### Pwsh
+
+Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
+
+- **Tool name**: `Pwsh`
+- **Required**:
+  - `command` - PowerShell command to execute.
+- **Optional**:
+  - `timeout_ms` - timeout in milliseconds (default 60000, max: 300000).
+  - `working_dir` - working directory for the command (default: current directory).
+- **Response**:
+  - Returns a JSON summary (including `stdout`, `stderr`, `exit_code`, `timed_out`) in `content[0].text` (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
+
+### Move
+
+Move or rename a file or directory.
+
+- **Tool name**: `Move`
+- **Required**:
+  - `source` - Source path to move.
+  - `destination` - Destination path (or directory to move into).
+- **Optional**:
+  - `overwrite` - Overwrite destination if it exists (default: false).
+- **Response**:
+  - Returns success/failure status with source and destination paths.
+
+### Copy
+
+Copy a file or directory.
+
+- **Tool name**: `Copy`
+- **Required**:
+  - `source` - Source path to copy.
+  - `destination` - Destination path (or directory to copy into).
+- **Optional**:
+  - `overwrite` - Overwrite destination if it exists (default: false).
+  - `recursive` - Copy directories recursively (default: false).
+- **Response**:
+  - Returns success/failure status with source and destination paths.
+
+### ListDir
+
+List directory contents with file metadata.
+
+- **Tool name**: `ListDir`
+- **Required**:
+  - `path` - Directory path to list.
+- **Optional**:
+  - `all` (boolean, default `false`) - include hidden files (starting with `.`).
+  - `long` (boolean, default `false`) - show detailed information (size, modified time).
+- **Response**:
+  - `content[0].text` - human-readable listing (filenames with `/` suffix for dirs, `@` for symlinks; or `d <size> <name>` format when `long` is true).
+  - `path` - the directory path listed.
+  - `count` - number of entries returned.
+  - `entries` - array of objects with `name`, `type` (`file`/ `dir`/ `symlink`), and optionally `size` and `modified` (Unix epoch seconds) when `long` is true.
+
+### Ping
 
 Simple health check for MCP clients.
 
-- **Tool name**: `ping`
+- **Tool name**: `Ping`
 - **Behavior**:
   - Always returns `pong` in a JSON `content` array.
 - Useful for MCP client connectivity tests or keepalive pings.
@@ -1072,7 +1061,7 @@ Run `git status` (porcelain by default).
 
 ### GitDiff
 
-Run `git diff` with optional flags and output truncation.
+Run `git diff` with optional flags and output truncation. When `from_ref`, `to_ref`, and `output_dir` are provided, writes per-file patches to the directory.
 
 - **Tool name**: `GitDiff`
 - **Optional**:
@@ -1084,9 +1073,13 @@ Run `git diff` with optional flags and output truncation.
   - `unified` (integer, >= 0) - context lines (`-U<N>`).
   - `paths` (string[]) - limit diff to these paths (passed after `--`).
   - `max_bytes` (integer, default 200000) - maximum bytes captured from stdout before truncation.
+  - `from_ref` (string) - starting ref (tag/branch/commit) for ref-to-ref comparison.
+  - `to_ref` (string) - ending ref (tag/branch/commit) for ref-to-ref comparison.
+  - `output_dir` (string) - directory to write per-file patches (creates if missing). Required with `from_ref`/`to_ref`.
 - **Response**:
-  - `content[0].text` - diff output (or `no diff`).
+  - `content[0].text` - diff output (or `no diff`; or summary text when using ref-to-ref mode).
   - Includes `stdout`, `stderr`, `exit_code`, `timed_out`, `truncated_stdout`, and the executed `args`.
+  - In ref-to-ref mode: also includes `from_ref`, `to_ref`, `output_dir`, `summary`, and `files`.
 
 ### GitRestore
 
@@ -1133,26 +1126,133 @@ Create a conventional commit.
 - **Response**:
   - Returns commit result with hash and message.
 
+### GitLog
+
+Show commit history with configurable format and filters.
+
+- **Tool name**: `GitLog`
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `max_count` (integer) - Limit number of commits to show.
+  - `oneline` (boolean, default false) - Show each commit on a single line.
+  - `format` (string) - Pretty-print format (e.g., '%H %s' for hash and subject).
+  - `author` (string) - Filter commits by author.
+  - `since` (string) - Show commits after date (e.g., '2024-01-01', '2 weeks ago').
+  - `until` (string) - Show commits before date.
+  - `grep` (string) - Filter commits by message pattern.
+  - `path` (string) - Show commits affecting this path.
+  - `max_bytes` (integer, default 200000) - Maximum output bytes.
+- **Response**:
+  - Returns commit history output.
+
+### GitBranch
+
+List, create, rename, or delete branches.
+
+- **Tool name**: `GitBranch`
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `list_all` (boolean, default false) - List both local and remote branches (`-a`).
+  - `list_remote` (boolean, default false) - List only remote branches (`-r`).
+  - `create` (string) - Create a new branch with this name.
+  - `delete` (string) - Delete this branch (`-d`, must be merged).
+  - `force_delete` (string) - Force delete this branch (`-D`).
+  - `rename` (string) - Rename this branch (requires `new_name`).
+  - `new_name` (string) - New name when renaming a branch.
+- **Response**:
+  - Returns branch operation result.
+
+### GitCheckout
+
+Switch branches or restore working tree files.
+
+- **Tool name**: `GitCheckout`
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `branch` (string) - Branch to switch to.
+  - `create_branch` (string) - Create and switch to a new branch (`-b`).
+  - `commit` (string) - Checkout a specific commit (detached HEAD).
+  - `paths` (string[]) - Restore these paths from HEAD or specified commit.
+- **Response**:
+  - Returns checkout operation result.
+
+### GitStash
+
+Stash changes in a dirty working directory.
+
+- **Tool name**: `GitStash`
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `action` (string, enum: ["push", "pop", "apply", "drop", "list", "show", "clear"], default: "push") - Stash action to perform. Note: "save" is also accepted as an alias for "push".
+  - `message` (string) - Message for the stash (with push).
+  - `index` (integer) - Stash index for pop/apply/drop/show.
+  - `include_untracked` (boolean, default false) - Include untracked files (with push).
+- **Response**:
+  - Returns stash operation result.
+
+### GitShow
+
+Show commit details and diff.
+
+- **Tool name**: `GitShow`
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `commit` (string) - Commit to show (default: HEAD).
+  - `stat` (boolean, default false) - Show diffstat only.
+  - `name_only` (boolean, default false) - Show only changed file names.
+  - `format` (string) - Pretty-print format.
+  - `max_bytes` (integer, default 200000) - Maximum output bytes.
+- **Response**:
+  - Returns commit details and diff output.
+
+### GitBlame
+
+Show line-by-line author information for a file.
+
+- **Tool name**: `GitBlame`
+- **Required**:
+  - `path` (string) - File path to show blame for.
+- **Optional**:
+  - `working_dir` (string) - working directory for the command.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds.
+  - `commit` (string) - Blame at specific commit (default: HEAD).
+  - `start_line` (integer, minimum `1`) - Start line number for range (1-indexed).
+  - `end_line` (integer, minimum `1`) - End line number for range (inclusive).
+  - `max_bytes` (integer, default 200000) - Maximum output bytes.
+- **Response**:
+  - Returns blame output showing line authors.
+
 ### Write
 
-Create a new file.
+Create a new file (fails if the file already exists).
 
 - **Tool name**: `Write`
 - **Required**:
   - `path` (string) - file path to create
   - `content` (string) - file content
 - **Response**:
-  - Returns number of bytes written.
+  - `content[0].text` - human-readable message (e.g., `"Created /path (123 bytes)"`).
+  - `path` - the file path created.
+  - `bytes` - number of bytes written.
 
 ### Delete
 
-Delete a file.
+Delete a file (symlinks and directories are explicitly rejected for safety).
 
 - **Tool name**: `Delete`
 - **Required**:
   - `path` (string) - file to delete
+- **Behavior**:
+  - Rejects symlinks to prevent TOCTOU races and deletion of files outside the workspace.
+  - Rejects directories; this tool only deletes regular files.
 - **Response**:
-  - Returns success/failure status.
+  - `content[0].text` - human-readable message (e.g., `"Deleted /path"`).
+  - `path` - the file path deleted.
 
 ### Glob
 
@@ -1160,13 +1260,18 @@ List files matching a glob pattern.
 
 - **Tool name**: `Glob`
 - **Required**:
-  - `pattern` (string) - glob pattern (e.g., `**/*.rs`)
+  - `pattern` (string) - glob pattern with brace expansion (e.g., `**/*.rs`, `src/*.{ts,tsx}`)
 - **Optional**:
   - `path` (string, default: ".") - base directory
   - `hidden` (boolean, default: false) - include hidden files
   - `limit` (integer, default: 1000, max: 10000) - maximum files to return
 - **Response**:
-  - Returns array of matching file paths.
+  - `content[0].text` - newline-separated list of matching files (or message if none match).
+  - `pattern` - the glob pattern used.
+  - `base_path` - the base directory searched.
+  - `count` - number of files returned.
+  - `files` - array of matching file paths.
+  - `truncated` (boolean, optional) - true if the result was truncated by the limit.
 
 ### Outline
 
@@ -1178,7 +1283,10 @@ Extract C++ structure.
 - **Optional**:
   - `include_private` (boolean, default: false) - include private members
 - **Response**:
-  - Returns extracted class/struct signatures and function declarations.
+  - `content[0].text` - extracted class/struct signatures and function declarations.
+  - `path` - the file path processed.
+  - `bytes` - size of the source file.
+  - `outline_bytes` - size of the extracted outline.
 
 ---
 
@@ -1365,12 +1473,13 @@ pub struct FetchChunk {
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| OPENAI_API_KEY | Yes | OpenAI API key for vector store operations |
+| OPENAI_API_KEY | Optional (required for CodeQuery) | OpenAI API key for vector store operations |
 | MCP_SKIP_HEADERS | No | Set to "true" for raw JSON output (no Content-Length headers) |
 | RUST_LOG | No | Logging level (debug, info, warn, error) |
 | APP_VERSION | No | Version string exposed in server info |
 | HOME | No | Home directory for cache storage |
 | TOOLS_PRETTY_JSON | No | Set to "true" (or 1/yes/on) to pretty-print JSON payloads returned as text (default: compact) |
+| WEBFETCH_ENABLE_BROWSER_UNSAFE | No | Set to "true" to enable headless browser rendering in WebFetch (disabled by default) |
 
 ### Cache Locations
 
@@ -1383,7 +1492,7 @@ pub struct FetchChunk {
 
 ```toml
 [mcp_servers.tools]
-command = "/path/to/tools/target/release/tools"
+command = "/path/to/tools-mcp/target/release/tools-mcp-server"
 env = {
   OPENAI_API_KEY = "${OPENAI_API_KEY}",
   MCP_SKIP_HEADERS = "true",
@@ -1427,9 +1536,9 @@ WebFetch returns structured data clearly marked as external content:
 
 When using headless Chrome:
 - Runs with `--no-sandbox` (required for containerized environments)
-- Browser pool lifecycle management prevents resource leaks
+- Browser pool lifecycle management prevents resource leaks (restarts after 100 requests or 1 hour)
 - Resource blocking: images, fonts, video/audio autoplay
-- Network idle timeout (max 20s wait)
+- Network idle detection timeout: 2s (with 20s safety cap on total wait)
 
 ### Input Validation
 
@@ -1459,6 +1568,7 @@ All tool handlers validate:
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
+| base64 | 0.22 | Base64 encoding/decoding |
 | chromiumoxide | 0.7 | Headless Chrome via CDP |
 | htmd | 0.4 | HTML to Markdown conversion |
 | readability | 0.3 | Boilerplate removal |
@@ -1531,7 +1641,7 @@ The `reindex_with_retry` function implements exponential backoff:
 
 - Max attempts: 3
 - Backoff delays: 200ms, 500ms, 1000ms
-- Jitter: 50ms per attempt
+- Jitter: cumulative (50ms, 100ms, 150ms per attempt)
 - Retries on: timeout, connection reset, 429/5xx errors
 
 ---
@@ -1559,9 +1669,9 @@ Prerequisites:
 - Install the Rust LLVM tools: `rustup component add llvm-tools-preview`
 - Install the cargo subcommand: `cargo install cargo-llvm-cov`
 
-Run (cross-platform):
+Run directly:
 ```bash
-cargo coverage
+cargo llvm-cov --workspace --html --output-dir coverage
 ```
 
 Run via scripts (also supports installing missing prerequisites):
@@ -1585,17 +1695,17 @@ Output:
 
 ### Integration Testing
 
-The server can be tested via stdin/stdout:
+The server can be tested via stdin/stdout. Use `MCP_SKIP_HEADERS=true` for raw JSON line output:
 
 ```bash
 # Initialize
-echo '{"jsonrpc":"2.0","id":1,"method":"mcp/initialize","params":{}}' | cargo run -p tools-mcp-server
+echo '{"jsonrpc":"2.0","id":1,"method":"mcp/initialize","params":{}}' | MCP_SKIP_HEADERS=true cargo run -p tools-mcp-server
 
 # List tools
-echo '{"jsonrpc":"2.0","id":2,"method":"mcp/tools/list","params":{}}' | cargo run -p tools-mcp-server
+echo '{"jsonrpc":"2.0","id":2,"method":"mcp/tools/list","params":{}}' | MCP_SKIP_HEADERS=true cargo run -p tools-mcp-server
 
 # Read file
-echo '{"jsonrpc":"2.0","id":3,"method":"mcp/tools/call","params":{"name":"Read","arguments":{"path":"Cargo.toml"}}}' | cargo run -p tools-mcp-server
+echo '{"jsonrpc":"2.0","id":3,"method":"mcp/tools/call","params":{"name":"Read","arguments":{"path":"Cargo.toml"}}}' | MCP_SKIP_HEADERS=true cargo run -p tools-mcp-server
 ```
 
 ---
@@ -1624,12 +1734,11 @@ APP_VERSION="1.0.0" cargo build -p tools-mcp-server --release
 
 **Required**:
 - Rust toolchain (2024 edition)
-- OPENAI_API_KEY environment variable
 
 **Optional**:
-- Chrome/Chromium for browser rendering
-- ripgrep (`rg`) for Search tool
-- ugrep for fuzzy search
+- `OPENAI_API_KEY` environment variable (required only for CodeQuery tool)
+- Chrome/Chromium for browser rendering (WebFetch)
+- ugrep for Search tool (regex and fuzzy search)
 - Git for git tools
 
 ---
