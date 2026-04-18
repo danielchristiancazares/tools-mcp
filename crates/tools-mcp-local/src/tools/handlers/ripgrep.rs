@@ -13,7 +13,30 @@ use tools_mcp_core::validation;
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
 /// Returns (path, `line_number`, text, `is_match`)
 fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
-    fn parse_with_sep(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
+    fn parse_with_sep_from_start(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
+        let bytes = line.as_bytes();
+        for i in 0..bytes.len() {
+            if bytes[i] != sep {
+                continue;
+            }
+
+            // Check if followed by digits then another matching separator.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            if j > i + 1 && j < bytes.len() && bytes[j] == sep {
+                let path = &line[..i];
+                let line_no: u64 = line[i + 1..j].parse().ok()?;
+                let text = &line[j + 1..];
+                return Some((path.to_string(), line_no, text.to_string(), sep == b':'));
+            }
+        }
+        None
+    }
+
+    fn parse_with_sep_from_end(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
         let bytes = line.as_bytes();
         for i in (0..bytes.len()).rev() {
             if bytes[i] != sep {
@@ -36,12 +59,14 @@ fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
         None
     }
 
-    // Parse match lines first ("path:line:text"), then context lines ("path-line-text").
-    // This avoids misparsing filenames containing "-<digits>-", e.g. "foo-1-bar.txt:10:text".
-    if let Some(parsed) = parse_with_sep(line, b':') {
+    // Parse match lines first ("path:line:text") by scanning from the start.
+    // This avoids selecting a later `:<digits>:` sequence in the matched text.
+    if let Some(parsed) = parse_with_sep_from_start(line, b':') {
         return parsed;
     }
-    if let Some(parsed) = parse_with_sep(line, b'-') {
+    // Parse context lines ("path-line-text") by scanning from the end.
+    // This avoids misparsing filenames containing "-<digits>-", e.g. "foo-1-bar.txt-10-text".
+    if let Some(parsed) = parse_with_sep_from_end(line, b'-') {
         return parsed;
     }
 
@@ -381,5 +406,15 @@ mod tests {
         assert_eq!(line_no, 7);
         assert_eq!(text, "use std::time::Duration;");
         assert!(!is_match);
+    }
+
+    #[test]
+    fn parse_grep_line_match_text_can_contain_colon_number_colon() {
+        let line = "src/main.rs:12:timestamp 10:23:59";
+        let (path, line_no, text, is_match) = parse_grep_line(line);
+        assert_eq!(path, "src/main.rs");
+        assert_eq!(line_no, 12);
+        assert_eq!(text, "timestamp 10:23:59");
+        assert!(is_match);
     }
 }
