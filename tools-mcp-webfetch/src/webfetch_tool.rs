@@ -2,10 +2,10 @@
 
 use crate::services::default_web_fetcher;
 use crate::webfetch::FetchRequest;
-use tools_mcp_core::ToolCallOutcome;
+use tools_mcp_core::{ToolCallOutcome, config::MAX_ERROR_DETAIL_CHARS, text};
 
 /// MCP tool handler for `WebFetch`
-pub async fn handle_webfetch(
+pub(crate) async fn handle_webfetch(
     _id: Option<serde_json::Value>,
     args: serde_json::Value,
 ) -> ToolCallOutcome {
@@ -39,35 +39,15 @@ pub async fn handle_webfetch(
                     ("force_browser", serde_json::json!(force_browser)),
                     (
                         "details",
-                        serde_json::json!(truncate_tool_details(&details_full, 1200)),
+                        serde_json::json!(text::truncate_at_char_boundary(
+                            &details_full,
+                            MAX_ERROR_DETAIL_CHARS
+                        )),
                     ),
                     ("remediation", serde_json::json!(remediation)),
                 ],
             )
         }
-    }
-}
-
-fn truncate_tool_details(input: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return "…".to_string();
-    }
-
-    let mut char_count = 0usize;
-    let mut truncation_byte_idx = input.len();
-
-    for (byte_idx, _) in input.char_indices() {
-        if char_count == max_chars {
-            truncation_byte_idx = byte_idx;
-            break;
-        }
-        char_count += 1;
-    }
-
-    if char_count == max_chars && truncation_byte_idx < input.len() {
-        format!("{}…", &input[..truncation_byte_idx])
-    } else {
-        input.to_string()
     }
 }
 
@@ -183,25 +163,3 @@ fn classify_webfetch_error(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::truncate_tool_details;
-
-    #[test]
-    fn truncate_tool_details_truncates_ascii() {
-        let out = truncate_tool_details("abcdef", 3);
-        assert_eq!(out, "abc…");
-    }
-
-    #[test]
-    fn truncate_tool_details_preserves_short_input() {
-        let out = truncate_tool_details("abc", 10);
-        assert_eq!(out, "abc");
-    }
-
-    #[test]
-    fn truncate_tool_details_handles_unicode_boundaries() {
-        let out = truncate_tool_details("éééé", 3);
-        assert_eq!(out, "ééé…");
-    }
-}

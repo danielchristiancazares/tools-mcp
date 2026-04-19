@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 /// Runs the existing `WebFetch` pipeline (SSRF, robots, cache, browser fallback, chunking).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct RunFetchWebFetcher;
+pub(crate) struct RunFetchWebFetcher;
 
 impl WebFetcher for RunFetchWebFetcher {
     fn fetch<'a>(

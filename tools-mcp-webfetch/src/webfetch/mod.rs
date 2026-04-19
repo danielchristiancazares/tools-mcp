@@ -94,16 +94,16 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 
-pub mod browser;
-pub mod cache;
-pub mod chunker;
-pub mod extract;
-pub mod heuristics;
-pub mod http;
-pub mod types;
-pub mod whitelist;
+pub(crate) mod browser;
+pub(crate) mod cache;
+pub(crate) mod chunker;
+pub(crate) mod extract;
+pub(crate) mod heuristics;
+pub(crate) mod http;
+pub(crate) mod types;
+pub(crate) mod whitelist;
 
-pub use types::{FetchChunk, FetchRequest, FetchResponse};
+pub(crate) use types::{FetchChunk, FetchRequest, FetchResponse};
 
 /// Global browser pool instance, lazily initialized on first browser render request.
 ///
@@ -137,7 +137,7 @@ static BROWSER_POOL: OnceCell<Arc<browser::BrowserPool>> = OnceCell::const_new()
 /// - **Tier 1**: Whitelisted domains or `force_browser=true` -> immediate browser rendering
 /// - **Tier 2**: HTTP fetch with JS-heavy heuristic analysis -> browser fallback if needed
 /// - **Tier 3**: Degraded HTTP mode if browser unavailable or fails
-pub async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
+pub(crate) async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     // Rendering decision: browser if explicitly requested OR domain is known to require JS
     let use_browser = req.force_browser || whitelist::is_whitelisted_js_heavy(&req.url);
 

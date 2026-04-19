@@ -2,6 +2,7 @@ pub mod config;
 pub mod mcp_protocol;
 pub mod process_utils;
 pub mod response;
+pub mod text;
 pub mod tool_outcome;
 pub mod tool_registry;
 pub mod validation;

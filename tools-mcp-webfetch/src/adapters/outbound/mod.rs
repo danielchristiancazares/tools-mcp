@@ -1,3 +1,3 @@
-pub mod webfetch_default;
+pub(crate) mod webfetch_default;
 
-pub use webfetch_default::RunFetchWebFetcher;
+pub(crate) use webfetch_default::RunFetchWebFetcher;

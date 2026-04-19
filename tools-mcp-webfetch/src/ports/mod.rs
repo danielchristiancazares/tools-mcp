@@ -1,3 +1,3 @@
-pub mod web_fetcher;
+pub(crate) mod web_fetcher;
 
-pub use web_fetcher::WebFetcher;
+pub(crate) use web_fetcher::WebFetcher;

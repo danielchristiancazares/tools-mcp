@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::pin::Pin;
 
 /// Fetches a URL and returns the structured `WebFetch` response (HTTP and/or browser pipeline).
-pub trait WebFetcher: Send + Sync {
+pub(crate) trait WebFetcher: Send + Sync {
     fn fetch<'a>(
         &'a self,
         req: crate::webfetch::FetchRequest,

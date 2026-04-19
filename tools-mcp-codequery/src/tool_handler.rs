@@ -15,7 +15,7 @@ use crate::adapters::outbound::FileSearchCoreEngine;
 use crate::discovery::{default_workspace_scope, discover_default_file_paths};
 use crate::ports::CodeQueryEngine;
 use crate::store_resolution::resolve_vector_store_id;
-use tools_mcp_core::{ToolCallOutcome, validation};
+use tools_mcp_core::{ToolCallOutcome, config::MAX_ERROR_DETAIL_CHARS, text, validation};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +40,7 @@ struct CodeQueryRequest {
     include_results: Option<bool>,
 }
 
-pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutcome {
+pub(crate) async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     let req = match ToolCallOutcome::parse_args::<CodeQueryRequest>(&args) {
         Ok(req) => req,
         Err(o) => return o,
@@ -220,8 +220,7 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
 
             // Avoid dumping huge server responses into the primary message; keep a bounded
             // `details` field for debugging while still giving the model actionable hints.
-            const MAX_DETAILS_CHARS: usize = 1200;
-            let details = truncate_error_details(&error_message, MAX_DETAILS_CHARS);
+            let details = text::truncate_at_char_boundary(&error_message, MAX_ERROR_DETAIL_CHARS);
 
             let mut remediation: Vec<String> = Vec::new();
             if lower.contains("http 401")
@@ -280,48 +279,3 @@ pub async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCallOutco
     }
 }
 
-/// Truncates `s` to `max_chars` characters at a UTF-8 boundary, appending `…` on truncation.
-fn truncate_error_details(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars).collect();
-    format!("{truncated}…")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_error_details_handles_utf8_boundary() {
-        // Build a string where a 3-byte UTF-8 character (€) starts at byte 1199.
-        // The old buggy code would slice at byte 1200 and panic.
-        let prefix = "a".repeat(1198);
-        let input = format!("{prefix}€tail"); // € spans bytes 1198-1200
-        assert!(input.len() > 1200);
-
-        let result = truncate_error_details(&input, 1200);
-        assert!(result.chars().count() == 1201); // 1200 chars + ellipsis
-        assert!(result.ends_with('…'));
-        assert!(result.contains('€'));
-    }
-
-    #[test]
-    fn truncate_error_details_returns_unchanged_when_short() {
-        let input = "short error";
-        let result = truncate_error_details(input, 1200);
-        assert_eq!(result, input);
-    }
-
-    #[test]
-    fn truncate_error_details_handles_multibyte_chars() {
-        let input = "🎉🎊🎈🎁🎀";
-        assert_eq!(input.len(), 20);
-        assert_eq!(input.chars().count(), 5);
-
-        let result = truncate_error_details(input, 3);
-        assert_eq!(result.chars().count(), 4); // 3 chars + ellipsis
-        assert_eq!(result, "🎉🎊🎈…");
-    }
-}

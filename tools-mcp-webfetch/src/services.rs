@@ -11,7 +11,7 @@ use crate::ports::WebFetcher;
 static DEFAULT_WEB_FETCHER: OnceLock<Arc<dyn WebFetcher>> = OnceLock::new();
 
 /// Shared default `WebFetch` adapter (wraps [`crate::webfetch::run_fetch`]).
-pub fn default_web_fetcher() -> Arc<dyn WebFetcher> {
+pub(crate) fn default_web_fetcher() -> Arc<dyn WebFetcher> {
     DEFAULT_WEB_FETCHER
         .get_or_init(|| {
             let r: Arc<dyn WebFetcher> = Arc::new(RunFetchWebFetcher);

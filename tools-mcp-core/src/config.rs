@@ -32,3 +32,7 @@ pub const MAX_PWSH_STDOUT_BYTES: usize = 1_000_000;
 
 /// Maximum stderr capture for `PowerShell` commands.
 pub const MAX_PWSH_STDERR_BYTES: usize = 500_000;
+
+/// Default cap for the `details` field in tool-level error payloads so a stray upstream
+/// response can't flood the model's context.
+pub const MAX_ERROR_DETAIL_CHARS: usize = 1200;
