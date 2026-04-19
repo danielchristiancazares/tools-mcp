@@ -1,6 +1,8 @@
 mod adapters;
 mod codequery_cache;
+mod discovery;
 mod ports;
+mod store_resolution;
 mod tool_handler;
 mod tools;
 

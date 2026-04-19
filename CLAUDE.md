@@ -22,24 +22,38 @@ When tools is available, prefer its dedicated tools over Bash equivalents:
 
 This is a **Rust-based MCP (Model Context Protocol) server** that provides file search functionality using OpenAI's vector stores API and a token-aware web content fetcher for Codex-style agents.
 
+## Workspace Layout
+
+The workspace is composed of focused crates that each register their own MCP tools:
+
+- `tools-mcp-server` — entry point; reads JSON-RPC from stdin, writes responses to stdout
+- `tools-mcp-core` — `ToolRegistry`, `ToolCallOutcome`, validation helpers, shared constants, the `define_mcp_tool!` macro
+- `tools-mcp-codequery` — `CodeQuery` tool (vector-store-backed semantic search)
+- `tools-mcp-webfetch` — `WebFetch` tool (HTTP/headless browser fetch + Markdown chunking)
+- `tools-mcp-local` — local file tools (smart edit, read, write, glob, etc.)
+- `tools-mcp-git` — git tools (status, diff, restore, add, commit)
+- `openai-file-search-core` — OpenAI vector store + Responses API client used by `tools-mcp-codequery`
+
+Each feature crate exposes a single `register_tools(&mut ToolRegistry)` entry point, called from `tools-mcp-server/src/composition.rs`. New tools are added by calling `registry.register::<MyTool>()` inside their crate's `register_tools` function — there is no central match statement.
+
 ## Architecture
 
 ### Core Components
 
-1. **MCP Server (`src/main.rs`)**
+1. **MCP Server (`tools-mcp-server/src/main.rs`)**
    - Implements JSON-RPC protocol over stdin/stdout
    - Handles MCP initialization, tool listing, and tool execution
-   - Provides 6 main tools: ping, query, upload_file, create-store, get-store-by-name, list-stores
+   - Composition root in `tools-mcp-server/src/composition.rs` calls each crate's `register_tools()`
    - Accepts multiple protocol aliases for compatibility (e.g., `mcp/initialize`, `initialize`, `server/initialize`)
 
-2. **OpenAI API Client (`src/lib.rs`)**
+2. **OpenAI API Client (`openai-file-search-core/src/lib.rs`)**
    - Wraps OpenAI's vector store and file APIs
    - Handles file uploads with automatic extension validation
    - Manages vector store creation and file association
    - Implements polling for file indexing completion
-   - Core functions: `upload_file`, `create_vector_store`, `responses_with_file_search`
+   - Core functions: `upload_file`, `create_vector_store`, `responses_with_file_search`, `reindex_files`
 
-3. **WebFetch Pipeline (`src/webfetch/`)**
+3. **WebFetch Pipeline (`tools-mcp-webfetch/src/webfetch/`)**
    - Retrieves remote pages with HTTP or headless browser rendering
    - Caches under `/tmp/tools-webfetch` (separate cache keys for http vs browser)
    - **Respects robots.txt** - Fetches and caches robots.txt per domain, blocks disallowed URLs [robotstxt v0.3.0]
@@ -249,10 +263,10 @@ WebFetch extracts content from untrusted external websites that may contain adve
 
 ### Adding a New Tool
 
-1. Add tool definition to `tools` vector in `main()` at src/main.rs:165
-2. Add handler case in the match statement at src/main.rs:306
-3. Implement handler function following the pattern of existing handlers
-4. Ensure response uses proper MCP content format
+1. In the owning feature crate (e.g. `tools-mcp-local`, `tools-mcp-git`), declare the tool with the `define_mcp_tool!` macro from `tools-mcp-core`. Provide `name`, `description`, JSON `schema`, and an async `handler` returning `ToolCallOutcome`.
+2. Register it inside that crate's `register_tools(&mut ToolRegistry)` via `registry.register::<MyTool>()`.
+3. If the crate is new, declare it as a workspace member in the root `Cargo.toml`, add it as a dependency in `tools-mcp-server/Cargo.toml`, and call its `register_tools` from `tools-mcp-server/src/composition.rs`.
+4. Implement the handler. Return structured errors via `ToolCallOutcome::err` / `ToolCallOutcome::err_with`; never panic.
 
 ### Debugging Protocol Issues
 

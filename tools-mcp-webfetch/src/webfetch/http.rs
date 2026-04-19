@@ -239,28 +239,42 @@ async fn validate_url_ssrf_and_resolve(url: &str) -> Result<Option<(String, Sock
         }
     }
 
-    let host = parsed
-        .host_str()
+    // Use the typed `Host` so IPv6 literals are detected correctly. `host_str()` returns
+    // IPv6 addresses bracketed (`[::1]`), which then fails `parse::<IpAddr>()`, silently
+    // bypassing the IP-literal SSRF check and falling through to DNS resolution.
+    let host_typed = parsed
+        .host()
         .ok_or_else(|| anyhow!("URL must have a valid host"))?;
 
-    // Reject localhost variations
-    if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.localdomain")
-    {
-        return Err(anyhow!("Cannot fetch from localhost"));
-    }
-
-    // If hostname is an IP address, check if it's private and skip DNS pinning.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(ip) {
-            return Err(anyhow!("Cannot fetch from private IP address: {ip}"));
+    let host_owned = match host_typed {
+        Host::Domain(d) => {
+            if d.eq_ignore_ascii_case("localhost") || d.eq_ignore_ascii_case("localhost.localdomain")
+            {
+                return Err(anyhow!("Cannot fetch from localhost"));
+            }
+            d.to_string()
         }
-        return Ok(None);
-    }
+        Host::Ipv4(ip) => {
+            let addr = IpAddr::V4(ip);
+            if is_private_ip(addr) {
+                return Err(anyhow!("Cannot fetch from private IP address: {addr}"));
+            }
+            return Ok(None);
+        }
+        Host::Ipv6(ip) => {
+            let addr = IpAddr::V6(ip);
+            if is_private_ip(addr) {
+                return Err(anyhow!("Cannot fetch from private IP address: {addr}"));
+            }
+            return Ok(None);
+        }
+    };
 
     // Resolve the host and ensure it does not map to a private/reserved IP.
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| anyhow!("unknown default port"))?;
+    let host = host_owned.as_str();
 
     let addrs = tokio::net::lookup_host((host, port))
         .await
@@ -626,5 +640,117 @@ mod tests {
             USER_AGENT,
             &robots_match_path(&parsed)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // IPv6 SSRF coverage
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_ipv6_loopback() {
+        let err = validate_url_ssrf("http://[::1]/")
+            .await
+            .expect_err("expected ::1 to be rejected");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_ipv6_unique_local() {
+        let err = validate_url_ssrf("http://[fc00::1]/")
+            .await
+            .expect_err("expected fc00::/7 to be rejected");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_ipv6_link_local() {
+        let err = validate_url_ssrf("http://[fe80::1]/")
+            .await
+            .expect_err("expected fe80::/10 to be rejected");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_ipv4_mapped_ipv6_loopback() {
+        // ::ffff:127.0.0.1 must be unwrapped to its IPv4 form and then rejected as loopback;
+        // skipping the unwrap would allow attackers to bypass the IPv4 private-range check.
+        let err = validate_url_ssrf("http://[::ffff:127.0.0.1]/")
+            .await
+            .expect_err("expected IPv4-mapped loopback to be rejected");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    // ------------------------------------------------------------------
+    // robots.txt URL construction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_robots_url_preserves_explicit_port() {
+        let robots = get_robots_url("https://example.com:8443/foo/bar").expect("robots url");
+        assert_eq!(robots, "https://example.com:8443/robots.txt");
+    }
+
+    #[test]
+    fn get_robots_url_brackets_ipv6_host() {
+        let robots = get_robots_url("http://[2001:db8::1]/page").expect("robots url");
+        assert_eq!(robots, "http://[2001:db8::1]/robots.txt");
+    }
+
+    // ------------------------------------------------------------------
+    // robots.txt round-trip via a localhost HTTP server
+    //
+    // `validate_url_ssrf` is bypassed here because we intentionally call the
+    // robots-checking helper directly — it has no SSRF gate of its own and the
+    // test server runs on 127.0.0.1.
+    // ------------------------------------------------------------------
+
+    /// Spawns a single-shot HTTP/1.1 server on a fresh 127.0.0.1 port.
+    ///
+    /// The server reads one request, returns `response_bytes` verbatim, then closes the
+    /// connection. The returned `(host, port)` pair lets the caller construct a URL that
+    /// reaches the server.
+    async fn spawn_oneshot_http_server(response_bytes: &'static [u8]) -> (String, u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                // Drain the request headers so the client doesn't see ECONNRESET.
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response_bytes).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (addr.ip().to_string(), addr.port())
+    }
+
+    #[tokio::test]
+    async fn is_allowed_by_robots_blocks_disallowed_path() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nConnection: close\r\n\r\nUser-agent: *\nDisallow: /private/\n";
+        let (host, port) = spawn_oneshot_http_server(response).await;
+
+        let client = Client::builder().build().expect("client");
+        let url = format!("http://{host}:{port}/private/secret");
+        let allowed = is_allowed_by_robots(&client, &url)
+            .await
+            .expect("robots check");
+        assert!(!allowed, "expected /private/secret to be disallowed");
+    }
+
+    #[tokio::test]
+    async fn is_allowed_by_robots_allows_when_no_robots_file() {
+        // A 404 means "no robots.txt" which the spec treats as allow-all.
+        let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (host, port) = spawn_oneshot_http_server(response).await;
+
+        let client = Client::builder().build().expect("client");
+        let url = format!("http://{host}:{port}/anything");
+        let allowed = is_allowed_by_robots(&client, &url)
+            .await
+            .expect("robots check");
+        assert!(allowed, "missing robots.txt must default to allow-all");
     }
 }
