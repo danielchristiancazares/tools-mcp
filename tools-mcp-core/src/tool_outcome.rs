@@ -59,7 +59,7 @@ impl ToolCallOutcome {
         })
     }
 
-    pub fn into_rpc_response(self, id: Option<Value>) -> crate::RpcResponse<'static> {
+    pub fn into_rpc_response(self, id: Option<Value>) -> crate::RpcResponse {
         crate::RpcResponse::ok(id, self.0)
     }
 

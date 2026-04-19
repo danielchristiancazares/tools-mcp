@@ -75,7 +75,7 @@ impl ToolRegistry {
         name: &str,
         id: Option<Value>,
         args: Value,
-    ) -> Option<crate::RpcResponse<'static>> {
+    ) -> Option<crate::RpcResponse> {
         let entry = self.tools.iter().find(|entry| entry.def.name == name)?;
         let outcome = (entry.executor)(id.clone(), args).await;
         Some(outcome.into_rpc_response(id))

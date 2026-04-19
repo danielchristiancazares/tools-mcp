@@ -273,7 +273,7 @@ where
 /// deterministic tests that need explicit header control.
 pub async fn write_mcp_response_with_mode<W>(
     writer: &mut W,
-    resp: &RpcResponse<'_>,
+    resp: &RpcResponse,
     skip_headers: bool,
 ) -> Result<()>
 where

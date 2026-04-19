@@ -40,9 +40,9 @@ use serde_json::Value;
 /// This allows tools to return structured content (text, JSON, images) while
 /// signaling success/failure via the `isError` flag.
 #[derive(Debug, Serialize)]
-pub struct RpcResponse<'a> {
+pub struct RpcResponse {
     /// JSON-RPC version (always "2.0").
-    pub jsonrpc: &'a str,
+    pub jsonrpc: &'static str,
 
     /// Request identifier from the corresponding request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,7 +84,7 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
-impl RpcResponse<'static> {
+impl RpcResponse {
     /// Creates a success response with the given result payload.
     ///
     /// # Arguments
@@ -98,7 +98,7 @@ impl RpcResponse<'static> {
     /// RpcResponse::ok(Some(json!(1)), json!({"status": "ready"}))
     /// ```
     #[must_use]
-    pub fn ok(id: Option<Value>, result: Value) -> RpcResponse<'static> {
+    pub fn ok(id: Option<Value>, result: Value) -> RpcResponse {
         RpcResponse {
             jsonrpc: "2.0",
             id,
@@ -131,7 +131,7 @@ impl RpcResponse<'static> {
     ///   }
     /// }
     /// ```
-    pub fn err(id: Option<Value>, msg: impl std::fmt::Display) -> RpcResponse<'static> {
+    pub fn err(id: Option<Value>, msg: impl std::fmt::Display) -> RpcResponse {
         RpcResponse {
             jsonrpc: "2.0",
             id,
@@ -151,7 +151,7 @@ impl RpcResponse<'static> {
         id: Option<Value>,
         msg: impl Into<String>,
         extra: impl IntoIterator<Item = (&'static str, Value)>,
-    ) -> RpcResponse<'static> {
+    ) -> RpcResponse {
         let mut payload = serde_json::json!({
             "content": [{"type": "text", "text": msg.into()}],
             "isError": true
@@ -193,7 +193,7 @@ impl RpcResponse<'static> {
         id: Option<Value>,
         text: impl Into<String>,
         extra: impl IntoIterator<Item = (&'static str, Value)>,
-    ) -> RpcResponse<'static> {
+    ) -> RpcResponse {
         let mut payload = serde_json::json!({
             "content": [{"type": "text", "text": text.into()}],
             "isError": false
@@ -238,7 +238,7 @@ impl RpcResponse<'static> {
     pub fn parse<T: serde::de::DeserializeOwned>(
         id: Option<Value>,
         args: &Value,
-    ) -> Result<T, Box<RpcResponse<'static>>> {
+    ) -> Result<T, Box<RpcResponse>> {
         serde_json::from_value::<T>(args.clone()).map_err(|e| {
             let msg = e.to_string();
             // Serde's error strings are informative but not always prescriptive.
@@ -277,7 +277,7 @@ impl RpcResponse<'static> {
         id: Option<Value>,
         code: i64,
         msg: impl Into<String>,
-    ) -> RpcResponse<'static> {
+    ) -> RpcResponse {
         RpcResponse {
             jsonrpc: "2.0",
             id,

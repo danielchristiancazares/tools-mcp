@@ -47,7 +47,7 @@ pub async fn dispatch_jsonrpc_request(
     req: RpcRequest,
     registry: &ToolRegistry,
     tools: &[ToolDef],
-) -> Option<(RpcResponse<'static>, bool)> {
+) -> Option<(RpcResponse, bool)> {
     if req.id.is_none() {
         match req.method.as_str() {
             "notifications/initialized" | "initialized" => {
@@ -61,7 +61,7 @@ pub async fn dispatch_jsonrpc_request(
         }
     }
 
-    let out: (RpcResponse<'static>, bool) = match req.method.as_str() {
+    let out: (RpcResponse, bool) = match req.method.as_str() {
         "ping" | "mcp/ping" => (
             RpcResponse::ok(
                 req.id,

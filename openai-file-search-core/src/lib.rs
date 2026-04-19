@@ -36,7 +36,7 @@
 //! ```
 
 mod files;
-pub mod openai;
+mod openai;
 mod reindex;
 mod responses;
 mod vector_stores;
