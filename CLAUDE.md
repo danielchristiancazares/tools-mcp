@@ -348,7 +348,7 @@ async fn test_file_search_flow() {
    - Porcelain output parsing
    - Timeout and output limit enforcement
 
-7. **Process Utilities** (`src/process_utils.rs`)
-   - Shell script execution with timeouts
-   - PowerShell command support
-   - ANSI code stripping
+7. **Process Utilities** (`tools-mcp-core/src/process.rs`, `tools-mcp-core/src/text.rs`)
+   - Bounded stream capture and timeout-enforced child wait (`wait_with_limits`)
+   - ANSI code stripping (`text::strip_ansi_codes`) for callers that need clean output
+   - PowerShell execution is owned by `tools-mcp-local/src/tools/pwsh.rs`

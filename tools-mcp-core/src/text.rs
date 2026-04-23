@@ -1,5 +1,74 @@
 //! Text helpers shared across tool crates.
 
+/// Strips ANSI escape codes from a string, returning clean plaintext.
+///
+/// Handles CSI sequences (`ESC [ ... final_byte`), OSC sequences
+/// (`ESC ] ... BEL` or `ESC ] ... ESC \`), character-set designation
+/// (`ESC ( G` / `ESC ) G`), and single-character escapes (e.g. `ESC M`).
+///
+/// # Examples
+///
+/// ```
+/// use tools_mcp_core::text::strip_ansi_codes;
+///
+/// let colored = "\x1b[31mError:\x1b[0m file not found";
+/// assert_eq!(strip_ansi_codes(colored), "Error: file not found");
+/// ```
+pub fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            result.push(c);
+            continue;
+        }
+
+        match chars.peek() {
+            Some('[') => {
+                // CSI: ESC [ <params> <final_byte in 0x40..=0x7E>
+                chars.next();
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: ESC ] <data> (BEL | ESC \)
+                chars.next();
+                while let Some(&ch) = chars.peek() {
+                    if ch == '\x07' {
+                        chars.next();
+                        break;
+                    }
+                    if ch == '\x1b' {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                        continue;
+                    }
+                    chars.next();
+                }
+            }
+            Some('(' | ')') => {
+                // Character-set designation: ESC ( G  or  ESC ) G
+                chars.next();
+                chars.next();
+            }
+            _ => {
+                // Other single-char escapes (e.g. ESC M reverse linefeed)
+                chars.next();
+            }
+        }
+    }
+
+    result
+}
+
 /// Truncates `s` to at most `max_chars` Unicode scalar values at a char boundary,
 /// appending `…` when truncation actually occurs.
 ///
@@ -27,7 +96,28 @@ pub fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_at_char_boundary;
+    use super::{strip_ansi_codes, truncate_at_char_boundary};
+
+    #[test]
+    fn strip_ansi_codes_nested_osc_csi() {
+        // OSC sequence containing an ESC but not an ST (ESC \), followed by BEL.
+        // Old buggy behavior would stop at the first ESC and leave "[31mcolor" in output.
+        let input = "\x1b]test\x1b[31mcolor\x07actual_content";
+        assert_eq!(strip_ansi_codes(input), "actual_content");
+    }
+
+    #[test]
+    fn strip_ansi_codes_colors() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[1;31;40mBold red on black\x1b[0m"),
+            "Bold red on black"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_passthrough() {
+        assert_eq!(strip_ansi_codes("Hello, world!"), "Hello, world!");
+    }
 
     #[test]
     fn returns_unchanged_when_short() {

@@ -1,11 +1,15 @@
+use std::process::Stdio;
+
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::process::Command;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::config::{
     DEFAULT_PWSH_TIMEOUT_MS, MAX_PWSH_STDERR_BYTES, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_TIMEOUT_MS,
 };
 use tools_mcp_core::define_mcp_tool;
-use tools_mcp_core::process_utils;
+use tools_mcp_core::process::wait_with_limits;
+use tools_mcp_core::text::strip_ansi_codes;
 use tools_mcp_core::validation;
 use tracing::{error, info};
 
@@ -35,28 +39,39 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 
     info!("Pwsh tool: executing command in {}", work_dir);
 
-    let result = match process_utils::run_pwsh_command(
-        &req.command,
-        work_dir,
-        timeout_ms,
-        MAX_PWSH_STDOUT_BYTES,
-        MAX_PWSH_STDERR_BYTES,
-    )
-    .await
-    {
-        Ok(r) => r,
+    let pwsh_exe = if cfg!(target_os = "windows") {
+        "pwsh.exe"
+    } else {
+        "pwsh"
+    };
+    let mut cmd = Command::new(pwsh_exe);
+    cmd.args(["-NoLogo", "-Command", &req.command]);
+    cmd.current_dir(work_dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
-            error!("Pwsh tool: {}", e);
-            let msg = if e.to_ascii_lowercase().contains("failed to spawn pwsh") {
-                format!(
-                    "failed to run pwsh: {e}. Remediation: install PowerShell 7 (pwsh) and ensure it is on PATH."
-                )
-            } else {
-                format!("failed to run pwsh: {e}")
-            };
-            return ToolCallOutcome::err(msg);
+            error!("Pwsh tool: failed to spawn pwsh: {}", e);
+            return ToolCallOutcome::err(format!(
+                "failed to run pwsh: failed to spawn pwsh: {e}. Remediation: install PowerShell 7 (pwsh) and ensure it is on PATH."
+            ));
         }
     };
+
+    let mut result =
+        match wait_with_limits(child, timeout_ms, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_STDERR_BYTES)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Pwsh tool: {}", e);
+                return ToolCallOutcome::err(format!("failed to run pwsh: {e}"));
+            }
+        };
+
+    result.stdout = strip_ansi_codes(&result.stdout);
+    result.stderr = strip_ansi_codes(&result.stderr);
 
     if !result.success {
         error!(
@@ -65,7 +80,15 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         );
     }
 
-    let payload = process_utils::build_process_result_response(&result, None);
+    let payload = serde_json::json!({
+        "exit_code": result.exit_code,
+        "success": result.success,
+        "timed_out": result.timed_out,
+        "truncated_stdout": result.truncated_stdout,
+        "truncated_stderr": result.truncated_stderr,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    });
     ToolCallOutcome::ok_json_content(&payload, !result.success)
 }
 

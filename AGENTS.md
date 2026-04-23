@@ -5,7 +5,7 @@ Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with too
 
 ## Project Structure
 - `tools-mcp-server/` — binary crate with stdin/stdout loop, JSON-RPC routing, and feature-crate composition.
-- `tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process_utils`, config).
+- `tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process`, `text`, config).
 - `openai-file-search-core/` — OpenAI/vector-store client library.
 - `tools-mcp-codequery/` — CodeQuery tool and vector-store cache/orchestration.
 - `tools-mcp-webfetch/` — WebFetch pipeline and tool registration.

@@ -59,7 +59,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time;
 use tools_mcp_core::config::{MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES};
-use tools_mcp_core::process_utils::read_to_end_limited;
+use tools_mcp_core::process::read_to_end_limited;
 use tracing::{debug, warn};
 
 /// Execute a Git command with timeout and output capture.
