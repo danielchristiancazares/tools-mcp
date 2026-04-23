@@ -182,7 +182,7 @@ pub async fn reindex_files(
         .collect();
     for chunk in chunks {
         let chunk_len = chunk.len();
-        let results: Vec<_> = stream::iter(chunk.into_iter())
+        let results: Vec<_> = stream::iter(chunk)
             .map(|(path, hash)| async move {
                 let file_id = match upload_file(client, cfg, &path).await {
                     Ok(id) => id,
