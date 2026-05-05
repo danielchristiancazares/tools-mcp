@@ -239,6 +239,8 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
         cmd_args.push(format!("-L{start},{end}"));
     } else if let Some(start) = req.start_line {
         cmd_args.push(format!("-L{start},"));
+    } else if let Some(end) = req.end_line {
+        cmd_args.push(format!("-L1,{end}"));
     }
 
     if let Some(commit) = &req.commit {

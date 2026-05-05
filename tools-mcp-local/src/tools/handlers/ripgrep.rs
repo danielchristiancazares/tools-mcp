@@ -82,9 +82,10 @@ fn classify_success(
     truncated: bool,
     timed_out: bool,
 ) -> bool {
-    status
-        .as_ref()
-        .is_some_and(|s| s.success() || exit_code == Some(1) || truncated)
+    (truncated
+        || status
+            .as_ref()
+            .is_some_and(|s| s.success() || exit_code == Some(1)))
         && !timed_out
 }
 
@@ -380,6 +381,11 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
         let terminated = std::process::ExitStatus::from_raw(9);
         assert!(classify_success(Some(terminated), None, true, false));
+    }
+
+    #[test]
+    fn truncated_without_status_is_success_when_not_timed_out() {
+        assert!(classify_success(None, None, true, false));
     }
 
     #[test]

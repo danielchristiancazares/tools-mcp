@@ -68,12 +68,31 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
         Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
-    let clean = exec.success
-        && if porcelain {
-            porcelain_status_is_clean(&exec.stdout)
-        } else {
-            exec.stdout.trim().is_empty()
-        };
+    let clean = if exec.success && porcelain {
+        porcelain_status_is_clean(&exec.stdout)
+    } else if exec.success {
+        let mut clean_args: Vec<String> = vec!["status".into(), "--porcelain=1".into()];
+        if branch {
+            clean_args.push("-b".into());
+        }
+        if !untracked {
+            clean_args.push("-uno".into());
+        }
+        match run_git(
+            req.working_dir.clone(),
+            clean_args,
+            timeout_ms,
+            DEFAULT_GIT_STDOUT_BYTES,
+            DEFAULT_GIT_STDERR_BYTES,
+        )
+        .await
+        {
+            Ok(clean_exec) if clean_exec.success => porcelain_status_is_clean(&clean_exec.stdout),
+            _ => false,
+        }
+    } else {
+        false
+    };
     let text = if exec.success {
         if clean {
             "clean".to_string()
@@ -180,6 +199,39 @@ mod tests {
                 .expect("stdout")
                 .starts_with("##")
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn git_status_non_porcelain_reports_clean() {
+        if !git_available() {
+            eprintln!("Skipping GitStatus non-porcelain clean test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("status-clean-non-porcelain");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("tracked.txt"), "tracked\n").expect("write tracked file");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "initial"]);
+
+        let outcome = handle_git_status(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string(),
+                "porcelain": false
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
+        assert_eq!(outcome.0["clean"], true);
+        assert_eq!(outcome.0["content"][0]["text"], "clean");
 
         let _ = std::fs::remove_dir_all(root);
     }

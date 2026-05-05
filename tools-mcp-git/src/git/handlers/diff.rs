@@ -61,8 +61,8 @@ struct DiffSummary {
 #[derive(Serialize)]
 struct DiffStats {
     files_changed: usize,
-    insertions: u32,
-    deletions: u32,
+    insertions: u64,
+    deletions: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -345,13 +345,13 @@ async fn write_patches_to_dir(
         collect_ref_diff_manifest(working_dir, from_ref, to_ref, paths, timeout_ms).await?;
 
     let mut files: Vec<FileDiffEntry> = Vec::new();
-    let mut total_insertions: u32 = 0;
-    let mut total_deletions: u32 = 0;
+    let mut total_insertions: u64 = 0;
+    let mut total_deletions: u64 = 0;
     let mut used_patch_filenames = HashSet::new();
 
     for entry in entries {
-        total_insertions += entry.insertions;
-        total_deletions += entry.deletions;
+        total_insertions += u64::from(entry.insertions);
+        total_deletions += u64::from(entry.deletions);
 
         let patch_filename = unique_patch_filename(
             &sanitize_path_for_filename(&entry.path),

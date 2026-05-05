@@ -64,6 +64,18 @@ pub use vector_stores::{
 /// Base URL for all `OpenAI` API requests.
 pub const BASE_URL: &str = "https://api.openai.com/v1";
 
+async fn openai_response_for_status(
+    response: reqwest::Response,
+    operation: &str,
+) -> anyhow::Result<reqwest::Response> {
+    if response.error_for_status_ref().is_err() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("{operation}: HTTP {} {}", status.as_u16(), body);
+    }
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

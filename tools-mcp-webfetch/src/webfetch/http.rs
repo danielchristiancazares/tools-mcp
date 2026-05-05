@@ -144,7 +144,7 @@ pub struct FetchedBody {
 /// | `::` | Unspecified |
 /// | `fc00::/7` | Unique local (ULA) |
 /// | `fe80::/10` | Link-local |
-/// | `::ffff:x.x.x.x` | IPv4-mapped (checked as IPv4) |
+/// | `::ffff:x.x.x.x`, `::x.x.x.x` | IPv4-mapped/compatible (checked as IPv4) |
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
@@ -160,8 +160,8 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || ipv4.octets()[0] >= 240 // 240.0.0.0/4 Reserved/Experimental
         }
         IpAddr::V6(ipv6) => {
-            // IPv4-mapped addresses (::ffff:x.x.x.x) must be checked as IPv4
-            if let Some(v4) = ipv6.to_ipv4_mapped() {
+            // Embedded IPv4 addresses must be checked as IPv4 to avoid private-range bypasses.
+            if let Some(v4) = ipv6.to_ipv4() {
                 return is_private_ip(IpAddr::V4(v4));
             }
             let segments = ipv6.segments();
@@ -784,6 +784,14 @@ mod tests {
         let err = validate_url_ssrf("http://[::ffff:127.0.0.1]/")
             .await
             .expect_err("expected IPv4-mapped loopback to be rejected");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    #[tokio::test]
+    async fn validate_url_ssrf_blocks_ipv4_compatible_ipv6_loopback() {
+        let err = validate_url_ssrf("http://[::127.0.0.1]/")
+            .await
+            .expect_err("expected IPv4-compatible loopback to be rejected");
         assert!(err.to_string().contains("private IP"));
     }
 

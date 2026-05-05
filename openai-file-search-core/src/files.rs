@@ -18,7 +18,7 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
             .error_for_status()?
             .bytes()
             .await?;
-        let name = path_or_url.rsplit('/').next().unwrap_or("file");
+        let name = upload_name_from_url(path_or_url);
         let effective_name = compute_upload_filename(name);
         let part = multipart::Part::bytes(bytes.to_vec()).file_name(effective_name.into_owned());
         multipart::Form::new()
@@ -45,10 +45,23 @@ pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) ->
         .bearer_auth(&cfg.api_key)
         .multipart(form)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = crate::openai_response_for_status(response, "upload_file").await?;
     let uploaded: FileObj = response.json().await?;
     Ok(uploaded.id)
+}
+
+fn upload_name_from_url(path_or_url: &str) -> &str {
+    let without_query = path_or_url.split(['?', '#']).next().unwrap_or(path_or_url);
+    let path = if let Some((_, rest)) = without_query.split_once("://") {
+        rest.split_once('/').map(|(_, path)| path).unwrap_or("")
+    } else {
+        without_query
+    };
+
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("file")
 }
 
 /// Uploads multiple files and attaches them to a vector store.
@@ -136,4 +149,26 @@ pub async fn upload_files_batch(
     }
 
     Ok((successes, failures))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_name_from_url;
+
+    #[test]
+    fn upload_name_from_url_strips_query_and_fragment() {
+        assert_eq!(
+            upload_name_from_url("https://example.com/src/report.pdf?v=2#page=1"),
+            "report.pdf"
+        );
+    }
+
+    #[test]
+    fn upload_name_from_url_defaults_when_path_has_no_filename() {
+        assert_eq!(
+            upload_name_from_url("https://example.com?download=1"),
+            "file"
+        );
+        assert_eq!(upload_name_from_url("https://example.com/"), "file");
+    }
 }

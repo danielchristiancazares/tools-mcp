@@ -41,8 +41,9 @@ pub async fn responses_with_file_search(
         .header("OpenAI-Beta", "assistants=v2")
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response =
+        crate::openai_response_for_status(response, "responses_with_file_search").await?;
     Ok(response.json().await?)
 }
 

@@ -21,13 +21,7 @@ pub async fn create_vector_store(client: &Client, cfg: &ApiConfig, name: &str) -
         .send()
         .await
         .with_context(|| "send create_vector_store")?;
-    let response = if let Err(_err) = response.error_for_status_ref() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("create_vector_store: HTTP {} {}", status.as_u16(), body);
-    } else {
-        response
-    };
+    let response = crate::openai_response_for_status(response, "create_vector_store").await?;
     let vector_store: VectorStore = response.json().await?;
     Ok(vector_store.id)
 }
@@ -51,13 +45,7 @@ pub async fn list_vector_stores(client: &Client, cfg: &ApiConfig) -> Result<Vec<
             .send()
             .await
             .with_context(|| "send list_vector_stores")?;
-        let response = if let Err(_err) = response.error_for_status_ref() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("list_vector_stores: HTTP {} {}", status.as_u16(), body);
-        } else {
-            response
-        };
+        let response = crate::openai_response_for_status(response, "list_vector_stores").await?;
         let page: VectorStoreList = response.json().await?;
         let has_more = page.has_more;
         after = next_vector_store_cursor(&page);
@@ -83,8 +71,8 @@ pub async fn get_vector_store_details(
         .bearer_auth(&cfg.api_key)
         .header("OpenAI-Beta", "assistants=v2")
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = crate::openai_response_for_status(response, "get_vector_store_details").await?;
     Ok(response.json().await?)
 }
 
@@ -157,8 +145,10 @@ pub(crate) async fn add_file_to_vector_store_with_response(
             chunking_strategy,
         })
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response =
+        crate::openai_response_for_status(response, "add_file_to_vector_store_with_response")
+            .await?;
     Ok(response.json().await?)
 }
 
@@ -207,8 +197,8 @@ pub async fn get_vector_store_file(
         .bearer_auth(&cfg.api_key)
         .header("OpenAI-Beta", "assistants=v2")
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = crate::openai_response_for_status(response, "get_vector_store_file").await?;
     Ok(response.json().await?)
 }
 
@@ -260,18 +250,10 @@ pub async fn wait_for_vector_file_ready(
     poll_ms: u64,
     timeout_ms: u64,
 ) -> Result<()> {
-    let url = format!("{BASE_URL}/vector_stores/{vs_id}/files");
     let start = std::time::Instant::now();
 
     loop {
-        let response = client
-            .get(&url)
-            .bearer_auth(&cfg.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .send()
-            .await?
-            .error_for_status()?;
-        let list: VectorStoreFilesList = response.json().await?;
+        let list = list_vector_store_files(client, cfg, vs_id).await?;
 
         if !list.data.is_empty() {
             if let Some(failed) = list
@@ -321,8 +303,9 @@ pub async fn list_vector_store_files(
             .bearer_auth(&cfg.api_key)
             .header("OpenAI-Beta", "assistants=v2")
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response =
+            crate::openai_response_for_status(response, "list_vector_store_files").await?;
         let page: VectorStoreFilesList = response.json().await?;
         let has_more = page.has_more;
 
@@ -349,25 +332,21 @@ pub async fn delete_vector_store_file(
     file_id: &str,
 ) -> Result<()> {
     let url = format!("{BASE_URL}/vector_stores/{vs_id}/files/{file_id}");
-    client
+    let response = client
         .delete(url)
         .bearer_auth(&cfg.api_key)
         .header("OpenAI-Beta", "assistants=v2")
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let _ = crate::openai_response_for_status(response, "delete_vector_store_file").await?;
     Ok(())
 }
 
 /// Fetches metadata for a file in the `OpenAI` Files API.
 pub async fn get_file(client: &Client, cfg: &ApiConfig, file_id: &str) -> Result<FileInfo> {
     let url = format!("{BASE_URL}/files/{file_id}");
-    let response = client
-        .get(url)
-        .bearer_auth(&cfg.api_key)
-        .send()
-        .await?
-        .error_for_status()?;
+    let response = client.get(url).bearer_auth(&cfg.api_key).send().await?;
+    let response = crate::openai_response_for_status(response, "get_file").await?;
     Ok(response.json().await?)
 }
 

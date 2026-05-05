@@ -50,13 +50,13 @@ fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
 fn expand_single_brace(pattern: &str) -> Result<Option<Vec<String>>, String> {
     // Find innermost brace group (one without nested braces)
     let bytes = pattern.as_bytes();
-    let mut brace_start = None;
+    let mut brace_stack = Vec::new();
 
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'{' {
-            brace_start = Some(i);
+            brace_stack.push(i);
         } else if b == b'}'
-            && let Some(start) = brace_start
+            && let Some(start) = brace_stack.pop()
         {
             // Found a complete brace group from start to i
             let prefix = &pattern[..start];
@@ -79,11 +79,7 @@ fn expand_single_brace(pattern: &str) -> Result<Option<Vec<String>>, String> {
                         .collect(),
                 ));
             }
-            // Single item in braces, just remove the braces
-            return Ok(Some(vec![format!(
-                "{prefix}{}{suffix}",
-                &pattern[start + 1..i]
-            )]));
+            // Single-item braces are literals, not brace expansion.
         }
     }
 
@@ -266,6 +262,18 @@ mod tests {
     fn expands_common_brace_patterns() {
         let expanded = expand_braces("src/*.{ts,tsx}").expect("valid expansion");
         assert_eq!(expanded, vec!["src/*.ts", "src/*.tsx"]);
+    }
+
+    #[test]
+    fn preserves_single_item_braces_as_literals() {
+        let expanded = expand_braces("src/{literal}.rs").expect("valid expansion");
+        assert_eq!(expanded, vec!["src/{literal}.rs"]);
+    }
+
+    #[test]
+    fn expands_outer_group_when_inner_single_item_is_literal() {
+        let expanded = expand_braces("{src,{tests}}/*.rs").expect("valid expansion");
+        assert_eq!(expanded, vec!["src/*.rs", "{tests}/*.rs"]);
     }
 
     #[test]
