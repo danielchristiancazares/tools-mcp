@@ -15,6 +15,7 @@ use crate::mcp_server::{
 };
 
 mod composition;
+mod gemini_gate;
 mod mcp_server;
 mod ping;
 

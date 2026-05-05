@@ -52,6 +52,7 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"CodeQuery"));
+    assert!(names.contains(&"GeminiGate"));
     assert!(names.contains(&"WebFetch"));
 }
 
@@ -229,6 +230,7 @@ fn golden_tools_list_returns_tools_array() {
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"Ping"));
+    assert!(names.contains(&"GeminiGate"));
 }
 
 #[test]

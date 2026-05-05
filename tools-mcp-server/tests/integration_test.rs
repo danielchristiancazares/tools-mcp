@@ -70,6 +70,7 @@ fn test_tools_list() {
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     assert!(tool_names.contains(&"Ping"));
+    assert!(tool_names.contains(&"GeminiGate"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
     assert!(tool_names.contains(&"CodeQuery"));
@@ -105,6 +106,58 @@ fn test_ping_tool_call() {
     assert_eq!(
         response["result"]["content"][0]["text"].as_str(),
         Some("pong")
+    );
+    assert_eq!(response["result"]["isError"], false);
+}
+
+#[test]
+fn test_gemini_gate_approves_valid_phases() {
+    for phase in ["1", "2", "3", "4"] {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": format!("gemini-{phase}"),
+            "method": "mcp/tools/call",
+            "params": {
+                "name": "GeminiGate",
+                "arguments": {
+                    "phase": phase
+                }
+            }
+        });
+
+        let response = send_mcp_message(&request).expect("Failed to call GeminiGate tool");
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], format!("gemini-{phase}"));
+        assert_eq!(
+            response["result"]["content"][0]["text"].as_str(),
+            Some("Approved")
+        );
+        assert_eq!(response["result"]["isError"], false);
+    }
+}
+
+#[test]
+fn test_gemini_gate_rejects_invalid_phase() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "GeminiGate",
+            "arguments": {
+                "phase": "5"
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call GeminiGate tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 5);
+    assert_eq!(
+        response["result"]["content"][0]["text"].as_str(),
+        Some("Rejected")
     );
     assert_eq!(response["result"]["isError"], false);
 }
