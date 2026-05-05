@@ -88,6 +88,7 @@ pub fn chunk_markdown(
 ) -> Result<Vec<(Option<String>, String, usize)>> {
     let encoder = get_encoder()?;
     let max_tokens = max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    anyhow::ensure!(max_tokens > 0, "max_chunk_tokens must be greater than 0");
 
     // We stream through the document and flush at heading boundaries. Each flushed
     // section is then chunked by tokens to avoid O(n^2) re-tokenization on each line.
@@ -163,14 +164,18 @@ pub fn chunk_markdown(
             }
         }
 
-        // Headings mark natural chunk boundaries, but only outside code blocks
-        if code_fence.is_none() && trimmed.starts_with('#') {
+        // Headings mark natural chunk boundaries, but only outside code blocks.
+        let heading_text = if code_fence.is_none() {
+            parse_markdown_heading(trimmed)
+        } else {
+            None
+        };
+        if let Some(heading_text) = heading_text {
             // Flush accumulated content before starting new section
             flush_section(&current_heading, &current_text)?;
             current_text.clear();
 
-            // Extract heading text (strip # prefix)
-            current_heading = Some(trimmed.trim_start_matches('#').trim().to_string());
+            current_heading = Some(heading_text);
         }
 
         // Accumulate line into current section
@@ -206,6 +211,34 @@ fn is_closing_fence_line(trimmed_line: &str) -> bool {
         .skip_while(|&c| c == marker)
         .collect::<String>();
     rest.trim().is_empty()
+}
+
+fn parse_markdown_heading(trimmed_line: &str) -> Option<String> {
+    let bytes = trimmed_line.as_bytes();
+    let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+
+    if hashes < bytes.len() && !bytes[hashes].is_ascii_whitespace() {
+        return None;
+    }
+
+    let mut text = trimmed_line[hashes..].trim();
+    let without_trailing = text.trim_end();
+    if without_trailing.ends_with('#') {
+        let hash_start = without_trailing.trim_end_matches('#').len();
+        let before_hashes = &without_trailing[..hash_start];
+        if before_hashes
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace)
+        {
+            text = before_hashes.trim_end();
+        }
+    }
+
+    Some(text.to_string())
 }
 
 /// Estimates the token count for a text string.
@@ -338,6 +371,16 @@ Body line 2
     }
 
     #[test]
+    fn chunk_markdown_rejects_zero_max_tokens() {
+        let err = chunk_markdown("hello", Some(0))
+            .expect_err("zero token budget should be rejected explicitly");
+        assert!(
+            err.to_string().contains("greater than 0"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn chunk_markdown_does_not_split_inside_code_blocks() {
         // BUG: The chunker treats `# comment` inside fenced code blocks as headings
         let md = "# Title\n```python\n# This is a comment\nx = 1\n```";
@@ -356,6 +399,27 @@ Body line 2
             chunks[0].1.contains("```python\n# This is a comment"),
             "Chunk should contain the full code block"
         );
+    }
+
+    #[test]
+    fn chunk_markdown_does_not_treat_hash_prefixed_words_as_headings() {
+        let md = "# Title\nparagraph\n#hashtag is text, not a heading\nstill title\n## Sub\nbody";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        assert_eq!(chunks.len(), 2, "unexpected chunks: {chunks:?}");
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
+        assert!(chunks[0].1.contains("#hashtag is text"));
+        assert_eq!(chunks[1].0.as_deref(), Some("Sub"));
+    }
+
+    #[test]
+    fn chunk_markdown_ignores_invalid_seven_hash_heading() {
+        let md = "# Title\n####### not a commonmark heading\nstill title";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        assert_eq!(chunks.len(), 1, "unexpected chunks: {chunks:?}");
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
+        assert!(chunks[0].1.contains("####### not a commonmark heading"));
     }
 
     #[test]

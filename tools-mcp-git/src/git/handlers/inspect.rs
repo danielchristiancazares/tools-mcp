@@ -9,6 +9,16 @@ use tools_mcp_core::config::{
 };
 use tools_mcp_core::validation;
 
+fn validate_non_option_arg(value: &str, field_name: &str) -> Result<(), ToolCallOutcome> {
+    validation::validate_non_empty(value, field_name, None)?;
+    if value.starts_with('-') {
+        return Err(ToolCallOutcome::err(format!(
+            "{field_name} must not start with '-'"
+        )));
+    }
+    Ok(())
+}
+
 /// Handle the `GitLog` MCP tool request.
 ///
 /// Executes `git log` to show commit history with configurable format and filters.
@@ -143,9 +153,6 @@ pub async fn handle_git_show(_id: Option<Value>, args: Value) -> ToolCallOutcome
 
     let mut cmd_args: Vec<String> = vec!["show".into()];
 
-    if let Some(commit) = &req.commit {
-        cmd_args.push(commit.clone());
-    }
     if req.stat.unwrap_or(false) {
         cmd_args.push("--stat".into());
     }
@@ -154,6 +161,13 @@ pub async fn handle_git_show(_id: Option<Value>, args: Value) -> ToolCallOutcome
     }
     if let Some(fmt) = &req.format {
         cmd_args.push(format!("--format={fmt}"));
+    }
+    if let Some(commit) = &req.commit {
+        if let Err(o) = validate_non_option_arg(commit, "commit") {
+            return o;
+        }
+        cmd_args.push("--end-of-options".into());
+        cmd_args.push(commit.clone());
     }
 
     let exec = match run_git(
@@ -228,6 +242,9 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
     }
 
     if let Some(commit) = &req.commit {
+        if let Err(o) = validate_non_option_arg(commit, "commit") {
+            return o;
+        }
         cmd_args.push(commit.clone());
     }
 
@@ -261,4 +278,38 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
     let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_git_blame, handle_git_show};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn git_show_rejects_option_like_commit() {
+        let outcome = handle_git_show(None, json!({"commit": "--output=target/side-effect"})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("must not start with '-'")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_blame_rejects_option_like_commit() {
+        let outcome = handle_git_blame(
+            None,
+            json!({"path": "src/lib.rs", "commit": "--contents=Cargo.toml"}),
+        )
+        .await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("must not start with '-'")
+        );
+    }
 }

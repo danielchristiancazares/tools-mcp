@@ -33,6 +33,10 @@ struct SimpleEditRequest {
     new_snippet: String,
     #[serde(default)]
     match_hint: Option<MatchHint>,
+    #[serde(default)]
+    file_hash: Option<String>,
+    #[serde(default)]
+    region_id: Option<String>,
 }
 
 /// Replace `old_snippet` with `new_snippet` in a file. Returns a structured outcome with
@@ -54,8 +58,8 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         old_snippet: req.old_snippet,
         new_snippet: req.new_snippet,
         match_hint: req.match_hint,
-        file_hash: None,
-        region_id: None,
+        file_hash: req.file_hash,
+        region_id: req.region_id,
     };
 
     match apply_snippet_edit_impl(&internal_req) {
@@ -66,5 +70,70 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         Err(err) => ToolCallOutcome::err(format!(
             "edit error: {err}. Remediation: ensure 'path' exists and 'old_snippet' matches exactly; if there are multiple matches, provide match_hint."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_edit;
+    use serde_json::json;
+
+    fn edit_payload(outcome: tools_mcp_core::ToolCallOutcome) -> serde_json::Value {
+        let text = outcome.0["content"][0]["text"]
+            .as_str()
+            .expect("json content text");
+        serde_json::from_str(text).expect("edit payload json")
+    }
+
+    #[tokio::test]
+    async fn public_edit_rejects_stale_file_hash_without_modifying_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stale-public.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("write");
+
+        let outcome = handle_edit(
+            None,
+            json!({
+                "path": path,
+                "old_snippet": "beta",
+                "new_snippet": "BETA",
+                "file_hash": "not-the-current-hash"
+            }),
+        )
+        .await;
+        let payload = edit_payload(outcome);
+
+        assert_eq!(payload["status"], "stale_file");
+        assert_eq!(payload["expected_file_hash"], "not-the-current-hash");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nbeta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_edit_forwards_region_id_to_success_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("region-public.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("write");
+
+        let outcome = handle_edit(
+            None,
+            json!({
+                "path": path,
+                "old_snippet": "beta",
+                "new_snippet": "BETA",
+                "region_id": "region-123"
+            }),
+        )
+        .await;
+        let payload = edit_payload(outcome);
+
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["region_id"], "region-123");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nBETA\n"
+        );
     }
 }

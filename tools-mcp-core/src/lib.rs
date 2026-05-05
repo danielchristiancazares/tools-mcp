@@ -7,7 +7,10 @@ pub mod tool_outcome;
 pub mod tool_registry;
 pub mod validation;
 
-pub use mcp_protocol::{read_mcp_message, should_skip_headers, write_mcp_response_with_mode};
+pub use mcp_protocol::{
+    read_mcp_message, should_skip_headers, write_mcp_payload_with_mode,
+    write_mcp_response_with_mode,
+};
 pub use response::{RpcError, RpcResponse};
 pub use tool_outcome::ToolCallOutcome;
 pub use tool_registry::{McpTool, ToolDef, ToolRegistry};

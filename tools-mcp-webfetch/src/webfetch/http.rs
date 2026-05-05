@@ -164,11 +164,13 @@ fn is_private_ip(ip: IpAddr) -> bool {
             if let Some(v4) = ipv6.to_ipv4_mapped() {
                 return is_private_ip(IpAddr::V4(v4));
             }
+            let segments = ipv6.segments();
             ipv6.is_loopback()      // ::1
                 || ipv6.is_unspecified() // ::
                 || ipv6.is_multicast()   // ff00::/8
-                || ((ipv6.segments()[0] & 0xfe00) == 0xfc00) // fc00::/7 unique local
-                || ((ipv6.segments()[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
+                || ((segments[0] & 0xfe00) == 0xfc00) // fc00::/7 unique local
+                || ((segments[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 documentation
         }
     }
 }
@@ -248,7 +250,8 @@ async fn validate_url_ssrf_and_resolve(url: &str) -> Result<Option<(String, Sock
 
     let host_owned = match host_typed {
         Host::Domain(d) => {
-            if d.eq_ignore_ascii_case("localhost") || d.eq_ignore_ascii_case("localhost.localdomain")
+            if d.eq_ignore_ascii_case("localhost")
+                || d.eq_ignore_ascii_case("localhost.localdomain")
             {
                 return Err(anyhow!("Cannot fetch from localhost"));
             }
@@ -329,7 +332,8 @@ fn get_robots_url(url: &str) -> Result<String> {
 /// ## Return Values
 ///
 /// - `Ok(Some(content))` - robots.txt exists and was fetched
-/// - `Ok(None)` - No robots.txt (404 or fetch error) - means "allow all"
+/// - `Ok(None)` - No robots.txt/client error (4xx) - means "allow all"
+/// - `Err(...)` - robots.txt is unreachable or returns a server/redirect error
 /// - `Err(...)` - URL parsing error
 async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>> {
     let robots_url = get_robots_url(url)?;
@@ -355,17 +359,27 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
         }
     }
 
-    // Fetch robots.txt
-    let response = client
-        .get(&robots_url)
-        .timeout(Duration::from_secs(5))
-        .header(header::USER_AGENT, USER_AGENT)
-        .send()
-        .await;
+    // Fetch robots.txt, following redirects manually when the caller's client has
+    // redirects disabled for SSRF-safe production fetches.
+    let response = fetch_robots_response(client, &robots_url).await;
 
     let content = match response {
         Ok(resp) if resp.status().is_success() => Some(resp.text().await?),
-        _ => None, // No robots.txt or error = allow all
+        Ok(resp) if resp.status().is_client_error() => None, // No robots.txt = allow all
+        Ok(resp) => {
+            return Err(anyhow!(
+                "robots.txt unavailable with HTTP status {}; refusing to fetch {}",
+                resp.status(),
+                url
+            ));
+        }
+        Err(err) => {
+            return Err(anyhow!(
+                "robots.txt unreachable; refusing to fetch {}: {}",
+                url,
+                err
+            ));
+        }
     };
 
     // Cache the result (write lock)
@@ -386,6 +400,75 @@ async fn get_robots_content(client: &Client, url: &str) -> Result<Option<String>
     Ok(content)
 }
 
+async fn fetch_robots_response(client: &Client, robots_url: &str) -> Result<reqwest::Response> {
+    let mut current_url = robots_url.to_string();
+    let mut redirects_followed = 0usize;
+
+    loop {
+        let response = send_robots_request(client, robots_url, &current_url).await;
+        let resp = response?;
+
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+
+        if redirects_followed >= MAX_REDIRECTS {
+            return Err(anyhow!(
+                "Too many robots.txt redirects (>{}) when fetching {}",
+                MAX_REDIRECTS,
+                robots_url
+            ));
+        }
+
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                anyhow!("robots.txt redirect without Location header from {current_url}")
+            })?;
+
+        let base = Url::parse(&current_url)?;
+        let next = base
+            .join(location)
+            .with_context(|| format!("invalid robots.txt redirect Location '{location}'"))?;
+        current_url = next.to_string();
+        redirects_followed += 1;
+    }
+}
+
+async fn send_robots_request(
+    client: &Client,
+    initial_robots_url: &str,
+    current_url: &str,
+) -> Result<reqwest::Response> {
+    if same_origin(initial_robots_url, current_url)? {
+        return Ok(client
+            .get(current_url)
+            .timeout(Duration::from_secs(5))
+            .header(header::USER_AGENT, USER_AGENT)
+            .send()
+            .await?);
+    }
+
+    let resolve = validate_url_ssrf_and_resolve(current_url).await?;
+    let redirect_client = build_http_client_with_resolve(resolve.as_ref())?;
+    Ok(redirect_client
+        .get(current_url)
+        .timeout(Duration::from_secs(5))
+        .header(header::USER_AGENT, USER_AGENT)
+        .send()
+        .await?)
+}
+
+fn same_origin(left: &str, right: &str) -> Result<bool> {
+    let left = Url::parse(left)?;
+    let right = Url::parse(right)?;
+    Ok(left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default())
+}
+
 /// Checks if a URL path is allowed by the domain's robots.txt.
 ///
 /// Uses the `robotstxt` crate's `DefaultMatcher` which implements the
@@ -401,7 +484,7 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
     let content = get_robots_content(client, url).await?;
 
     match content {
-        None => Ok(true), // No robots.txt = allow all (per specification)
+        None => Ok(true), // No robots.txt/client error = allow all (per specification)
         Some(txt) => {
             let mut matcher = DefaultMatcher::default();
             let parsed = Url::parse(url)?;
@@ -409,6 +492,22 @@ async fn is_allowed_by_robots(client: &Client, url: &str) -> Result<bool> {
             Ok(matcher.one_agent_allowed_by_robots(&txt, USER_AGENT, &path))
         }
     }
+}
+
+/// Validates that a URL may be fetched under SSRF and robots.txt policy.
+///
+/// This is intentionally safe to call before cache lookup: it validates the target URL,
+/// pins DNS for the robots.txt request, and refuses to proceed if robots.txt disallows
+/// the URL or cannot be checked due to server/network errors.
+pub async fn ensure_fetch_allowed(url: &str) -> Result<()> {
+    let resolve = validate_url_ssrf_and_resolve(url).await?;
+    let pinned_client = build_http_client_with_resolve(resolve.as_ref())?;
+
+    if !is_allowed_by_robots(&pinned_client, url).await? {
+        return Err(anyhow!("URL disallowed by robots.txt: {url}"));
+    }
+
+    Ok(())
 }
 
 fn robots_match_path(parsed: &Url) -> String {
@@ -671,6 +770,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_url_ssrf_blocks_ipv6_documentation_range() {
+        let err = validate_url_ssrf("http://[2001:db8::1]/")
+            .await
+            .expect_err("expected 2001:db8::/32 to be rejected");
+        assert!(err.to_string().contains("private IP"));
+    }
+
+    #[tokio::test]
     async fn validate_url_ssrf_blocks_ipv4_mapped_ipv6_loopback() {
         // ::ffff:127.0.0.1 must be unwrapped to its IPv4 form and then rejected as loopback;
         // skipping the unwrap would allow attackers to bypass the IPv4 private-range check.
@@ -727,6 +834,26 @@ mod tests {
         (addr.ip().to_string(), addr.port())
     }
 
+    async fn spawn_http_server_responses(responses: Vec<&'static [u8]>) -> (String, u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (addr.ip().to_string(), addr.port())
+    }
+
     #[tokio::test]
     async fn is_allowed_by_robots_blocks_disallowed_path() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nConnection: close\r\n\r\nUser-agent: *\nDisallow: /private/\n";
@@ -752,5 +879,41 @@ mod tests {
             .await
             .expect("robots check");
         assert!(allowed, "missing robots.txt must default to allow-all");
+    }
+
+    #[tokio::test]
+    async fn is_allowed_by_robots_refuses_when_robots_server_errors() {
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (host, port) = spawn_oneshot_http_server(response).await;
+
+        let client = Client::builder().build().expect("client");
+        let url = format!("http://{host}:{port}/anything");
+        let err = is_allowed_by_robots(&client, &url)
+            .await
+            .expect_err("robots 5xx should fail closed");
+
+        assert!(
+            err.to_string().contains("robots.txt unavailable"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_allowed_by_robots_follows_same_origin_redirects_with_no_redirect_client() {
+        let redirect = b"HTTP/1.1 302 Found\r\nLocation: /robots-final.txt\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let final_robots = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nConnection: close\r\n\r\nUser-agent: *\nDisallow: /private/\n";
+        let (host, port) = spawn_http_server_responses(vec![redirect, final_robots]).await;
+
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let url = format!("http://{host}:{port}/private/secret");
+        let allowed = is_allowed_by_robots(&client, &url)
+            .await
+            .expect("robots redirect should be followed");
+
+        assert!(!allowed, "redirected robots.txt should disallow /private/");
     }
 }

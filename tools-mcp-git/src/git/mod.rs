@@ -221,7 +221,13 @@ pub(crate) async fn run_git(
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
     if !status.success() && !timed_out {
-        let stderr_head: String = stderr.lines().next().unwrap_or("").chars().take(200).collect();
+        let stderr_head: String = stderr
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
         debug!(
             exit_code = ?exit_code,
             args = ?args,

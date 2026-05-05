@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -13,8 +14,9 @@ use tools_mcp_core::validation;
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
 /// Returns (path, `line_number`, text, `is_match`)
 fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
-    fn parse_with_sep_from_start(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
+    fn separator_candidates(line: &str, sep: u8) -> Vec<(String, u64, String, bool)> {
         let bytes = line.as_bytes();
+        let mut candidates = Vec::new();
         for i in 0..bytes.len() {
             if bytes[i] != sep {
                 continue;
@@ -26,42 +28,42 @@ fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
                 j += 1;
             }
 
-            if j > i + 1 && j < bytes.len() && bytes[j] == sep {
-                let path = &line[..i];
-                let line_no: u64 = line[i + 1..j].parse().ok()?;
-                let text = &line[j + 1..];
-                return Some((path.to_string(), line_no, text.to_string(), sep == b':'));
+            if j > i + 1
+                && j < bytes.len()
+                && bytes[j] == sep
+                && let Ok(line_no) = line[i + 1..j].parse::<u64>()
+            {
+                candidates.push((
+                    line[..i].to_string(),
+                    line_no,
+                    line[j + 1..].to_string(),
+                    sep == b':',
+                ));
             }
         }
-        None
+        candidates
     }
 
     fn parse_with_sep_from_end(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
-        let bytes = line.as_bytes();
-        for i in (0..bytes.len()).rev() {
-            if bytes[i] != sep {
-                continue;
-            }
+        separator_candidates(line, sep).into_iter().next_back()
+    }
 
-            // Check if followed by digits then another matching separator.
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-
-            if j > i + 1 && j < bytes.len() && bytes[j] == sep {
-                let path = &line[..i];
-                let line_no: u64 = line[i + 1..j].parse().ok()?;
-                let text = &line[j + 1..];
-                return Some((path.to_string(), line_no, text.to_string(), sep == b':'));
-            }
+    fn parse_match_line(line: &str) -> Option<(String, u64, String, bool)> {
+        let candidates = separator_candidates(line, b':');
+        if candidates.len() > 1
+            && let Some(existing_path) = candidates
+                .iter()
+                .rev()
+                .find(|(path, _, _, _)| Path::new(path).exists())
+        {
+            return Some(existing_path.clone());
         }
-        None
+        candidates.into_iter().next()
     }
 
     // Parse match lines first ("path:line:text") by scanning from the start.
     // This avoids selecting a later `:<digits>:` sequence in the matched text.
-    if let Some(parsed) = parse_with_sep_from_start(line, b':') {
+    if let Some(parsed) = parse_match_line(line) {
         return parsed;
     }
     // Parse context lines ("path-line-text") by scanning from the end.
@@ -415,6 +417,21 @@ mod tests {
         assert_eq!(path, "src/main.rs");
         assert_eq!(line_no, 12);
         assert_eq!(text, "timestamp 10:23:59");
+        assert!(is_match);
+    }
+
+    #[test]
+    fn parse_grep_line_preserves_existing_filename_with_colon_number_colon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("foo:1:bar.txt");
+        std::fs::write(&path, "needle\n").expect("write");
+        let line = format!("{}:7:needle", path.display());
+
+        let (parsed_path, line_no, text, is_match) = parse_grep_line(&line);
+
+        assert_eq!(parsed_path, path.display().to_string());
+        assert_eq!(line_no, 7);
+        assert_eq!(text, "needle");
         assert!(is_match);
     }
 }

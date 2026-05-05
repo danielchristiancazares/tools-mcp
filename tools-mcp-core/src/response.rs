@@ -45,7 +45,6 @@ pub struct RpcResponse {
     pub jsonrpc: &'static str,
 
     /// Request identifier from the corresponding request.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Value>,
 
     /// Success payload. Mutually exclusive with `error`.
@@ -273,11 +272,7 @@ impl RpcResponse {
     /// * `-32601` - Method not found
     /// * `-32602` - Invalid params
     /// * `-32603` - Internal error
-    pub fn protocol_error(
-        id: Option<Value>,
-        code: i64,
-        msg: impl Into<String>,
-    ) -> RpcResponse {
+    pub fn protocol_error(id: Option<Value>, code: i64, msg: impl Into<String>) -> RpcResponse {
         RpcResponse {
             jsonrpc: "2.0",
             id,
@@ -288,5 +283,19 @@ impl RpcResponse {
                 data: None,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RpcResponse;
+
+    #[test]
+    fn protocol_error_serializes_unknown_id_as_null() {
+        let response = RpcResponse::protocol_error(None, -32700, "Parse error");
+        let json = serde_json::to_value(response).expect("response serializes");
+
+        assert!(json.as_object().expect("object").contains_key("id"));
+        assert!(json["id"].is_null());
     }
 }

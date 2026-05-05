@@ -8,6 +8,9 @@ pub trait McpTool: Send + Sync + 'static {
     /// Primary tool name.
     const NAME: &'static str;
 
+    /// Alternate accepted names for inbound tool calls.
+    const ALIASES: &'static [&'static str] = &[];
+
     /// Tool description shown in tool listings.
     const DESCRIPTION: &'static str;
 
@@ -38,6 +41,7 @@ type ToolExecutor = Box<
 
 struct ToolEntry {
     def: ToolDef,
+    aliases: &'static [&'static str],
     executor: ToolExecutor,
 }
 
@@ -61,7 +65,11 @@ impl ToolRegistry {
 
         let executor: ToolExecutor = Box::new(|id, args| T::execute(id, args));
 
-        self.tools.push(ToolEntry { def, executor });
+        self.tools.push(ToolEntry {
+            def,
+            aliases: T::ALIASES,
+            executor,
+        });
     }
 
     /// Get all tool definitions for protocol responses.
@@ -76,7 +84,10 @@ impl ToolRegistry {
         id: Option<Value>,
         args: Value,
     ) -> Option<crate::RpcResponse> {
-        let entry = self.tools.iter().find(|entry| entry.def.name == name)?;
+        let entry = self
+            .tools
+            .iter()
+            .find(|entry| entry.def.name == name || entry.aliases.contains(&name))?;
         let outcome = (entry.executor)(id.clone(), args).await;
         Some(outcome.into_rpc_response(id))
     }
@@ -193,5 +204,40 @@ mod tests {
         let reg = ToolRegistry::new();
         let r = reg.call("nope", Some(json!(1)), json!({})).await;
         assert!(r.is_none());
+    }
+
+    struct AliasTool;
+
+    impl McpTool for AliasTool {
+        const NAME: &'static str = "Canonical";
+        const ALIASES: &'static [&'static str] = &["alias"];
+        const DESCRIPTION: &'static str = "tool with alias";
+
+        fn input_schema() -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn execute(
+            id: Option<Value>,
+            args: Value,
+        ) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>> {
+            Box::pin(ok_tool(id, args))
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_dispatches_by_alias_without_listing_alias() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<AliasTool>();
+
+        let tool_names: Vec<_> = reg.list().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(tool_names, vec!["Canonical"]);
+
+        let response = reg.call("alias", Some(json!(1)), json!({})).await;
+        assert!(response.is_some());
     }
 }

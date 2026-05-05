@@ -14,7 +14,8 @@ define_mcp_tool! {
             },
             "max_chunk_tokens": {
                 "type": "integer",
-                "description": "Max tokens per chunk (default 2000)"
+                "minimum": 1,
+                "description": "Max tokens per chunk (default 600)"
             },
             "no_cache": {
                 "type": "boolean",

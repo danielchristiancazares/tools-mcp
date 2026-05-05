@@ -8,6 +8,12 @@ use tools_mcp_core::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS,
 };
 
+fn porcelain_status_is_clean(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .all(|line| line.trim().is_empty() || line.starts_with("##"))
+}
+
 /// Handle the `GitStatus` MCP tool request.
 ///
 /// Executes `git status` and returns working tree state in a structured format.
@@ -62,7 +68,12 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
         Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
-    let clean = exec.success && exec.stdout.trim().is_empty();
+    let clean = exec.success
+        && if porcelain {
+            porcelain_status_is_clean(&exec.stdout)
+        } else {
+            exec.stdout.trim().is_empty()
+        };
     let text = if exec.success {
         if clean {
             "clean".to_string()
@@ -80,4 +91,96 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
 
     let payload = build_git_response(&exec, &text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_git_status, porcelain_status_is_clean};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn git_bin() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "git.exe"
+        } else {
+            "git"
+        }
+    }
+
+    fn git_available() -> bool {
+        Command::new(git_bin())
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/tools-mcp-git-tests")
+            .join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new(git_bin())
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git command should start");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn porcelain_clean_ignores_branch_header() {
+        assert!(porcelain_status_is_clean("## main\n"));
+        assert!(porcelain_status_is_clean("## main...origin/main\n\n"));
+        assert!(!porcelain_status_is_clean("## main\n M src/lib.rs\n"));
+        assert!(!porcelain_status_is_clean("?? new.txt\n"));
+    }
+
+    #[tokio::test]
+    async fn git_status_default_branch_header_still_reports_clean() {
+        if !git_available() {
+            eprintln!("Skipping GitStatus clean test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("status-clean-with-branch");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("tracked.txt"), "tracked\n").expect("write tracked file");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "initial"]);
+
+        let outcome = handle_git_status(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string()
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
+        assert_eq!(outcome.0["clean"], true);
+        assert_eq!(outcome.0["content"][0]["text"], "clean");
+        assert!(
+            outcome.0["stdout"]
+                .as_str()
+                .expect("stdout")
+                .starts_with("##")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

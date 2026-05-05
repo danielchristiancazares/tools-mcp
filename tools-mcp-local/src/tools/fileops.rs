@@ -52,6 +52,18 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         destination.to_path_buf()
     };
 
+    if source.is_dir() {
+        let source_norm = normalize_absolute_or_cwd(source);
+        let dest_norm = normalize_absolute_or_cwd(&final_dest);
+        if dest_norm != source_norm && dest_norm.starts_with(&source_norm) {
+            return ToolCallOutcome::err(format!(
+                "refusing move: destination {} is inside source {}",
+                final_dest.display(),
+                source.display()
+            ));
+        }
+    }
+
     if final_dest.exists() && !req.overwrite.unwrap_or(false) {
         return ToolCallOutcome::err(format!(
             "destination already exists: {}. Use overwrite: true to replace.",
@@ -157,6 +169,16 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("source not found: {}", source.display()));
     }
 
+    let source_metadata = match tokio::fs::symlink_metadata(source).await {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return ToolCallOutcome::err(format!(
+                "failed to inspect source {}: {err}",
+                source.display()
+            ));
+        }
+    };
+
     let overwrite = req.overwrite.unwrap_or(false);
 
     // Existing directories act as container targets in the default cp-like mode.
@@ -171,6 +193,14 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     } else {
         destination.to_path_buf()
     };
+
+    if source_metadata.file_type().is_symlink() && source.is_dir() && req.recursive.unwrap_or(false)
+    {
+        return ToolCallOutcome::err(format!(
+            "refusing recursive copy from symlinked directory: {}",
+            source.display()
+        ));
+    }
 
     if source.is_dir() && req.recursive.unwrap_or(false) {
         let source_norm = normalize_absolute_or_cwd(source);
@@ -455,6 +485,37 @@ mod tests {
         assert!(msg.contains("symlink"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_rejects_symlinked_directory_as_recursive_source() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        let dst = dir.path().join("dst");
+        tokio::fs::create_dir_all(&target)
+            .await
+            .expect("create target");
+        tokio::fs::write(target.join("outside.txt"), "outside")
+            .await
+            .expect("write target file");
+        unix_fs::symlink(&target, &link).expect("symlink");
+
+        let args = json!({
+            "source": link.display().to_string(),
+            "destination": dst.display().to_string(),
+            "recursive": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("symlinked directory"));
+        assert!(!dst.exists());
+    }
+
     #[tokio::test]
     async fn copy_overwrite_replaces_existing_directory_contents() {
         let dir = tempdir().expect("tempdir");
@@ -506,6 +567,31 @@ mod tests {
         assert_eq!(result["isError"], false);
         assert!(dst.is_dir());
         assert!(dst.join("inside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn move_rejects_directory_into_own_descendant_without_creating_parent() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let nested_parent = src.join("nested");
+        let dst = nested_parent.join("moved");
+        tokio::fs::create_dir_all(&src).await.expect("create src");
+        tokio::fs::write(src.join("file.txt"), "hello")
+            .await
+            .expect("write");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string()
+        });
+
+        let resp = handle_move(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("inside source"));
+        assert!(!nested_parent.exists());
+        assert!(src.join("file.txt").exists());
     }
 }
 

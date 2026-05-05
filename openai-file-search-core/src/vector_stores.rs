@@ -34,23 +34,41 @@ pub async fn create_vector_store(client: &Client, cfg: &ApiConfig, name: &str) -
 
 /// Lists all vector stores visible to the configured account.
 pub async fn list_vector_stores(client: &Client, cfg: &ApiConfig) -> Result<Vec<VectorStoreEntry>> {
-    let url = format!("{BASE_URL}/vector_stores");
-    let response = client
-        .get(url)
-        .bearer_auth(&cfg.api_key)
-        .header("OpenAI-Beta", "assistants=v2")
-        .send()
-        .await
-        .with_context(|| "send list_vector_stores")?;
-    let response = if let Err(_err) = response.error_for_status_ref() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("list_vector_stores: HTTP {} {}", status.as_u16(), body);
-    } else {
-        response
-    };
-    let list: VectorStoreList = response.json().await?;
-    Ok(list.data)
+    let base_url = format!("{BASE_URL}/vector_stores");
+    let mut all_stores = Vec::new();
+    let mut after: Option<String> = None;
+
+    loop {
+        let mut url = base_url.clone();
+        if let Some(cursor) = &after {
+            url = format!("{url}?after={cursor}");
+        }
+
+        let response = client
+            .get(url)
+            .bearer_auth(&cfg.api_key)
+            .header("OpenAI-Beta", "assistants=v2")
+            .send()
+            .await
+            .with_context(|| "send list_vector_stores")?;
+        let response = if let Err(_err) = response.error_for_status_ref() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("list_vector_stores: HTTP {} {}", status.as_u16(), body);
+        } else {
+            response
+        };
+        let page: VectorStoreList = response.json().await?;
+        let has_more = page.has_more;
+        after = next_vector_store_cursor(&page);
+        all_stores.extend(page.data);
+
+        if !has_more || after.is_none() {
+            break;
+        }
+    }
+
+    Ok(all_stores)
 }
 
 /// Fetches aggregate details for a vector store.
@@ -308,7 +326,7 @@ pub async fn list_vector_store_files(
         let page: VectorStoreFilesList = response.json().await?;
         let has_more = page.has_more;
 
-        after = page.data.last().map(|file| file.id.clone());
+        after = next_vector_store_file_cursor(&page);
         all_files.extend(page.data);
 
         if !has_more || after.is_none() {
@@ -371,17 +389,114 @@ pub async fn list_vector_store_files_with_details(
         if let Some(fid) = file_id {
             match get_file(client, cfg, fid).await {
                 Ok(file_info) => detailed_files.push(file_info),
-                Err(_) => detailed_files.push(FileInfo {
-                    id: fid.clone(),
-                    filename: item.file.as_ref().and_then(|file| file.filename.clone()),
-                    purpose: None,
-                    bytes: None,
-                    created_at: None,
-                    attributes: None,
-                }),
+                Err(_) => {
+                    detailed_files.push(fallback_file_info_from_vector_store_item(&item, fid))
+                }
             }
         }
     }
 
     Ok(detailed_files)
+}
+
+fn next_vector_store_cursor(page: &VectorStoreList) -> Option<String> {
+    page.last_id
+        .clone()
+        .or_else(|| page.data.last().map(|store| store.id.clone()))
+}
+
+fn next_vector_store_file_cursor(page: &VectorStoreFilesList) -> Option<String> {
+    page.last_id
+        .clone()
+        .or_else(|| page.data.last().map(|file| file.id.clone()))
+}
+
+fn fallback_file_info_from_vector_store_item(
+    item: &VectorStoreFileItem,
+    file_id: &str,
+) -> FileInfo {
+    FileInfo {
+        id: file_id.to_string(),
+        filename: item
+            .filename
+            .clone()
+            .or_else(|| item.file.as_ref().and_then(|file| file.filename.clone())),
+        purpose: None,
+        bytes: None,
+        created_at: None,
+        attributes: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        fallback_file_info_from_vector_store_item, next_vector_store_cursor,
+        next_vector_store_file_cursor,
+    };
+    use crate::{
+        FileInfo, VectorStoreEntry, VectorStoreFileItem, VectorStoreFilesList, VectorStoreList,
+    };
+
+    #[test]
+    fn vector_store_pagination_prefers_response_last_id() {
+        let page = VectorStoreList {
+            data: vec![VectorStoreEntry {
+                id: "vs_data_id".to_string(),
+                name: Some("store".to_string()),
+                created_at: None,
+            }],
+            has_more: true,
+            last_id: Some("vs_cursor".to_string()),
+        };
+
+        assert_eq!(
+            next_vector_store_cursor(&page).as_deref(),
+            Some("vs_cursor")
+        );
+    }
+
+    #[test]
+    fn vector_store_file_pagination_prefers_response_last_id() {
+        let page = VectorStoreFilesList {
+            data: vec![VectorStoreFileItem {
+                id: "vsf_data_id".to_string(),
+                status: "completed".to_string(),
+                file: None,
+                file_id: Some("file_1".to_string()),
+                filename: None,
+                attributes: None,
+            }],
+            has_more: true,
+            last_id: Some("vsf_cursor".to_string()),
+        };
+
+        assert_eq!(
+            next_vector_store_file_cursor(&page).as_deref(),
+            Some("vsf_cursor")
+        );
+    }
+
+    #[test]
+    fn fallback_file_info_preserves_top_level_filename() {
+        let item = VectorStoreFileItem {
+            id: "vsf_1".to_string(),
+            status: "completed".to_string(),
+            file: Some(FileInfo {
+                id: "file_1".to_string(),
+                filename: Some("nested.rs".to_string()),
+                purpose: None,
+                bytes: None,
+                created_at: None,
+                attributes: None,
+            }),
+            file_id: Some("file_1".to_string()),
+            filename: Some("top_level.rs".to_string()),
+            attributes: None,
+        };
+
+        let fallback = fallback_file_info_from_vector_store_item(&item, "file_1");
+
+        assert_eq!(fallback.filename.as_deref(), Some("top_level.rs"));
+    }
 }

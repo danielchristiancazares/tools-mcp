@@ -4,7 +4,27 @@
 mod support;
 
 use serde_json::{Value, json};
-use support::send_mcp_message;
+use std::collections::BTreeSet;
+use support::{send_mcp_message, workspace_root};
+
+fn documented_tool_names() -> BTreeSet<String> {
+    let readme =
+        std::fs::read_to_string(workspace_root().join("README.md")).expect("README.md readable");
+
+    readme
+        .lines()
+        .filter_map(|line| {
+            line.split("**Tool name**: `")
+                .nth(1)
+                .and_then(|rest| rest.split('`').next())
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn readme_text() -> String {
+    std::fs::read_to_string(workspace_root().join("README.md")).expect("README.md readable")
+}
 
 #[test]
 fn golden_initialize_has_tools_capabilities_and_protocol_version() {
@@ -70,6 +90,66 @@ fn golden_tools_call_accepts_toolname_and_args_aliases() {
 }
 
 #[test]
+fn golden_batch_returns_responses_for_requests_only() {
+    let request = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 9012,
+            "method": "ping",
+            "params": {}
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "client-response",
+            "result": {}
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 9013,
+            "method": "mcp/tools/list",
+            "params": {}
+        }
+    ]);
+
+    let response = send_mcp_message(&request).expect("batch request");
+    let responses = response.as_array().expect("batch response array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert_eq!(responses[0]["id"], 9012);
+    assert_eq!(responses[0]["result"]["content"][0]["text"], "pong");
+    assert_eq!(responses[1]["jsonrpc"], "2.0");
+    assert_eq!(responses[1]["id"], 9013);
+    assert!(responses[1]["result"]["tools"].is_array());
+}
+
+#[test]
+fn golden_batch_reports_invalid_items_without_dropping_valid_requests() {
+    let request = json!([
+        1,
+        {
+            "jsonrpc": "2.0",
+            "id": 9014,
+            "method": "ping",
+            "params": {}
+        }
+    ]);
+
+    let response = send_mcp_message(&request).expect("batch with invalid item");
+    let responses = response.as_array().expect("batch response array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert!(responses[0]["id"].is_null());
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert_eq!(responses[1]["id"], 9014);
+    assert_eq!(responses[1]["result"]["content"][0]["text"], "pong");
+}
+
+#[test]
 fn golden_unknown_method_returns_protocol_error() {
     let request = json!({
         "jsonrpc": "2.0",
@@ -112,6 +192,25 @@ fn golden_unknown_tool_returns_protocol_error() {
 }
 
 #[test]
+fn golden_tools_call_missing_name_is_invalid_params() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9011,
+        "method": "mcp/tools/call",
+        "params": {
+            "arguments": {}
+        }
+    });
+    let response = send_mcp_message(&request).expect("missing tool name");
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 9011);
+    assert!(response["result"].is_null());
+    let err = response["error"].as_object().expect("protocol error");
+    assert_eq!(err["code"], -32602);
+    assert!(err["message"].as_str().unwrap().contains("tool name"));
+}
+
+#[test]
 fn golden_tools_list_returns_tools_array() {
     let request = json!({
         "jsonrpc": "2.0",
@@ -130,6 +229,41 @@ fn golden_tools_list_returns_tools_array() {
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"Ping"));
+}
+
+#[test]
+fn golden_readme_tool_inventory_matches_tools_list() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9010,
+        "method": "mcp/tools/list",
+        "params": {}
+    });
+    let response = send_mcp_message(&request).expect("tools list");
+    let actual: BTreeSet<String> = response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let documented = documented_tool_names();
+    assert_eq!(
+        actual, documented,
+        "README MCP Tools section must document exactly the tools exposed by tools/list"
+    );
+}
+
+#[test]
+fn golden_readme_documents_observable_protocol_error_codes() {
+    let readme = readme_text();
+    for code in ["-32700", "-32600", "-32601", "-32602", "-32603"] {
+        assert!(
+            readme.contains(code),
+            "README Error Codes section must document observable JSON-RPC error code {code}"
+        );
+    }
 }
 
 #[test]

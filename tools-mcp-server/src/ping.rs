@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tools_mcp_core::{ToolCallOutcome, define_mcp_tool};
+use std::future::Future;
+use std::pin::Pin;
+use tools_mcp_core::{McpTool, ToolCallOutcome};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,16 +20,27 @@ async fn handle_ping(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }))
 }
 
-define_mcp_tool! {
-    /// Simple ping tool for health checks.
-    PingTool,
-    name: "Ping",
-    description: "Returns 'pong' to verify the server is running",
-    schema: {
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": false
-    },
-    handler: handle_ping
+/// Simple ping tool for health checks.
+pub struct PingTool;
+
+impl McpTool for PingTool {
+    const NAME: &'static str = "Ping";
+    const ALIASES: &'static [&'static str] = &["ping"];
+    const DESCRIPTION: &'static str = "Returns 'pong' to verify the server is running";
+
+    fn input_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(
+        id: Option<Value>,
+        args: Value,
+    ) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>> {
+        Box::pin(handle_ping(id, args))
+    }
 }

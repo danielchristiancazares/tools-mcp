@@ -76,7 +76,11 @@ pub fn strip_ansi_codes(s: &str) -> String {
 /// any allocation and long inputs avoid collecting a full char vector.
 pub fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
-        return if s.is_empty() { String::new() } else { "…".to_string() };
+        return if s.is_empty() {
+            String::new()
+        } else {
+            "…".to_string()
+        };
     }
 
     let mut truncation_byte_idx = s.len();

@@ -148,6 +148,13 @@ where
                     should_continue: false,
                 });
             }
+            if saw_non_empty_non_json_line {
+                return Err(McpReadError {
+                    error: io::Error::new(ErrorKind::InvalidData, "missing Content-Length header"),
+                    response_has_headers: true,
+                    should_continue: false,
+                });
+            }
             return Ok(None);
         }
 
@@ -173,6 +180,7 @@ where
         // Auto-detect raw JSON mode (line starts with { or [)
         let trimmed_start = trimmed.trim_start();
         if content_length.is_none()
+            && !saw_non_empty_non_json_line
             && (trimmed_start.starts_with('{') || trimmed_start.starts_with('['))
         {
             return Ok(Some(McpMessage {
@@ -271,15 +279,16 @@ where
 ///
 /// This is used by the runtime when the framing mode is already known and by
 /// deterministic tests that need explicit header control.
-pub async fn write_mcp_response_with_mode<W>(
+pub async fn write_mcp_payload_with_mode<W, T>(
     writer: &mut W,
-    resp: &RpcResponse,
+    payload_value: &T,
     skip_headers: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
+    T: serde::Serialize + ?Sized,
 {
-    let mut payload = serde_json::to_vec(resp).context("serialize response")?;
+    let mut payload = serde_json::to_vec(payload_value).context("serialize response")?;
 
     // Ensure payload ends with newline for clean line-based parsing
     if !payload.ends_with(b"\n") {
@@ -305,6 +314,17 @@ where
     // Flush immediately to ensure client receives the response
     writer.flush().await.context("flush stdout")?;
     Ok(())
+}
+
+pub async fn write_mcp_response_with_mode<W>(
+    writer: &mut W,
+    resp: &RpcResponse,
+    skip_headers: bool,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_mcp_payload_with_mode(writer, resp, skip_headers).await
 }
 
 #[cfg(test)]
@@ -352,6 +372,32 @@ mod tests {
         let err = read_mcp_message(&mut reader)
             .await
             .expect_err("expected missing Content-Length to error");
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.error.to_string().contains("missing Content-Length"));
+        assert!(err.response_has_headers);
+        assert!(!err.should_continue);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_errors_when_non_json_line_reaches_eof() {
+        let input = b"not-json\n";
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected non-json input to error");
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.error.to_string().contains("missing Content-Length"));
+        assert!(err.response_has_headers);
+        assert!(!err.should_continue);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_does_not_ignore_junk_before_raw_json() {
+        let input = b"X-Test: 1\n{\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected header-like prelude without Content-Length to error");
         assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.error.to_string().contains("missing Content-Length"));
         assert!(err.response_has_headers);

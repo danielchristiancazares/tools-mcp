@@ -95,19 +95,18 @@ impl ResponseObject {
     pub fn extract_text(&self, include_results: bool) -> String {
         use std::fmt::Write as _;
 
-        let message = self.output.iter().find_map(|item| {
+        if let Some(text) = self.output.iter().find_map(|item| {
             if let OutputItem::Message(msg) = item {
-                Some(msg)
+                join_text_blocks(
+                    msg.content
+                        .iter()
+                        .filter_map(|content| content.text.as_deref()),
+                )
             } else {
                 None
             }
-        });
-
-        if let Some(msg) = message
-            && let Some(content) = msg.content.first()
-            && let Some(text) = &content.text
-        {
-            let mut result = text.clone();
+        }) {
+            let mut result = text;
 
             if include_results
                 && let Some(file_search) = self.output.iter().find_map(|item| match item {
@@ -173,14 +172,17 @@ pub fn extract_text_from_response_value(
                 if item.get("type").and_then(|t| t.as_str()) == Some("message") {
                     item.get("content")
                         .and_then(|c| c.as_array())
-                        .and_then(|c| c.first())
-                        .and_then(|c0| c0.get("text").and_then(|t| t.as_str()))
+                        .and_then(|content| {
+                            join_text_blocks(content.iter().filter_map(|block| {
+                                block.get("text").and_then(|text| text.as_str())
+                            }))
+                        })
                 } else {
                     None
                 }
             })
         })
-        .unwrap_or("No response text found");
+        .unwrap_or_else(|| "No response text found".to_string());
 
     let mut result = message_text.to_string();
 
@@ -235,6 +237,100 @@ pub fn extract_text_from_response_value(
     }
 
     result
+}
+
+fn join_text_blocks<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut saw_text_block = false;
+    let mut joined = String::new();
+
+    for text in texts {
+        saw_text_block = true;
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str(text);
+    }
+
+    if saw_text_block { Some(joined) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ContentItem, MessageOutput, OutputItem, ResponseObject, extract_text_from_response_value,
+    };
+
+    fn response_with_content(content: Vec<ContentItem>) -> ResponseObject {
+        ResponseObject {
+            id: "resp_1".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "gpt-4o".to_string(),
+            output: vec![OutputItem::Message(MessageOutput {
+                id: "msg_1".to_string(),
+                role: "assistant".to_string(),
+                status: "completed".to_string(),
+                content,
+            })],
+            error: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn response_object_extract_text_skips_non_text_content_blocks() {
+        let response = response_with_content(vec![
+            ContentItem {
+                content_type: "refusal".to_string(),
+                text: None,
+                annotations: None,
+            },
+            ContentItem {
+                content_type: "output_text".to_string(),
+                text: Some("answer after non-text block".to_string()),
+                annotations: None,
+            },
+        ]);
+
+        assert_eq!(response.extract_text(false), "answer after non-text block");
+    }
+
+    #[test]
+    fn response_object_extract_text_preserves_multiple_text_blocks() {
+        let response = response_with_content(vec![
+            ContentItem {
+                content_type: "output_text".to_string(),
+                text: Some("first".to_string()),
+                annotations: None,
+            },
+            ContentItem {
+                content_type: "output_text".to_string(),
+                text: Some("second".to_string()),
+                annotations: None,
+            },
+        ]);
+
+        assert_eq!(response.extract_text(false), "first\nsecond");
+    }
+
+    #[test]
+    fn raw_response_extract_text_skips_non_text_content_blocks() {
+        let response = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [
+                    {"type": "refusal", "refusal": "not applicable"},
+                    {"type": "output_text", "text": "raw answer"}
+                ]
+            }]
+        });
+
+        assert_eq!(
+            extract_text_from_response_value(&response, false),
+            "raw answer"
+        );
+    }
 }
 
 /// Configuration for `OpenAI` API authentication and defaults.
@@ -383,6 +479,9 @@ pub struct VectorStoreList {
     /// True if more pages are available.
     #[serde(default)]
     pub has_more: bool,
+    /// Cursor for fetching the next page.
+    #[serde(default)]
+    pub last_id: Option<String>,
 }
 
 /// Summary information about a vector store.

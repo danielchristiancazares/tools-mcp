@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, StatusCode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tokio::time::{Duration, sleep};
 
 use crate::files::upload_file;
@@ -12,10 +13,16 @@ use crate::vector_stores::{
 };
 use crate::{ApiConfig, CodeQueryOptions, compute_file_hash, is_codequery_indexable_path};
 
-fn normalize_indexed_path(path: &str) -> String {
-    let path_buf = std::path::PathBuf::from(path);
+fn normalize_indexed_path_with_base(path: &str, base: Option<&Path>) -> String {
+    let path_buf = PathBuf::from(path);
     if !path_buf.is_absolute() {
         return path.to_string();
+    }
+
+    if let Some(base) = base
+        && let Ok(relative) = path_buf.strip_prefix(base)
+    {
+        return relative.to_string_lossy().to_string();
     }
 
     if let Ok(cwd) = std::env::current_dir()
@@ -30,6 +37,54 @@ fn normalize_indexed_path(path: &str) -> String {
     )
 }
 
+fn compute_indexed_path_base(file_paths: &[String]) -> Option<PathBuf> {
+    let absolute_paths: Vec<PathBuf> = file_paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect();
+
+    if absolute_paths.is_empty() {
+        return None;
+    }
+
+    let mut parents = absolute_paths
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf));
+    let mut common = parents.next()?;
+
+    for parent in parents {
+        while !parent.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+
+    if let Some(git_root) = find_git_root_from(&common) {
+        return Some(git_root);
+    }
+
+    if let Ok(cwd) = std::env::current_dir()
+        && absolute_paths.iter().all(|path| path.starts_with(&cwd))
+    {
+        return Some(cwd);
+    }
+
+    Some(common)
+}
+
+fn find_git_root_from(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+fn is_hash_match_move_candidate(old_key: &str, desired_indexed_paths: &HashSet<String>) -> bool {
+    !desired_indexed_paths.contains(old_key)
+}
+
 /// Synchronizes local files into a vector store using path and hash metadata.
 pub async fn reindex_files(
     client: &Client,
@@ -42,6 +97,11 @@ pub async fn reindex_files(
     use futures::stream::{self, StreamExt};
 
     let store_files_list = list_vector_store_files(client, cfg, vector_store_id).await?;
+    let indexed_path_base = compute_indexed_path_base(file_paths);
+    let desired_indexed_paths: HashSet<String> = file_paths
+        .iter()
+        .map(|path| normalize_indexed_path_with_base(path, indexed_path_base.as_deref()))
+        .collect();
 
     let mut path_map: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut hash_map: HashMap<String, (String, String)> = HashMap::new();
@@ -69,7 +129,7 @@ pub async fn reindex_files(
 
         if let Some(path) = &path_attr {
             path_map.insert(
-                normalize_indexed_path(path),
+                normalize_indexed_path_with_base(path, indexed_path_base.as_deref()),
                 (file.id.clone(), hash.clone()),
             );
         }
@@ -120,7 +180,7 @@ pub async fn reindex_files(
                 continue;
             }
         };
-        let indexed_path = normalize_indexed_path(&path);
+        let indexed_path = normalize_indexed_path_with_base(&path, indexed_path_base.as_deref());
 
         if let Some((file_id, store_hash)) = path_map.get(&indexed_path).cloned() {
             if store_hash.as_ref() == Some(&local_hash) {
@@ -142,6 +202,10 @@ pub async fn reindex_files(
                 to_upload.push((path, local_hash));
             }
         } else if let Some((old_key, file_id)) = hash_map.get(&local_hash).cloned() {
+            if !is_hash_match_move_candidate(&old_key, &desired_indexed_paths) {
+                to_upload.push((path, local_hash));
+                continue;
+            }
             to_delete.insert(file_id.clone(), format!("moved from {old_key} to {path}"));
             path_map.remove(&old_key);
             hash_map.remove(&local_hash);
@@ -183,53 +247,59 @@ pub async fn reindex_files(
     for chunk in chunks {
         let chunk_len = chunk.len();
         let results: Vec<_> = stream::iter(chunk)
-            .map(|(path, hash)| async move {
-                let file_id = match upload_file(client, cfg, &path).await {
-                    Ok(id) => id,
-                    Err(err) => return Err((path.clone(), format!("Upload failed: {err}"))),
-                };
+            .map(|(path, hash)| {
+                let indexed_path_base = indexed_path_base.clone();
+                async move {
+                    let file_id = match upload_file(client, cfg, &path).await {
+                        Ok(id) => id,
+                        Err(err) => return Err((path.clone(), format!("Upload failed: {err}"))),
+                    };
 
-                let mut attributes = serde_json::Map::new();
-                attributes.insert(
-                    "path".to_string(),
-                    serde_json::Value::String(normalize_indexed_path(&path)),
-                );
-                attributes.insert("hash".to_string(), serde_json::Value::String(hash.clone()));
-                attributes.insert(
-                    "indexed_at".to_string(),
-                    serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-                );
+                    let mut attributes = serde_json::Map::new();
+                    attributes.insert(
+                        "path".to_string(),
+                        serde_json::Value::String(normalize_indexed_path_with_base(
+                            &path,
+                            indexed_path_base.as_deref(),
+                        )),
+                    );
+                    attributes.insert("hash".to_string(), serde_json::Value::String(hash.clone()));
+                    attributes.insert(
+                        "indexed_at".to_string(),
+                        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+                    );
 
-                match add_file_to_vector_store_with(
-                    client,
-                    cfg,
-                    vector_store_id,
-                    &file_id,
-                    Some(attributes),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if !skip_per_file_wait
-                            && let Err(err) = wait_for_vector_file_ready(
-                                client,
-                                cfg,
-                                vector_store_id,
-                                1000,
-                                30_000,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "File {} uploaded but processing incomplete: {}",
-                                path,
-                                err
-                            );
+                    match add_file_to_vector_store_with(
+                        client,
+                        cfg,
+                        vector_store_id,
+                        &file_id,
+                        Some(attributes),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if !skip_per_file_wait
+                                && let Err(err) = wait_for_vector_file_ready(
+                                    client,
+                                    cfg,
+                                    vector_store_id,
+                                    1000,
+                                    30_000,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "File {} uploaded but processing incomplete: {}",
+                                    path,
+                                    err
+                                );
+                            }
+                            Ok((path, file_id, hash))
                         }
-                        Ok((path, file_id, hash))
+                        Err(err) => Err((path.clone(), format!("Attach failed: {err}"))),
                     }
-                    Err(err) => Err((path.clone(), format!("Attach failed: {err}"))),
                 }
             })
             .buffer_unordered(concurrent_limit)
@@ -552,4 +622,44 @@ pub async fn code_query(
         crate::openai::types::extract_text_from_response_value(&raw_response, include_results);
 
     Ok((response_text, reindex_summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_indexed_path_base, is_hash_match_move_candidate, normalize_indexed_path_with_base,
+    };
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    #[test]
+    fn absolute_paths_normalize_against_common_base() {
+        let base = Path::new("/workspace/repo");
+
+        assert_eq!(
+            normalize_indexed_path_with_base("/workspace/repo/src/lib.rs", Some(base)),
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn indexed_path_base_uses_common_parent_for_absolute_paths_outside_cwd() {
+        let paths = vec![
+            "/workspace/repo/src/lib.rs".to_string(),
+            "/workspace/repo/tests/integration.rs".to_string(),
+        ];
+
+        assert_eq!(
+            compute_indexed_path_base(&paths).as_deref(),
+            Some(Path::new("/workspace/repo"))
+        );
+    }
+
+    #[test]
+    fn identical_hash_at_requested_old_path_is_copy_not_move() {
+        let desired = HashSet::from(["src/original.rs".to_string(), "src/copy.rs".to_string()]);
+
+        assert!(!is_hash_match_move_candidate("src/original.rs", &desired));
+        assert!(is_hash_match_move_candidate("src/removed.rs", &desired));
+    }
 }

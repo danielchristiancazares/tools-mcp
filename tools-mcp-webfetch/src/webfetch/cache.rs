@@ -250,6 +250,15 @@ pub fn write_cache(url: &str, data: &CachedFetch) -> Result<()> {
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
+    use std::sync::{Mutex, MutexGuard};
+
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn cache_test_guard() -> MutexGuard<'static, ()> {
+        CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
 
     #[test]
     fn cached_fetch_serializes_body_as_base64_string() {
@@ -282,6 +291,7 @@ mod tests {
 
     #[test]
     fn cache_write_then_read_roundtrip() {
+        let _guard = cache_test_guard();
         let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let key = format!("test://cache-roundtrip-{}_http", uuid::Uuid::new_v4());
         let entry = CachedFetch {
@@ -307,6 +317,7 @@ mod tests {
 
     #[test]
     fn read_cache_treats_corrupt_entry_as_miss_and_removes_file() {
+        let _guard = cache_test_guard();
         let key = format!("test://cache-corrupt-{}_http", uuid::Uuid::new_v4());
         let path = cache_path_for(&key).expect("cache path");
 
@@ -325,6 +336,7 @@ mod tests {
     // The tracing::warn! is the only signal, which is lost in non-debug environments.
     #[test]
     fn read_cache_silently_swallows_corruption_error() {
+        let _guard = cache_test_guard();
         let key = format!("test://cache-silent-corrupt-{}_http", uuid::Uuid::new_v4());
         let path = cache_path_for(&key).expect("cache path");
 
@@ -344,6 +356,7 @@ mod tests {
     // cache_path_for() and write_cache(), the write will fail.
     #[test]
     fn write_cache_creates_parent_directory_if_missing() {
+        let _guard = cache_test_guard();
         let key = format!("test://cache-dir-check-{}_http", uuid::Uuid::new_v4());
         let path = cache_path_for(&key).expect("cache path");
 
@@ -372,6 +385,7 @@ mod tests {
     // Entries exceeding this size are rejected.
     #[test]
     fn cache_rejects_entries_exceeding_size_limit() {
+        let _guard = cache_test_guard();
         let unique_id = uuid::Uuid::new_v4();
         let key = format!("test://cache-size-limit-{}_http", unique_id);
         let _ = fs::remove_file(cache_path_for(&key).unwrap());

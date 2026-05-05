@@ -3,7 +3,7 @@ use super::super::types::build_git_response;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::fs;
 use tools_mcp_core::ToolCallOutcome;
@@ -15,6 +15,22 @@ use tools_mcp_core::validation;
 /// Sanitize a file path for use as a filename (replace path separators).
 fn sanitize_path_for_filename(path: &str) -> String {
     path.replace(['/', '\\'], "__")
+}
+
+fn unique_patch_filename(base: &str, used_filenames: &mut HashSet<String>) -> String {
+    let first = format!("{base}.patch");
+    if used_filenames.insert(first.clone()) {
+        return first;
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{base}.{suffix}.patch");
+        if used_filenames.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix search must find an unused patch filename")
 }
 
 /// File diff entry for the summary JSON.
@@ -64,6 +80,46 @@ fn diff_manifest_key(path: &str, old_path: Option<&str>) -> String {
         Some(old_path) => format!("{old_path}\0{path}"),
         None => path.to_string(),
     }
+}
+
+fn requested_paths(paths: Option<Vec<String>>) -> Result<Vec<String>, ToolCallOutcome> {
+    match paths {
+        Some(paths) => {
+            let paths: Vec<String> = paths
+                .into_iter()
+                .filter(|path| !path.trim().is_empty())
+                .collect();
+            if paths.is_empty() {
+                return Err(ToolCallOutcome::err(
+                    "paths must include at least one non-empty path",
+                ));
+            }
+            Ok(paths)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn build_ref_diff_args(
+    from_ref: &str,
+    to_ref: &str,
+    mode_args: &[&str],
+    paths: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "diff".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "--find-renames".into(),
+    ];
+    args.extend(mode_args.iter().map(|arg| (*arg).to_string()));
+    args.push("--end-of-options".into());
+    args.push(format!("{from_ref}..{to_ref}"));
+    if !paths.is_empty() {
+        args.push("--".into());
+        args.extend(paths.iter().cloned());
+    }
+    args
 }
 
 fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
@@ -228,19 +284,10 @@ async fn collect_ref_diff_manifest(
     working_dir: Option<&str>,
     from_ref: &str,
     to_ref: &str,
+    paths: &[String],
     timeout_ms: u64,
 ) -> Result<Vec<DiffManifestEntry>, String> {
-    let common_args = vec![
-        "diff".into(),
-        format!("{from_ref}..{to_ref}"),
-        "--no-ext-diff".into(),
-        "--no-textconv".into(),
-        "--find-renames".into(),
-    ];
-
-    let mut name_status_args = common_args.clone();
-    name_status_args.push("--name-status".into());
-    name_status_args.push("-z".into());
+    let name_status_args = build_ref_diff_args(from_ref, to_ref, &["--name-status", "-z"], paths);
     let name_status_exec = run_git(
         working_dir.map(std::string::ToString::to_string),
         name_status_args,
@@ -259,9 +306,7 @@ async fn collect_ref_diff_manifest(
 
     let mut entries = parse_name_status_z(&name_status_exec.stdout)?;
 
-    let mut numstat_args = common_args;
-    numstat_args.push("--numstat".into());
-    numstat_args.push("-z".into());
+    let numstat_args = build_ref_diff_args(from_ref, to_ref, &["--numstat", "-z"], paths);
     let numstat_exec = run_git(
         working_dir.map(std::string::ToString::to_string),
         numstat_args,
@@ -288,6 +333,7 @@ async fn write_patches_to_dir(
     from_ref: &str,
     to_ref: &str,
     output_dir: &str,
+    paths: &[String],
     timeout_ms: u64,
 ) -> Result<Value, String> {
     let out_path = Path::new(output_dir);
@@ -295,25 +341,31 @@ async fn write_patches_to_dir(
         .await
         .map_err(|e| format!("Failed to create output directory: {e}"))?;
 
-    let entries = collect_ref_diff_manifest(working_dir, from_ref, to_ref, timeout_ms).await?;
+    let entries =
+        collect_ref_diff_manifest(working_dir, from_ref, to_ref, paths, timeout_ms).await?;
 
     let mut files: Vec<FileDiffEntry> = Vec::new();
     let mut total_insertions: u32 = 0;
     let mut total_deletions: u32 = 0;
+    let mut used_patch_filenames = HashSet::new();
 
     for entry in entries {
         total_insertions += entry.insertions;
         total_deletions += entry.deletions;
 
-        let patch_filename = format!("{}.patch", sanitize_path_for_filename(&entry.path));
+        let patch_filename = unique_patch_filename(
+            &sanitize_path_for_filename(&entry.path),
+            &mut used_patch_filenames,
+        );
         let patch_path = out_path.join(&patch_filename);
 
         let mut patch_args = vec![
             "diff".into(),
-            format!("{from_ref}..{to_ref}"),
             "--no-ext-diff".into(),
             "--no-textconv".into(),
             "--find-renames".into(),
+            "--end-of-options".into(),
+            format!("{from_ref}..{to_ref}"),
             "--".into(),
         ];
         if let Some(old_path) = &entry.old_path {
@@ -421,47 +473,57 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
+    let paths = match requested_paths(req.paths) {
+        Ok(paths) => paths,
+        Err(o) => return o,
+    };
 
-    if let (Some(from_ref), Some(to_ref), Some(output_dir)) =
-        (&req.from_ref, &req.to_ref, &req.output_dir)
-    {
-        match write_patches_to_dir(
-            req.working_dir.as_deref(),
-            from_ref,
-            to_ref,
-            output_dir,
-            timeout_ms,
-        )
-        .await
-        {
-            Ok(summary) => {
-                let files_changed = summary["summary"]["files_changed"].as_u64().unwrap_or(0);
-                let text = format!(
-                    "Diff between {from_ref} and {to_ref}: {files_changed} files changed. Patches written to {output_dir}"
-                );
-                let mut response = serde_json::Map::new();
-                response.insert(
-                    "content".to_string(),
-                    json!([{"type": "text", "text": text}]),
-                );
-                response.insert("isError".to_string(), json!(false));
-                response.insert("from_ref".to_string(), json!(from_ref));
-                response.insert("to_ref".to_string(), json!(to_ref));
-                response.insert("output_dir".to_string(), json!(output_dir));
-                response.insert("summary".to_string(), summary["summary"].clone());
-                response.insert("files".to_string(), summary["files"].clone());
-                return ToolCallOutcome::ok(Value::Object(response));
+    match (&req.from_ref, &req.to_ref, &req.output_dir) {
+        (Some(from_ref), Some(to_ref), Some(output_dir)) => {
+            for (field_name, value) in [
+                ("from_ref", from_ref.as_str()),
+                ("to_ref", to_ref.as_str()),
+                ("output_dir", output_dir.as_str()),
+            ] {
+                if let Err(o) = validation::validate_non_empty(value, field_name, None) {
+                    return o;
+                }
             }
-            Err(e) => return ToolCallOutcome::err(e),
-        }
-    }
 
-    if req.from_ref.is_some() || req.to_ref.is_some() {
-        if req.output_dir.is_none() {
-            return ToolCallOutcome::err("output_dir is required when using from_ref and to_ref");
+            match write_patches_to_dir(
+                req.working_dir.as_deref(),
+                from_ref,
+                to_ref,
+                output_dir,
+                &paths,
+                timeout_ms,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    let files_changed = summary["summary"]["files_changed"].as_u64().unwrap_or(0);
+                    let text = format!(
+                        "Diff between {from_ref} and {to_ref}: {files_changed} files changed. Patches written to {output_dir}"
+                    );
+                    let mut response = serde_json::Map::new();
+                    response.insert(
+                        "content".to_string(),
+                        json!([{"type": "text", "text": text}]),
+                    );
+                    response.insert("isError".to_string(), json!(false));
+                    response.insert("from_ref".to_string(), json!(from_ref));
+                    response.insert("to_ref".to_string(), json!(to_ref));
+                    response.insert("output_dir".to_string(), json!(output_dir));
+                    response.insert("summary".to_string(), summary["summary"].clone());
+                    response.insert("files".to_string(), summary["files"].clone());
+                    return ToolCallOutcome::ok(Value::Object(response));
+                }
+                Err(e) => return ToolCallOutcome::err(e),
+            }
         }
-        if req.from_ref.is_none() || req.to_ref.is_none() {
-            return ToolCallOutcome::err("both from_ref and to_ref are required together");
+        (None, None, None) => {}
+        _ => {
+            return ToolCallOutcome::err("from_ref, to_ref, and output_dir are required together");
         }
     }
 
@@ -483,20 +545,17 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
     if req.name_only.unwrap_or(false) {
         cmd_args.push("--name-only".into());
     }
-    if let Some(u) = req.unified
-        && u >= 0
-    {
+    if let Some(u) = req.unified {
+        if u < 0 {
+            return ToolCallOutcome::err("unified must be >= 0");
+        }
         cmd_args.push(format!("-U{u}"));
     }
 
-    if let Some(paths) = &req.paths
-        && !paths.is_empty()
-    {
+    if !paths.is_empty() {
         cmd_args.push("--".into());
-        for p in paths {
-            if !p.trim().is_empty() {
-                cmd_args.push(p.clone());
-            }
+        for p in &paths {
+            cmd_args.push(p.clone());
         }
     }
 
@@ -534,7 +593,71 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_numstat_z, parse_name_status_z};
+    use super::{
+        apply_numstat_z, build_ref_diff_args, handle_git_diff, parse_name_status_z,
+        unique_patch_filename,
+    };
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn git_bin() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "git.exe"
+        } else {
+            "git"
+        }
+    }
+
+    fn git_available() -> bool {
+        Command::new(git_bin())
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/tools-mcp-git-tests")
+            .join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new(git_bin())
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git command should start");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn create_two_commit_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+
+        std::fs::write(repo.join("a.txt"), "a1\n").expect("write a");
+        std::fs::write(repo.join("b.txt"), "b1\n").expect("write b");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(repo.join("a.txt"), "a2\n").expect("update a");
+        std::fs::write(repo.join("b.txt"), "b2\n").expect("update b");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "second"]);
+        repo
+    }
 
     #[test]
     fn parse_name_status_z_handles_rename_entries() {
@@ -578,5 +701,211 @@ mod tests {
         assert_eq!(entries[0].deletions, 5);
         assert_eq!(entries[0].old_path.as_deref(), Some("src/original.txt"));
         assert_eq!(entries[0].path, "src/copy.txt");
+    }
+
+    #[test]
+    fn ref_diff_args_place_modes_before_end_of_options() {
+        let paths = vec!["src/lib.rs".to_string()];
+        let args = build_ref_diff_args(
+            "--output=target/side-effect",
+            "HEAD",
+            &["--name-status", "-z"],
+            &paths,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--name-status",
+                "-z",
+                "--end-of-options",
+                "--output=target/side-effect..HEAD",
+                "--",
+                "src/lib.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn unique_patch_filename_disambiguates_sanitized_path_collisions() {
+        let mut used = HashSet::new();
+        assert_eq!(
+            unique_patch_filename("a__b.txt", &mut used),
+            "a__b.txt.patch"
+        );
+        assert_eq!(
+            unique_patch_filename("a__b.txt", &mut used),
+            "a__b.txt.2.patch"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_diff_rejects_whitespace_only_paths() {
+        let outcome = handle_git_diff(None, json!({"paths": ["   ", "\t"]})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("paths must include")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_diff_rejects_negative_unified_context() {
+        let outcome = handle_git_diff(None, json!({"unified": -1})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unified must be >= 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_diff_ref_export_requires_complete_non_empty_ref_tuple() {
+        let incomplete = handle_git_diff(None, json!({"output_dir": "patches"})).await;
+        assert_eq!(incomplete.0["isError"], true);
+        assert!(
+            incomplete.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("from_ref, to_ref, and output_dir are required together")
+        );
+
+        let empty_ref = handle_git_diff(
+            None,
+            json!({"from_ref": "   ", "to_ref": "HEAD", "output_dir": "patches"}),
+        )
+        .await;
+        assert_eq!(empty_ref.0["isError"], true);
+        assert!(
+            empty_ref.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("from_ref is required")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_diff_ref_export_honors_paths_filter() {
+        if !git_available() {
+            eprintln!("Skipping GitDiff path filter test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("diff-path-filter");
+        let repo = create_two_commit_repo(&root);
+        let patches = root.join("patches");
+
+        let outcome = handle_git_diff(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string(),
+                "from_ref": "HEAD~1",
+                "to_ref": "HEAD",
+                "output_dir": patches.to_string_lossy().to_string(),
+                "paths": ["a.txt"]
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
+        let files = outcome.0["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "a.txt");
+        assert!(patches.join("a.txt.patch").exists());
+        assert!(!patches.join("b.txt.patch").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn git_diff_ref_export_uses_distinct_patch_files_for_sanitized_path_collisions() {
+        if !git_available() {
+            eprintln!("Skipping GitDiff patch collision test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("diff-patch-collision");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("a")).expect("create nested dir");
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("a").join("b.txt"), "nested old\n").expect("write nested");
+        std::fs::write(repo.join("a__b.txt"), "flat old\n").expect("write flat");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(repo.join("a").join("b.txt"), "nested new\n").expect("update nested");
+        std::fs::write(repo.join("a__b.txt"), "flat new\n").expect("update flat");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "second"]);
+
+        let patches = root.join("patches");
+        let outcome = handle_git_diff(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string(),
+                "from_ref": "HEAD~1",
+                "to_ref": "HEAD",
+                "output_dir": patches.to_string_lossy().to_string()
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
+        let files = outcome.0["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 2);
+        let patch_files: HashSet<&str> = files
+            .iter()
+            .map(|file| file["patch_file"].as_str().expect("patch file"))
+            .collect();
+        assert_eq!(patch_files.len(), 2, "patch filenames must be unique");
+        for patch_file in patch_files {
+            assert!(
+                patches.join(patch_file).exists(),
+                "{patch_file} should exist"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn git_diff_ref_export_does_not_treat_refs_as_options() {
+        if !git_available() {
+            eprintln!("Skipping GitDiff option-like ref test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("diff-option-ref");
+        let repo = create_two_commit_repo(&root);
+        let patches = root.join("patches");
+        let injected_output = root.join("side-effect..HEAD");
+
+        let outcome = handle_git_diff(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string(),
+                "from_ref": "--output=../side-effect",
+                "to_ref": "HEAD",
+                "output_dir": patches.to_string_lossy().to_string()
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            !injected_output.exists(),
+            "option-like ref must not create an output file"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

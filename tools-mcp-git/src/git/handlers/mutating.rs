@@ -9,6 +9,27 @@ use tools_mcp_core::config::{
 };
 use tools_mcp_core::validation;
 
+fn non_empty_paths(paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| !path.trim().is_empty())
+        .collect()
+}
+
+fn validate_non_option_arg(value: &str, field_name: &str) -> Result<(), ToolCallOutcome> {
+    validation::validate_non_empty(value, field_name, None)?;
+    if value.starts_with('-') {
+        return Err(ToolCallOutcome::err(format!(
+            "{field_name} must not start with '-'"
+        )));
+    }
+    Ok(())
+}
+
+fn sanitize_commit_fragment(value: &str) -> String {
+    value.trim().replace('\n', " ").replace('\r', "")
+}
+
 /// Handle the `GitRestore` MCP tool request.
 ///
 /// Executes `git restore` to discard uncommitted changes. This is a **destructive
@@ -33,7 +54,8 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
         Err(o) => return o,
     };
 
-    if req.paths.iter().all(|p| p.trim().is_empty()) {
+    let paths = non_empty_paths(req.paths);
+    if paths.is_empty() {
         return ToolCallOutcome::err("paths must be non-empty");
     }
 
@@ -55,10 +77,8 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
     }
 
     cmd_args.push("--".into());
-    for p in &req.paths {
-        if !p.trim().is_empty() {
-            cmd_args.push(p.clone());
-        }
+    for p in &paths {
+        cmd_args.push(p.clone());
     }
 
     let exec = match run_git(
@@ -119,7 +139,7 @@ pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome 
 
     let use_all = req.all.unwrap_or(false);
     let use_update = req.update.unwrap_or(false);
-    let paths = req.paths.unwrap_or_default();
+    let paths = non_empty_paths(req.paths.unwrap_or_default());
 
     if !use_all && !use_update && paths.is_empty() {
         return ToolCallOutcome::err("paths required unless 'all' or 'update' is true");
@@ -138,9 +158,7 @@ pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome 
     if !paths.is_empty() {
         cmd_args.push("--".into());
         for p in &paths {
-            if !p.trim().is_empty() {
-                cmd_args.push(p.clone());
-            }
+            cmd_args.push(p.clone());
         }
     }
 
@@ -200,20 +218,13 @@ pub async fn handle_git_commit(_id: Option<Value>, args: Value) -> ToolCallOutco
         return o;
     }
 
-    let commit_msg = match &req.scope {
+    let commit_type = sanitize_commit_fragment(&req.commit_type);
+    let message = sanitize_commit_fragment(&req.message);
+    let commit_msg = match req.scope.as_deref().map(sanitize_commit_fragment) {
         Some(scope) if !scope.trim().is_empty() => {
-            format!(
-                "{}({}): {}",
-                req.commit_type.trim(),
-                scope.trim(),
-                req.message.trim().replace('\n', " ").replace('\r', "")
-            )
+            format!("{commit_type}({scope}): {message}")
         }
-        _ => format!(
-            "{}: {}",
-            req.commit_type.trim(),
-            req.message.trim().replace('\n', " ").replace('\r', "")
-        ),
+        _ => format!("{commit_type}: {message}"),
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
@@ -290,17 +301,32 @@ pub async fn handle_git_branch(_id: Option<Value>, args: Value) -> ToolCallOutco
     let mut cmd_args: Vec<String> = vec!["branch".into()];
 
     if let Some(name) = &req.create {
+        if let Err(o) = validate_non_option_arg(name, "create") {
+            return o;
+        }
         cmd_args.push(name.clone());
     } else if let Some(name) = &req.delete {
+        if let Err(o) = validate_non_option_arg(name, "delete") {
+            return o;
+        }
         cmd_args.push("-d".into());
         cmd_args.push(name.clone());
     } else if let Some(name) = &req.force_delete {
+        if let Err(o) = validate_non_option_arg(name, "force_delete") {
+            return o;
+        }
         cmd_args.push("-D".into());
         cmd_args.push(name.clone());
     } else if let Some(old_name) = &req.rename {
+        if let Err(o) = validate_non_option_arg(old_name, "rename") {
+            return o;
+        }
         cmd_args.push("-m".into());
         cmd_args.push(old_name.clone());
         if let Some(new_name) = &req.new_name {
+            if let Err(o) = validate_non_option_arg(new_name, "new_name") {
+                return o;
+            }
             cmd_args.push(new_name.clone());
         } else {
             return ToolCallOutcome::err("new_name required when renaming a branch");
@@ -371,24 +397,30 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
     let mut cmd_args: Vec<String> = vec!["checkout".into()];
+    let paths = non_empty_paths(req.paths.unwrap_or_default());
 
     if let Some(branch) = &req.create_branch {
+        if let Err(o) = validate_non_option_arg(branch, "create_branch") {
+            return o;
+        }
         cmd_args.push("-b".into());
         cmd_args.push(branch.clone());
     } else if let Some(branch) = &req.branch {
+        if let Err(o) = validate_non_option_arg(branch, "branch") {
+            return o;
+        }
         cmd_args.push(branch.clone());
     } else if let Some(commit) = &req.commit {
+        if let Err(o) = validate_non_option_arg(commit, "commit") {
+            return o;
+        }
         cmd_args.push(commit.clone());
     }
 
-    if let Some(paths) = &req.paths
-        && !paths.is_empty()
-    {
+    if !paths.is_empty() {
         cmd_args.push("--".into());
-        for p in paths {
-            if !p.trim().is_empty() {
-                cmd_args.push(p.clone());
-            }
+        for p in &paths {
+            cmd_args.push(p.clone());
         }
     }
 
@@ -550,11 +582,10 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
 #[cfg(test)]
 mod tests {
-    // BUG: GitStash handler accepts action="" (empty string) and falls through to the
-    // wildcard `_` arm, returning "unknown stash action ''". But the default action is
-    // "push" (line 455: `let action = req.action.as_deref().unwrap_or("push");`), so if
-    // the user explicitly passes action: "", they get an error instead of the default.
-    // This is inconsistent — action: null => "push", action: "" => error.
+    use super::{handle_git_add, handle_git_checkout, sanitize_commit_fragment};
+    use serde_json::json;
+
+    // Empty action should preserve the default push behavior.
     #[test]
     fn git_stash_empty_string_action_defaults_to_push() {
         let action: Option<String> = Some("".to_string());
@@ -575,9 +606,7 @@ mod tests {
         assert_eq!(result2, "push", "None should also default to 'push'");
     }
 
-    // BUG: GitRestore validation says "paths must be non-empty" but accepts paths with
-    // whitespace-only strings. The check is `req.paths.is_empty()` which only checks if
-    // the Vec is empty, not if individual path strings are empty/whitespace.
+    // Whitespace-only paths must be rejected before invoking destructive restore.
     #[test]
     fn git_restore_rejects_whitespace_only_paths() {
         let paths: Vec<String> = vec!["   ".to_string(), "\t".to_string()];
@@ -585,30 +614,20 @@ mod tests {
         assert!(all_empty, "whitespace-only paths should be rejected");
     }
 
-    // BUG: GitCommit allows injection through commit message formatting.
-    // The commit message is passed directly to `git commit -m` without sanitization.
-    // A message like "foo\n\nSigned-off-by: attacker <evil@evil.com>" could add
-    // extra commit trailer lines.
+    // Conventional commit fields must stay a single subject line.
     #[test]
     fn git_commit_message_sanitizes_newlines() {
-        let commit_type = "feat";
-        let scope: Option<String> = None;
+        let commit_type = "feat\n\nCo-authored-by: attacker <evil@evil.com>";
+        let scope: Option<String> = Some("core\r\nReviewed-by: attacker <evil@evil.com>".into());
         let message = "add feature\n\nSigned-off-by: attacker <evil@evil.com>";
 
-        let commit_msg = match &scope {
+        let commit_type = sanitize_commit_fragment(commit_type);
+        let message = sanitize_commit_fragment(message);
+        let commit_msg = match scope.as_deref().map(sanitize_commit_fragment) {
             Some(scope) if !scope.trim().is_empty() => {
-                format!(
-                    "{}({}): {}",
-                    commit_type.trim(),
-                    scope.trim(),
-                    message.trim().replace('\n', " ").replace('\r', "")
-                )
+                format!("{commit_type}({scope}): {message}")
             }
-            _ => format!(
-                "{}: {}",
-                commit_type.trim(),
-                message.trim().replace('\n', " ").replace('\r', "")
-            ),
+            _ => format!("{commit_type}: {message}"),
         };
 
         assert!(
@@ -618,6 +637,42 @@ mod tests {
         assert!(
             !commit_msg.contains('\r'),
             "commit message should not contain carriage returns: {commit_msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_add_rejects_whitespace_only_paths() {
+        let outcome = handle_git_add(None, json!({"paths": ["   ", "\t"]})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("paths required")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_checkout_rejects_whitespace_only_paths_without_ref() {
+        let outcome = handle_git_checkout(None, json!({"paths": ["   ", "\t"]})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("at least one")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_checkout_rejects_option_like_branch() {
+        let outcome = handle_git_checkout(None, json!({"branch": "--detach"})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("must not start with '-'")
         );
     }
 }

@@ -146,7 +146,10 @@ pub(crate) async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCa
     }
 
     let include_results = req.include_results.unwrap_or(false);
-    let max_num_results = req.max_num_results.map(|n| n as u32);
+    let max_num_results = match validate_max_num_results(req.max_num_results) {
+        Ok(max_num_results) => max_num_results,
+        Err(outcome) => return outcome,
+    };
     let model_override = req.model;
 
     let client = reqwest::Client::new();
@@ -279,3 +282,50 @@ pub(crate) async fn handle_code_query(_id: Option<Value>, args: Value) -> ToolCa
     }
 }
 
+fn validate_max_num_results(value: Option<u64>) -> Result<Option<u32>, ToolCallOutcome> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    if value == 0 {
+        return Err(ToolCallOutcome::err(
+            "max_num_results must be at least 1. Omit it to use the OpenAI default, or provide a positive value.",
+        ));
+    }
+
+    let value = u32::try_from(value).map_err(|_| {
+        ToolCallOutcome::err(format!(
+            "max_num_results is too large ({value}). Use a value no greater than {}.",
+            u32::MAX
+        ))
+    })?;
+
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_max_num_results;
+
+    #[test]
+    fn max_num_results_validation_rejects_zero() {
+        let err = validate_max_num_results(Some(0)).expect_err("zero should be invalid");
+        let message = err.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(message.contains("at least 1"));
+    }
+
+    #[test]
+    fn max_num_results_validation_rejects_values_that_would_wrap() {
+        let too_large = u64::from(u32::MAX) + 1;
+        let err =
+            validate_max_num_results(Some(too_large)).expect_err("oversized value should fail");
+        let message = err.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(message.contains("too large"));
+    }
+
+    #[test]
+    fn max_num_results_validation_preserves_valid_values() {
+        assert_eq!(validate_max_num_results(None).expect("none"), None);
+        assert_eq!(validate_max_num_results(Some(25)).expect("valid"), Some(25));
+    }
+}

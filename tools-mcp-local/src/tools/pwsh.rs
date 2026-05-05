@@ -59,16 +59,20 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         }
     };
 
-    let mut result =
-        match wait_with_limits(child, timeout_ms, MAX_PWSH_STDOUT_BYTES, MAX_PWSH_STDERR_BYTES)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Pwsh tool: {}", e);
-                return ToolCallOutcome::err(format!("failed to run pwsh: {e}"));
-            }
-        };
+    let mut result = match wait_with_limits(
+        child,
+        timeout_ms,
+        MAX_PWSH_STDOUT_BYTES,
+        MAX_PWSH_STDERR_BYTES,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Pwsh tool: {}", e);
+            return ToolCallOutcome::err(format!("failed to run pwsh: {e}"));
+        }
+    };
 
     result.stdout = strip_ansi_codes(&result.stdout);
     result.stderr = strip_ansi_codes(&result.stderr);

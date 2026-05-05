@@ -98,7 +98,7 @@ pub fn analyze_js_heavy(
 
     // Skip analysis for non-HTML content (case-insensitive check)
     if let Some(ct) = content_type
-        && !ct.to_ascii_lowercase().contains("text/html")
+        && !ct.to_ascii_lowercase().contains("html")
     {
         return result;
     }
@@ -541,6 +541,24 @@ mod tests {
         assert!(
             result.confidence > 0.0,
             "Should consider small content length"
+        );
+    }
+
+    #[test]
+    fn test_xhtml_content_type_is_analyzed_as_html() {
+        let html = r#"
+            <html>
+            <body>
+                <noscript>You need to enable JavaScript to run this app.</noscript>
+                <div id="root"></div>
+            </body>
+            </html>
+        "#;
+
+        let result = analyze_js_heavy(html, "", Some("application/xhtml+xml"), Some(html.len()));
+        assert!(
+            result.is_js_heavy,
+            "XHTML responses are HTML-like and should still trigger JS-heavy fallback"
         );
     }
 }

@@ -143,9 +143,13 @@ pub(crate) async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 
     if use_browser {
         debug!("Browser rendering requested for {}", req.url);
-        // Try browser first, fallback to HTTP if browser fails
+        // Try browser first. Explicit browser mode is strict; automatic browser attempts may
+        // degrade to HTTP when browser rendering is unavailable.
         match try_browser_render(&req).await {
             Ok(response) => return Ok(response),
+            Err(e) if req.force_browser => {
+                return Err(e).context("forced browser rendering failed");
+            }
             Err(e) => {
                 warn!("Browser rendering failed, falling back to HTTP: {}", e);
                 // Continue with HTTP fallback
@@ -154,6 +158,12 @@ pub(crate) async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     }
 
     // HTTP-first path (with JS-heavy detection)
+    // SECURITY: validate before cache lookup so a pre-existing cache entry cannot bypass
+    // SSRF or robots.txt policy.
+    http::ensure_fetch_allowed(&req.url)
+        .await
+        .context("SSRF/robots validation failed")?;
+
     // Check cache with method-specific key
     let cache_key = format!("{}_http", req.url);
     let cached = if req.no_cache {
@@ -238,16 +248,17 @@ pub(crate) async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 /// This function handles the complete browser rendering flow:
 /// 1. **SSRF validation first** - URL is validated BEFORE cache lookup to prevent
 ///    cache poisoning attacks where a malicious URL could poison the cache
-/// 2. **Cache check** - Returns cached browser-rendered content if available
-/// 3. **Browser availability** - Falls back with error if Chrome not installed
-/// 4. **Page rendering** - Navigates to URL, waits for JS execution and network idle
-/// 5. **Content extraction** - Extracts rendered HTML and converts to Markdown
+/// 2. **robots.txt check** - Refuses disallowed URLs before cache/rendering
+/// 3. **Cache check** - Returns cached browser-rendered content if available
+/// 4. **Browser availability** - Falls back with error if Chrome not installed
+/// 5. **Page rendering** - Navigates to URL, waits for JS execution and network idle
+/// 6. **Content extraction** - Extracts rendered HTML and converts to Markdown
 ///
 /// # Security Note
 ///
-/// SSRF validation happens before any cache operations. This prevents an attacker
-/// from poisoning the cache with content from a private IP by using a URL that
-/// passes initial validation but redirects to a private address.
+/// SSRF and robots.txt validation happen before any cache operations. This prevents
+/// an attacker from poisoning the cache with content from a private IP or from a
+/// URL that should not be fetched under robots.txt policy.
 ///
 /// # Errors
 ///
@@ -257,6 +268,11 @@ pub(crate) async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
 /// - Browser navigation times out (15s limit)
 /// - Page content extraction fails
 async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
+    // SECURITY: Validate SSRF before cache to prevent cache poisoning attacks
+    http::validate_url_ssrf(&req.url)
+        .await
+        .context("SSRF validation failed")?;
+
     // SECURITY: Fail closed for browser rendering until subresource requests
     // are SSRF-filtered inside the browser path.
     if std::env::var("WEBFETCH_ENABLE_BROWSER_UNSAFE")
@@ -269,10 +285,11 @@ async fn try_browser_render(req: &FetchRequest) -> Result<FetchResponse> {
         ));
     }
 
-    // SECURITY: Validate SSRF before cache to prevent cache poisoning attacks
-    http::validate_url_ssrf(&req.url)
+    // Browser mode performs a real fetch when enabled, so it must enforce the same
+    // robots.txt policy as the HTTP path before cache lookup or rendering.
+    http::ensure_fetch_allowed(&req.url)
         .await
-        .context("SSRF validation failed")?;
+        .context("SSRF/robots validation failed")?;
 
     // Check browser cache (works even if Chrome isn't installed)
     let cache_key = format!("{}_browser", req.url);
@@ -418,7 +435,10 @@ fn maybe_write_cache(key: &str, entry: &cache::CachedFetch, no_cache: bool) -> R
     if no_cache {
         return Ok(());
     }
-    cache::write_cache(key, entry)
+    if let Err(err) = cache::write_cache(key, entry) {
+        warn!(cache_key = key, error = %err, "Skipping webfetch cache write");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -460,6 +480,108 @@ mod tests {
         assert!(
             cached.is_some(),
             "no_cache=false should persist cache entries"
+        );
+    }
+
+    #[test]
+    fn maybe_write_cache_does_not_fail_fetch_when_entry_is_too_large_to_cache() {
+        let cache_key = format!("test_{}_http", Uuid::new_v4());
+        let entry = cache::CachedFetch {
+            content_type: Some("text/plain".to_string()),
+            body: vec![0; 26 * 1024 * 1024],
+            fetched_at: Utc::now(),
+        };
+
+        maybe_write_cache(&cache_key, &entry, false)
+            .expect("cache write failures should not fail a successful fetch");
+    }
+
+    #[tokio::test]
+    async fn run_fetch_rejects_blocked_url_even_when_http_cache_exists() {
+        let url = format!("http://127.0.0.1/{}", Uuid::new_v4());
+        let cache_key = format!("{url}_http");
+        let path = cache::cache_path_for(&cache_key).expect("cache path");
+        let entry = cache::CachedFetch {
+            content_type: Some("text/html".to_string()),
+            body: b"<html><body>cached private content</body></html>".to_vec(),
+            fetched_at: Utc::now(),
+        };
+        cache::write_cache(&cache_key, &entry).expect("write cache");
+
+        let err = run_fetch(FetchRequest {
+            url,
+            max_chunk_tokens: None,
+            no_cache: false,
+            force_browser: false,
+        })
+        .await
+        .expect_err("SSRF validation must run before HTTP cache lookup");
+
+        let details = format!("{err:#}");
+        assert!(
+            details.contains("SSRF/robots validation failed")
+                && details.contains("private IP address"),
+            "unexpected error: {details}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn force_browser_does_not_fall_back_to_cached_http_when_browser_disabled() {
+        if std::env::var("WEBFETCH_ENABLE_BROWSER_UNSAFE")
+            .ok()
+            .as_deref()
+            == Some("true")
+        {
+            return;
+        }
+
+        let url = format!("https://93.184.216.34/{}", Uuid::new_v4());
+        let cache_key = format!("{url}_http");
+        let path = cache::cache_path_for(&cache_key).expect("cache path");
+        let entry = cache::CachedFetch {
+            content_type: Some("text/html".to_string()),
+            body: b"<html><body>cached public content</body></html>".to_vec(),
+            fetched_at: Utc::now(),
+        };
+        cache::write_cache(&cache_key, &entry).expect("write cache");
+
+        let err = run_fetch(FetchRequest {
+            url,
+            max_chunk_tokens: None,
+            no_cache: false,
+            force_browser: true,
+        })
+        .await
+        .expect_err("force_browser=true must not silently use HTTP cache");
+
+        let details = format!("{err:#}");
+        assert!(
+            details.contains("forced browser rendering failed")
+                && details.contains("Browser rendering disabled"),
+            "unexpected error: {details}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn browser_path_validates_ssrf_before_disabled_gate() {
+        let req = FetchRequest {
+            url: "http://127.0.0.1/secret".to_string(),
+            max_chunk_tokens: None,
+            no_cache: false,
+            force_browser: true,
+        };
+
+        let err = try_browser_render(&req)
+            .await
+            .expect_err("browser path must reject private targets before feature gating");
+        let details = format!("{err:#}");
+        assert!(
+            details.contains("SSRF validation failed") && details.contains("private IP address"),
+            "unexpected error: {details}"
         );
     }
 }

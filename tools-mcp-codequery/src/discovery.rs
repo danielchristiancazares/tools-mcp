@@ -170,7 +170,7 @@ mod tests {
         fs::write(temp.path().join("logo.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         fs::write(temp.path().join(".gitignore"), b"ignored.rs\n").unwrap();
 
-        let discovered = discover_default_file_paths_from(temp.path(), None).unwrap();
+        let discovered = discover_default_file_paths_from(temp.path(), Some(temp.path())).unwrap();
 
         let discovered_joined = discovered.join("\n");
         assert!(discovered_joined.contains("kept.rs"));

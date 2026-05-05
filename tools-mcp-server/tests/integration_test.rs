@@ -533,6 +533,60 @@ fn test_error_handling_unknown_tool() {
 }
 
 #[test]
+fn test_explicit_null_id_receives_response_with_null_id() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "method": "ping",
+        "params": {}
+    });
+
+    let response = send_mcp_message(&request).expect("explicit null id should receive response");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert!(
+        response
+            .as_object()
+            .expect("response object")
+            .contains_key("id")
+    );
+    assert!(response["id"].is_null());
+    assert_eq!(response["result"]["content"][0]["text"], "pong");
+}
+
+#[test]
+fn test_invalid_request_shape_returns_invalid_request_not_parse_error() {
+    let request = json!({
+        "jsonrpc": "1.0",
+        "id": 610,
+        "method": "ping",
+        "params": {}
+    });
+
+    let response = send_mcp_message(&request).expect("invalid request response");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 610);
+    assert_eq!(response["error"]["code"], -32600);
+}
+
+#[test]
+fn test_invalid_request_id_type_returns_null_id() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": {"not": "valid"},
+        "method": "ping",
+        "params": {}
+    });
+
+    let response = send_mcp_message(&request).expect("invalid id response");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert!(response["id"].is_null());
+    assert_eq!(response["error"]["code"], -32600);
+}
+
+#[test]
 fn test_invalid_json_returns_parse_error_response() {
     let mut child = spawn_server().spawn().expect("Failed to spawn");
 

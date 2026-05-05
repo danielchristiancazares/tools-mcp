@@ -57,6 +57,33 @@ fn classify_webfetch_error(
 ) -> (String, &'static str, Vec<String>) {
     let lower = details.to_ascii_lowercase();
 
+    if lower.contains("robots.txt") && (lower.contains("disallow") || lower.contains("disallowed"))
+    {
+        return (
+            "WebFetch is blocked by robots.txt for this URL (the tool respects robots.txt).".to_string(),
+            "robots_disallowed",
+            vec![
+                "Choose a different URL that is allowed by robots.txt, or use an official API/source.".to_string(),
+                "If you already have the relevant text, paste/supply it directly instead of fetching.".to_string(),
+            ],
+        );
+    }
+
+    if lower.contains("robots.txt")
+        && (lower.contains("unavailable") || lower.contains("unreachable"))
+    {
+        return (
+            "WebFetch could not verify robots.txt for this URL, so it refused to fetch it."
+                .to_string(),
+            "robots_unavailable",
+            vec![
+                "Retry later; the site's robots.txt endpoint may be temporarily unavailable."
+                    .to_string(),
+                "Use an official API/source or provide the text directly if available.".to_string(),
+            ],
+        );
+    }
+
     if lower.contains("ssrf validation failed")
         || lower.contains("cannot fetch from localhost")
         || lower.contains("private ip")
@@ -69,18 +96,6 @@ fn classify_webfetch_error(
             vec![
                 "Use a public http/https URL (not file://, localhost, or a private IP).".to_string(),
                 "If you need local content, read files from disk with Read instead of WebFetch.".to_string(),
-            ],
-        );
-    }
-
-    if lower.contains("robots.txt") && (lower.contains("disallow") || lower.contains("disallowed"))
-    {
-        return (
-            "WebFetch is blocked by robots.txt for this URL (the tool respects robots.txt).".to_string(),
-            "robots_disallowed",
-            vec![
-                "Choose a different URL that is allowed by robots.txt, or use an official API/source.".to_string(),
-                "If you already have the relevant text, paste/supply it directly instead of fetching.".to_string(),
             ],
         );
     }
@@ -163,3 +178,18 @@ fn classify_webfetch_error(
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_webfetch_error_reports_robots_unavailable() {
+        let (_message, error_type, remediation) = classify_webfetch_error(
+            "robots.txt unavailable with HTTP status 503 Service Unavailable; refusing to fetch https://example.com/",
+            false,
+        );
+
+        assert_eq!(error_type, "robots_unavailable");
+        assert!(!remediation.is_empty());
+    }
+}

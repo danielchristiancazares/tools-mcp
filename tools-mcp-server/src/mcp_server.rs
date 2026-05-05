@@ -1,18 +1,134 @@
 //! MCP JSON-RPC routing and tool dispatch (inbound adapter).
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 use tools_mcp_core::{RpcError, RpcResponse, ToolDef, ToolRegistry};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct RpcRequest {
-    #[serde(rename = "jsonrpc")]
-    pub _jsonrpc: String,
     pub id: Option<Value>,
+    pub is_notification: bool,
     pub method: String,
-    #[serde(default)]
     pub params: Value,
+}
+
+#[derive(Debug)]
+pub enum ParseRpcRequestError {
+    Parse(serde_json::Error),
+    InvalidRequest { id: Option<Value>, message: String },
+}
+
+#[derive(Debug)]
+pub enum RpcMessage {
+    Request(RpcRequest),
+    Response,
+    Batch(Vec<RpcBatchItem>),
+}
+
+#[derive(Debug)]
+pub enum RpcBatchItem {
+    Request(RpcRequest),
+    Response,
+    InvalidRequest { id: Option<Value>, message: String },
+}
+
+pub fn parse_rpc_message(input: &str) -> Result<RpcMessage, ParseRpcRequestError> {
+    let value: Value = serde_json::from_str(input).map_err(ParseRpcRequestError::Parse)?;
+    match value {
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err(ParseRpcRequestError::InvalidRequest {
+                    id: None,
+                    message: "Invalid Request: batch must contain at least one message".into(),
+                });
+            }
+
+            let mut batch = Vec::with_capacity(items.len());
+            for item in items {
+                if is_rpc_response_value(&item) {
+                    batch.push(RpcBatchItem::Response);
+                    continue;
+                }
+
+                match parse_rpc_request_value(item) {
+                    Ok(req) => batch.push(RpcBatchItem::Request(req)),
+                    Err(ParseRpcRequestError::InvalidRequest { id, message }) => {
+                        batch.push(RpcBatchItem::InvalidRequest { id, message });
+                    }
+                    Err(ParseRpcRequestError::Parse(_)) => unreachable!(
+                        "batch items are already parsed JSON values, so parse errors are impossible"
+                    ),
+                }
+            }
+
+            Ok(RpcMessage::Batch(batch))
+        }
+        value if is_rpc_response_value(&value) => Ok(RpcMessage::Response),
+        value => parse_rpc_request_value(value).map(RpcMessage::Request),
+    }
+}
+
+fn parse_rpc_request_value(value: Value) -> Result<RpcRequest, ParseRpcRequestError> {
+    let Some(obj) = value.as_object() else {
+        return Err(ParseRpcRequestError::InvalidRequest {
+            id: None,
+            message: "Invalid Request: request must be a JSON object".into(),
+        });
+    };
+
+    let id = match extract_request_id(obj.get("id")) {
+        Ok(id) => id,
+        Err(()) => {
+            return Err(ParseRpcRequestError::InvalidRequest {
+                id: None,
+                message: "Invalid Request: id must be a string, number, null, or omitted".into(),
+            });
+        }
+    };
+
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(ParseRpcRequestError::InvalidRequest {
+            id,
+            message: "Invalid Request: jsonrpc must be \"2.0\"".into(),
+        });
+    }
+
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        return Err(ParseRpcRequestError::InvalidRequest {
+            id,
+            message: "Invalid Request: method must be a string".into(),
+        });
+    };
+
+    Ok(RpcRequest {
+        id,
+        is_notification: !obj.contains_key("id"),
+        method: method.to_string(),
+        params: obj
+            .get("params")
+            .cloned()
+            .unwrap_or(Value::Object(Map::new())),
+    })
+}
+
+fn is_rpc_response_value(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && !obj.contains_key("method")
+        && (obj.contains_key("result") ^ obj.contains_key("error"))
+        && obj.contains_key("id")
+        && extract_request_id(obj.get("id")).is_ok()
+}
+
+fn extract_request_id(id: Option<&Value>) -> Result<Option<Value>, ()> {
+    match id {
+        None => Ok(None),
+        Some(Value::Null | Value::String(_) | Value::Number(_)) => Ok(id.cloned()),
+        Some(_) => Err(()),
+    }
 }
 
 #[derive(Serialize)]
@@ -48,7 +164,7 @@ pub async fn dispatch_jsonrpc_request(
     registry: &ToolRegistry,
     tools: &[ToolDef],
 ) -> Option<(RpcResponse, bool)> {
-    if req.id.is_none() {
+    if req.is_notification {
         match req.method.as_str() {
             "notifications/initialized" | "initialized" => {
                 tracing::info!("Received initialized notification");
@@ -118,17 +234,36 @@ pub async fn dispatch_jsonrpc_request(
 
         "mcp/tools/call" | "tools/call" | "server/tools/call" => {
             let params = &req.params;
-            let name = params
+            let Some(params_obj) = params.as_object() else {
+                return Some((
+                    RpcResponse::protocol_error(
+                        req.id,
+                        -32602,
+                        "Invalid params: tools/call params must be an object",
+                    ),
+                    false,
+                ));
+            };
+            let name = params_obj
                 .get("name")
                 .and_then(|v| v.as_str())
-                .or_else(|| params.get("toolName").and_then(|v| v.as_str()))
+                .or_else(|| params_obj.get("toolName").and_then(|v| v.as_str()))
                 .or_else(|| {
-                    params
+                    params_obj
                         .get("call")
                         .and_then(|c| c.get("name"))
                         .and_then(|v| v.as_str())
-                })
-                .unwrap_or("");
+                });
+            let Some(name) = name.filter(|name| !name.is_empty()) else {
+                return Some((
+                    RpcResponse::protocol_error(
+                        req.id,
+                        -32602,
+                        "Invalid params: tools/call requires a non-empty tool name",
+                    ),
+                    false,
+                ));
+            };
 
             let args = params
                 .get("arguments")
@@ -170,4 +305,35 @@ pub async fn dispatch_jsonrpc_request(
     };
 
     Some(out)
+}
+
+pub async fn dispatch_jsonrpc_batch(
+    items: Vec<RpcBatchItem>,
+    registry: &ToolRegistry,
+    tools: &[ToolDef],
+) -> Option<(Vec<RpcResponse>, bool)> {
+    let mut responses = Vec::new();
+    let mut should_exit = false;
+
+    for item in items {
+        match item {
+            RpcBatchItem::Request(req) => {
+                if let Some((response, exit)) = dispatch_jsonrpc_request(req, registry, tools).await
+                {
+                    responses.push(response);
+                    should_exit |= exit;
+                }
+            }
+            RpcBatchItem::Response => {}
+            RpcBatchItem::InvalidRequest { id, message } => {
+                responses.push(RpcResponse::protocol_error(id, -32600, message));
+            }
+        }
+    }
+
+    if responses.is_empty() {
+        None
+    } else {
+        Some((responses, should_exit))
+    }
 }

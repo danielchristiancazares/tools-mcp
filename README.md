@@ -37,7 +37,7 @@
 - **CodeQuery** - One-shot helper that optionally auto-discovers and reindexes local files, then runs a semantic search query against an OpenAI vector store.
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
 - **Search** - Fast local regex search via ugrep with both line-oriented output and structured match records.
-- **Read** - Line-numbered file reader (optionally a line range) for quick inspection.
+- **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
 - **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
 - **GitStatus / GitDiff / GitRestore** - Local Git status/diff/restore helpers with timeout and output truncation.
@@ -57,10 +57,10 @@
 
 ### Requirements
 
-- Rust toolchain (edition 2024; tested with latest stable).
+- Rust toolchain 1.94 or newer (edition 2024).
 - Cargo in PATH (for running the MCP binary).
 - `ugrep` in PATH (required for `Search`).
-- Git in PATH (required for `GitStatus`, `GitDiff`, and `GitRestore`).
+- Git in PATH (required for all `Git*` tools).
 - **OpenAI**
   - `OPENAI_API_KEY` with access to the Assistants / Vector Store APIs (required for `CodeQuery` and other OpenAI calls).
 - **WebFetch browser support** (optional)
@@ -903,7 +903,7 @@ Fetch and normalize external web content with caching and JS-aware rendering.
   - `force_browser` (boolean) – when true, forces headless browser rendering even if heuristics do not flag the page as JS-heavy.
 - **Behavior**:
   - Builds a hardened HTTP client, validates the URL against SSRF rules, and enforces `robots.txt`.
-  - Caches responses under `/tmp/tools-webfetch` keyed by URL + method.
+  - Caches responses under the system temp directory (`/tmp/tools-webfetch` on Unix, `%TEMP%\tools-webfetch` on Windows) keyed by URL + method.
   - Extracts readable content and produces Markdown.
   - Uses heuristics to detect JavaScript-heavy pages and, where possible, re-renders them via a headless Chrome/Chromium browser. Browser rendering is disabled by default unless the `WEBFETCH_ENABLE_BROWSER_UNSAFE=true` environment variable is set.
   - Splits content into token-aware chunks with headings.
@@ -967,6 +967,8 @@ Edit files by replacing a snippet, preserving original newline bytes and whitesp
   - `new_snippet` - replacement text (use LF newlines; file's original line endings are preserved).
 - **Optional**:
   - `match_hint` - `{ start_line, end_line }` to restrict the search range when multiple matches exist.
+  - `file_hash` - expected current file hash; stale hashes return `status: "stale_file"` without writing.
+  - `region_id` - caller-supplied region identifier echoed in successful edit metadata.
 - **Behavior**:
   - Searches for `old_snippet` in the file (within `match_hint` range if provided).
   - Replaces with `new_snippet` while preserving the file's dominant line ending style (LF, CRLF, or CR).
@@ -1339,7 +1341,10 @@ The server handles the following notifications (no response sent):
 
 | Code | Meaning |
 |------|---------|
+| -32700 | Parse error (invalid JSON or malformed Content-Length frame) |
+| -32600 | Invalid Request (malformed JSON-RPC envelope or invalid batch item) |
 | -32601 | Method not found / Unknown tool |
+| -32602 | Invalid params (for example, malformed `tools/call` parameters) |
 | -32603 | Internal error |
 
 ### Initialize Response
@@ -1483,7 +1488,7 @@ pub struct FetchChunk {
 | Cache | Path | Purpose |
 |-------|------|---------|
 | CodeQuery stores | `$HOME/.codex/mcp/stores.json` | Vector store ID mapping |
-| WebFetch content | `/tmp/tools-webfetch/` | HTTP response cache |
+| WebFetch content | System temp dir (`/tmp/tools-webfetch` on Unix, `%TEMP%\tools-webfetch` on Windows) | HTTP response cache |
 
 ### MCP Client Configuration Example
 
