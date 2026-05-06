@@ -1,5 +1,6 @@
 //! File reading handler implementation.
 
+use memchr::memchr2_iter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -178,24 +179,23 @@ fn for_each_line_with_endings(text: &str, mut visit: impl FnMut(usize, usize, us
     let mut line_count = 0;
     let mut line_start = 0;
     let bytes = text.as_bytes();
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let line_end = match bytes[i] {
-            b'\n' => Some(i + 1),
-            b'\r' if i + 1 < bytes.len() && bytes[i + 1] == b'\n' => Some(i + 2),
-            b'\r' => Some(i + 1),
-            _ => None,
+    for line_break in memchr2_iter(b'\n', b'\r', bytes) {
+        if line_break < line_start {
+            continue;
+        }
+
+        let line_end = if bytes[line_break] == b'\r'
+            && bytes.get(line_break + 1).is_some_and(|byte| *byte == b'\n')
+        {
+            line_break + 2
+        } else {
+            line_break + 1
         };
 
-        if let Some(line_end) = line_end {
-            line_count += 1;
-            visit(line_count, line_start, line_end);
-            line_start = line_end;
-            i = line_end;
-        } else {
-            i += 1;
-        }
+        line_count += 1;
+        visit(line_count, line_start, line_end);
+        line_start = line_end;
     }
 
     if line_start < bytes.len() {
@@ -228,6 +228,12 @@ mod tests {
     fn line_scanner_handles_mixed_newlines() {
         let lines = lines_with_endings("a\r\nb\nc\rd");
         assert_eq!(lines, vec!["a\r\n", "b\n", "c\r", "d"]);
+    }
+
+    #[test]
+    fn line_scanner_handles_crlf_without_counting_lf_twice() {
+        let lines = lines_with_endings("a\r\nb\r\nc\r\n");
+        assert_eq!(lines, vec!["a\r\n", "b\r\n", "c\r\n"]);
     }
 
     #[test]

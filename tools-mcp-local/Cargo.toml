@@ -10,6 +10,7 @@ doctest = false
 anyhow.workspace = true
 glob.workspace = true
 ignore.workspace = true
+memchr.workspace = true
 regex.workspace = true
 regex-syntax.workspace = true
 serde.workspace = true
