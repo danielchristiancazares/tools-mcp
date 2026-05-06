@@ -116,7 +116,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        let tools_slice: Vec<_> = tools.clone();
         let skip_headers = if message.has_headers {
             false
         } else {
@@ -126,7 +125,7 @@ async fn main() -> Result<()> {
         let should_exit = match message_kind {
             RpcMessage::Request(req) => {
                 let Some((resp, should_exit)) =
-                    dispatch_jsonrpc_request(req, &registry, &tools_slice).await
+                    dispatch_jsonrpc_request(req, &registry, &tools).await
                 else {
                     continue;
                 };
@@ -141,7 +140,7 @@ async fn main() -> Result<()> {
             }
             RpcMessage::Batch(items) => {
                 let Some((responses, should_exit)) =
-                    dispatch_jsonrpc_batch(items, &registry, &tools_slice).await
+                    dispatch_jsonrpc_batch(items, &registry, &tools).await
                 else {
                     continue;
                 };
