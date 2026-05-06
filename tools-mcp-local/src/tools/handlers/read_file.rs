@@ -1,6 +1,6 @@
 //! File reading handler implementation.
 
-use memchr::memchr2_iter;
+use memchr::memchr2;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -35,6 +35,21 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         return o;
     }
 
+    let start = req.start_line.unwrap_or(1);
+    if start == 0 {
+        return ToolCallOutcome::err("start_line must be >= 1");
+    }
+
+    if let Some(end) = req.end_line {
+        if end == 0 {
+            return ToolCallOutcome::err("end_line must be >= 1");
+        }
+
+        if start > end {
+            return ToolCallOutcome::err("start_line cannot be greater than end_line");
+        }
+    }
+
     let path = Path::new(&req.path);
     let data = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -58,9 +73,7 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         }
     };
 
-    let text = String::from_utf8_lossy(&data);
-
-    if text.is_empty() {
+    if data.is_empty() {
         let payload = json!({
             "content": [{"type": "text", "text": ""}],
             "isError": false,
@@ -72,23 +85,9 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         return ToolCallOutcome::ok(payload);
     }
 
-    let scan = scan_line_range(&text, req.start_line.unwrap_or(1), req.end_line);
+    let scan = scan_line_range(&data, start, req.end_line);
     let line_count = scan.total_lines;
-
-    let start = req.start_line.unwrap_or(1);
     let end = req.end_line.unwrap_or(line_count);
-
-    if start == 0 {
-        return ToolCallOutcome::err("start_line must be >= 1");
-    }
-
-    if end == 0 {
-        return ToolCallOutcome::err("end_line must be >= 1");
-    }
-
-    if start > end {
-        return ToolCallOutcome::err("start_line cannot be greater than end_line");
-    }
 
     if start > line_count {
         return ToolCallOutcome::err(format!(
@@ -103,11 +102,11 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         .expect("valid line range should have selected bytes");
 
     let body = if show_line_numbers {
-        render_numbered_range(&text, selected_range, start, resolved_end)
-    } else if selected_range.start == 0 && selected_range.end == text.len() {
-        text.into_owned()
+        render_numbered_range(&data, selected_range, start, resolved_end)
+    } else if selected_range.start == 0 && selected_range.end == data.len() {
+        bytes_to_string_lossy(data)
     } else {
-        text[selected_range].to_owned()
+        bytes_slice_to_string_lossy(&data[selected_range])
     };
 
     let payload = json!({
@@ -135,11 +134,11 @@ impl LineRangeScan {
     }
 }
 
-fn scan_line_range(text: &str, start_line: usize, end_line: Option<usize>) -> LineRangeScan {
+fn scan_line_range(bytes: &[u8], start_line: usize, end_line: Option<usize>) -> LineRangeScan {
     let mut selected_start = None;
     let mut selected_end = 0;
 
-    let total_lines = for_each_line_with_endings(text, |line_no, line_start, line_end| {
+    let total_lines = for_each_line_with_endings(bytes, |line_no, line_start, line_end| {
         if line_no >= start_line && end_line.is_none_or(|end_line| line_no <= end_line) {
             selected_start.get_or_insert(line_start);
             selected_end = line_end;
@@ -153,21 +152,32 @@ fn scan_line_range(text: &str, start_line: usize, end_line: Option<usize>) -> Li
     }
 }
 
+fn bytes_to_string_lossy(data: Vec<u8>) -> String {
+    match String::from_utf8(data) {
+        Ok(text) => text,
+        Err(err) => bytes_slice_to_string_lossy(&err.into_bytes()),
+    }
+}
+
+fn bytes_slice_to_string_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 fn render_numbered_range(
-    text: &str,
+    bytes: &[u8],
     selected_range: Range<usize>,
     start_line: usize,
     resolved_end: usize,
 ) -> String {
-    let selected_text = &text[selected_range];
+    let selected_bytes = &bytes[selected_range];
     let width = resolved_end.max(1).to_string().len();
     let line_count = resolved_end - start_line + 1;
     let prefix_capacity = line_count.saturating_mul(width + 1);
-    let mut body = String::with_capacity(selected_text.len().saturating_add(prefix_capacity));
+    let mut body = String::with_capacity(selected_bytes.len().saturating_add(prefix_capacity));
     let mut line_no = start_line;
 
-    for_each_line_with_endings(selected_text, |_, line_start, line_end| {
-        let line = &selected_text[line_start..line_end];
+    for_each_line_with_endings(selected_bytes, |_, line_start, line_end| {
+        let line = String::from_utf8_lossy(&selected_bytes[line_start..line_end]);
         let _ = write!(body, "{line_no:>width$}\t{line}");
         line_no += 1;
     });
@@ -175,16 +185,12 @@ fn render_numbered_range(
     body
 }
 
-fn for_each_line_with_endings(text: &str, mut visit: impl FnMut(usize, usize, usize)) -> usize {
+fn for_each_line_with_endings(bytes: &[u8], mut visit: impl FnMut(usize, usize, usize)) -> usize {
     let mut line_count = 0;
     let mut line_start = 0;
-    let bytes = text.as_bytes();
 
-    for line_break in memchr2_iter(b'\n', b'\r', bytes) {
-        if line_break < line_start {
-            continue;
-        }
-
+    while let Some(relative_break) = memchr2(b'\n', b'\r', &bytes[line_start..]) {
+        let line_break = line_start + relative_break;
         let line_end = if bytes[line_break] == b'\r'
             && bytes.get(line_break + 1).is_some_and(|byte| *byte == b'\n')
         {
@@ -212,10 +218,14 @@ mod tests {
 
     fn lines_with_endings(text: &str) -> Vec<&str> {
         let mut lines = Vec::new();
-        for_each_line_with_endings(text, |_, start, end| {
+        for_each_line_with_endings(text.as_bytes(), |_, start, end| {
             lines.push(&text[start..end]);
         });
         lines
+    }
+
+    fn content_text(outcome: &tools_mcp_core::ToolCallOutcome) -> &str {
+        outcome.0["content"][0]["text"].as_str().unwrap()
     }
 
     #[test]
@@ -238,12 +248,12 @@ mod tests {
 
     #[test]
     fn line_scanner_returns_empty_count_for_empty_input() {
-        assert_eq!(for_each_line_with_endings("", |_, _, _| {}), 0);
+        assert_eq!(for_each_line_with_endings(b"", |_, _, _| {}), 0);
     }
 
     #[test]
     fn scan_line_range_counts_all_lines_without_collecting_them() {
-        let scan = scan_line_range("a\nb\nc\nd\n", 2, Some(3));
+        let scan = scan_line_range(b"a\nb\nc\nd\n", 2, Some(3));
         assert_eq!(
             scan,
             LineRangeScan {
@@ -319,6 +329,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_start_line_zero_is_validated_before_file_read() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("missing.txt");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 0,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(content_text(&outcome), "start_line must be >= 1");
+    }
+
+    #[tokio::test]
+    async fn read_file_end_line_zero_is_validated_before_file_read() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("missing.txt");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "end_line": 0,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(content_text(&outcome), "end_line must be >= 1");
+    }
+
+    #[tokio::test]
+    async fn read_file_start_greater_than_end_is_validated_before_file_read() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("missing.txt");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 3,
+            "end_line": 2,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(
+            content_text(&outcome),
+            "start_line cannot be greater than end_line"
+        );
+    }
+
+    #[tokio::test]
     async fn read_file_range_preserves_mixed_newline_endings() {
         use tempfile::tempdir;
 
@@ -339,6 +407,50 @@ mod tests {
         assert_eq!(outcome.0["start_line"], 2);
         assert_eq!(outcome.0["end_line"], 3);
         assert_eq!(outcome.0["total_lines"], 4);
+    }
+
+    #[tokio::test]
+    async fn read_file_range_preserves_invalid_utf8_lossy_replacement() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("invalid-utf8.txt");
+        std::fs::write(&path, b"valid\n\xFFbad\nlast\n").expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 2,
+            "end_line": 2,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(!outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(content_text(&outcome), "\u{FFFD}bad\n");
+        assert_eq!(outcome.0["start_line"], 2);
+        assert_eq!(outcome.0["end_line"], 2);
+        assert_eq!(outcome.0["total_lines"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_file_full_file_preserves_invalid_utf8_lossy_replacement() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("invalid-full-utf8.txt");
+        std::fs::write(&path, b"valid\n\xFFbad\nlast\n").expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(!outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(content_text(&outcome), "valid\n\u{FFFD}bad\nlast\n");
+        assert_eq!(outcome.0["start_line"], 1);
+        assert_eq!(outcome.0["end_line"], 3);
+        assert_eq!(outcome.0["total_lines"], 3);
     }
 
     #[tokio::test]
