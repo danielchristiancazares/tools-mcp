@@ -805,7 +805,7 @@ Run `git status` (porcelain by default).
   - `branch` (boolean, default `true`) - include branch header (`-b`) in porcelain mode.
   - `untracked` (boolean, default `true`) - include untracked files in porcelain mode (when false, uses `-uno`).
 - **Response**:
-  - `content[0].text` - porcelain output (or `clean` if there are no changes).
+  - `content[0].text` - same as command output (trimmed trailing newlines); use `clean` when you only need a boolean working-tree summary.
   - Includes `stdout`, `stderr`, `exit_code`, `timed_out`, `clean`, and the executed `args`.
 
 ### GitDiff

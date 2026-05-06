@@ -94,11 +94,7 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
         false
     };
     let text = if exec.success {
-        if clean {
-            "clean".to_string()
-        } else {
-            exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-        }
+        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
     } else if !exec.stderr.trim().is_empty() {
         exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
     } else {
@@ -192,12 +188,14 @@ mod tests {
 
         assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
         assert_eq!(outcome.0["clean"], true);
-        assert_eq!(outcome.0["content"][0]["text"], "clean");
+        let stdout = outcome.0["stdout"].as_str().expect("stdout");
+        let text = outcome.0["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        assert_eq!(text, stdout.trim_end_matches(&['\r', '\n'][..]));
         assert!(
-            outcome.0["stdout"]
-                .as_str()
-                .expect("stdout")
-                .starts_with("##")
+            stdout.starts_with("##"),
+            "expected branch line in porcelain stdout"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -231,7 +229,15 @@ mod tests {
 
         assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
         assert_eq!(outcome.0["clean"], true);
-        assert_eq!(outcome.0["content"][0]["text"], "clean");
+        let stdout = outcome.0["stdout"].as_str().expect("stdout");
+        let text = outcome.0["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        assert_eq!(text, stdout.trim_end_matches(&['\r', '\n'][..]));
+        assert!(
+            !text.is_empty(),
+            "expected human-readable git status output, got empty text"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
