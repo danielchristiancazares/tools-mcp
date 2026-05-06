@@ -25,7 +25,6 @@
 
 ### Key Capabilities
 
-- **Semantic Code Search**: Index and query codebases using OpenAI's vector stores API
 - **Web Content Fetching**: Retrieve and process web pages with SSRF protection and robots.txt compliance
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
 - **Git Integration**: Execute git commands (status, diff, restore, add, commit)
@@ -34,7 +33,6 @@
 
 ### Highlights
 
-- **CodeQuery** - One-shot helper that optionally auto-discovers and reindexes local files, then runs a semantic search query against an OpenAI vector store.
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
 - **Search** - Fast local regex search via ugrep with both line-oriented output and structured match records.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
@@ -61,8 +59,6 @@
 - Cargo in PATH (for running the MCP binary).
 - `ugrep` in PATH (required for `Search`).
 - Git in PATH (required for all `Git*` tools).
-- **OpenAI**
-  - `OPENAI_API_KEY` with access to the Assistants / Vector Store APIs (required for `CodeQuery` and other OpenAI calls).
 - **WebFetch browser support** (optional)
   - Chrome or Chromium installed and discoverable on PATH to enable headless rendering of JavaScript-heavy sites. Without it, WebFetch still works in HTTP-only mode.
 
@@ -76,8 +72,7 @@ cd tools-mcp
 # Build the workspace
 cargo build --workspace --release
 
-# Run the MCP server (OpenAI only)
-export OPENAI_API_KEY="sk-..."
+# Run the MCP server
 cargo run -p tools-mcp-server --release
 ```
 
@@ -89,7 +84,6 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 
 | Task | Tool |
 |------|------|
-| Semantic code search | CodeQuery |
 | Find code by pattern/regex | Search |
 | Fetch web content | WebFetch |
 | Read file contents | Read |
@@ -122,18 +116,18 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 
 ```
 +------------------+     +-------------------+     +-------------------+
-|   MCP Client     |     |   tools           |     |   External APIs   |
-|   (Codex Agent)  |<--->|   (JSON-RPC 2.0)  |<--->|   (OpenAI, Web)   |
+|   MCP Client     |     |   tools           |     |   External Web    |
+|   (Codex Agent)  |<--->|   (JSON-RPC 2.0)  |<--->|                   |
 +------------------+     +-------------------+     +-------------------+
         |                        |
         v                        v
    stdin/stdout           +------+------+------+------+
                           |      |      |      |      |
-                     WebFetch CodeQuery Git  Search   Edit
-                          |      |      |      |      |
-                    +-----+------+------+------+------+
-                    | HTTP/Browser | OpenAI API | Local FS |
-                    +--------------+------------+---------+
+                     WebFetch     Git  Search   Edit
+                          |        |      |      |
+                     +-----+------+------+------+------+
+                     | HTTP/Browser |      Local FS       |
+                     +--------------+---------------------+
 ```
 
 ### Module Organization
@@ -141,8 +135,6 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 ```text
 tools-mcp-server/        # Binary crate: stdin/stdout loop, routing, composition
 tools-mcp-core/          # Shared MCP/runtime support and tool registry
-openai-file-search-core/ # OpenAI/vector-store client library
-tools-mcp-codequery/     # CodeQuery tool, cache, OpenAI integration adapter
 tools-mcp-webfetch/      # WebFetch tool and fetch pipeline
 tools-mcp-local/         # Read/Edit/Write/Delete/Glob/Search/Outline/Pwsh and smart_file_edit
 tools-mcp-git/           # Git tool implementations
@@ -205,193 +197,6 @@ Supported method aliases for broad client compatibility:
 | Tools List | `mcp/tools/list`, `tools/list`, `server/tools/list`, `mcp/capabilities`, `capabilities` |
 | Tool Call | `mcp/tools/call`, `tools/call`, `server/tools/call` |
 | Shutdown | `mcp/shutdown`, `shutdown`, `server/shutdown` |
-
----
-
-### lib.rs - OpenAI API Client
-
-**Location**: `openai-file-search-core/src/lib.rs`
-**Library Name**: `openai_file_search_core`
-
-Provides the core functionality for interacting with OpenAI's vector stores and file search APIs.
-
-#### Configuration
-
-```rust
-/// API configuration for OpenAI operations
-pub struct ApiConfig {
-    pub api_key: String,
-    pub default_model: String,  // e.g., "gpt-4o"
-}
-```
-
-#### File Operations
-
-**File Upload**
-
-```rust
-/// Uploads a file to OpenAI's file storage
-///
-/// # Arguments
-/// * `client` - HTTP client
-/// * `cfg` - API configuration
-/// * `path_or_url` - Local path or HTTP(S) URL
-///
-/// # Returns
-/// File ID assigned by OpenAI (e.g., "file-abc123")
-///
-/// # File Format Handling
-/// - Allowed extensions: c, cpp, css, csv, doc, docx, gif, go, html, java,
-///   jpeg, jpg, js, json, md, pdf, php, pkl, png, pptx, py, rb, tar, tex,
-///   ts, txt, webp, xlsx, xml, zip
-/// - Unsupported extensions are converted to .txt
-pub async fn upload_file(client: &Client, cfg: &ApiConfig, path_or_url: &str) -> Result<String>
-```
-
-**Batch Upload**
-
-```rust
-/// Uploads multiple files with concurrency control
-///
-/// # Returns
-/// Tuple of (successes, failures) where each is a Vec of (path, id/error)
-pub async fn upload_files_batch(
-    client: &Client,
-    cfg: &ApiConfig,
-    file_paths: Vec<String>,
-    vector_store_id: &str,
-    concurrent_limit: usize,
-) -> Result<(Vec<(String, String)>, Vec<(String, String)>)>
-```
-
-#### Vector Store Management
-
-```rust
-/// Creates a new vector store
-pub async fn create_vector_store(client: &Client, cfg: &ApiConfig, name: &str) -> Result<String>
-
-/// Lists all vector stores
-pub async fn list_vector_stores(client: &Client, cfg: &ApiConfig) -> Result<Vec<VectorStoreEntry>>
-
-/// Gets vector store details including file counts
-pub async fn get_vector_store_details(
-    client: &Client, cfg: &ApiConfig, vs_id: &str
-) -> Result<VectorStoreDetails>
-
-/// Waits for all files in a vector store to finish indexing
-pub async fn wait_for_vector_store_ready(
-    client: &Client, cfg: &ApiConfig, vs_id: &str,
-    poll_ms: u64, timeout_ms: u64
-) -> Result<()>
-```
-
-#### Semantic Search
-
-```rust
-/// Executes a semantic search query against a vector store
-///
-/// # Arguments
-/// * `model` - Model to use (e.g., "gpt-4o")
-/// * `query` - Natural language search query
-/// * `vector_store_id` - Target vector store ID
-/// * `max_num_results` - Optional limit on returned results
-/// * `include_results` - Include raw search results in response
-pub async fn responses_with_file_search(
-    client: &Client, cfg: &ApiConfig, model: &str, query: &str,
-    vector_store_id: &str, max_num_results: Option<u32>, include_results: bool,
-) -> Result<serde_json::Value>
-```
-
-#### File Reindexing
-
-```rust
-/// Reindexes files based on content hashes
-///
-/// This function implements incremental indexing:
-/// 1. Lists existing files in vector store with their hashes
-/// 2. Computes hashes for local files
-/// 3. Uploads changed/new files with path and hash attributes
-/// 4. Deletes files that no longer exist locally (orphan cleanup)
-///
-/// # Attributes Stored
-/// - `path`: Full file path for matching
-/// - `hash`: SHA-256 content hash for change detection
-/// - `indexed_at`: ISO 8601 timestamp
-pub async fn reindex_files(
-    client: &Client, cfg: &ApiConfig, vector_store_id: &str,
-    file_paths: &[String], concurrent_limit: usize, skip_per_file_wait: bool,
-) -> Result<serde_json::Value>
-```
-
-#### CodeQuery Options
-
-```rust
-/// Configuration for CodeQuery operations
-pub struct CodeQueryOptions<'a> {
-    pub concurrent_limit: usize,      // Max concurrent uploads (1-20)
-    pub timeout_ms: u64,              // Indexing timeout
-    pub model: Option<&'a str>,       // Override default model
-    pub max_num_results: Option<u32>, // Limit search results
-    pub include_results: bool,        // Include raw results in response
-}
-```
-
----
-
-### codequery/mod.rs - Semantic Code Search
-
-**Location**: `tools-mcp-codequery/src/tool_handler.rs`
-
-Orchestrates semantic code search by combining file indexing with OpenAI's vector store queries.
-
-#### Handler Function
-
-```rust
-/// Handles CodeQuery tool invocations
-///
-/// # Flow
-/// 1. Validates API key and parameters
-/// 2. Resolves vector store (by ID, name, or auto-creates from directory name)
-/// 3. Auto-discovers indexable files if none provided
-/// 4. Filters out binary and non-code files
-/// 5. Reindexes changed files using hash-based comparison
-/// 6. Waits for indexing to complete
-/// 7. Executes semantic search query
-///
-/// # File Discovery
-/// Uses `ignore` crate to walk directory tree respecting .gitignore rules
-///
-/// # Indexable Extensions
-/// rs, c, h, cpp, hpp, go, java, kt, kts, swift, py, rb, php, js, jsx, ts, tsx
-pub async fn handle_code_query(id: Option<Value>, args: Value) -> ToolCallOutcome
-```
-
-#### Skip Directories
-
-The following directories are automatically excluded from file discovery:
-- `.git`, `.hg`, `.svn` (version control)
-- `.idea`, `.vscode` (IDE)
-- `.venv`, `__pycache__`, `node_modules` (dependencies)
-- `target`, `dist`, `build`, `out` (build artifacts)
-- `coverage`, `tmp` (temporary)
-
----
-
-### codequery/cache.rs - Vector Store ID Caching
-
-**Location**: `tools-mcp-codequery/src/codequery_cache.rs`
-
-Provides disk-based caching for vector store IDs to avoid repeated API lookups.
-
-```rust
-/// Loads a cached vector store ID by name
-pub fn load_store_id_from_cache(name: &str) -> Option<String>
-
-/// Caches a vector store ID for future lookups
-pub fn cache_store_id(name: &str, id: &str)
-```
-
-**Cache Location**: `$HOME/.codex/mcp/stores.json`
 
 ---
 
@@ -806,89 +611,6 @@ pub async fn handle_outline(id: Option<Value>, args: Value) -> ToolCallOutcome
 ---
 
 ## MCP Tools
-
-### CodeQuery
-
-Index code and query an OpenAI vector store in a single call.
-
-- **Tool name**: `CodeQuery`
-- **Required**:
-  - `query` – natural-language question.
-- **Vector store selection**:
-  - `vector_store_id` – use an existing store by ID, or
-  - `vector_store_name` – use or create a store with this name, or
-  - omit both – default to the git top-level directory name plus a workspace fingerprint, such as `tools-mcp [1a2b3c4d]`. If the name cannot be inferred, the call returns an error.
-- **Optional**:
-  - `file_paths` (string[]) - explicit local file paths to sync before querying. If omitted, CodeQuery auto-discovers indexable files under the git top level when inside a repository, otherwise under the current directory (respecting `.gitignore`, skipping `target/`, `node_modules/`, VCS dirs, etc.). CodeQuery only indexes source code files; docs (e.g. `.md`), config (e.g. `.toml`/`.yaml`), and binary/media files (e.g. images/archives) are filtered out even if explicitly listed.
-  - `concurrent_limit` (integer, 1-20, default 5) - maximum concurrent upload/delete operations.
-  - `timeout_ms` (integer, ≥1000, default 60000) – overall indexing + query timeout in milliseconds.
-  - `model` (string) – override the default OpenAI model (defaults to `gpt-4o`).
-  - `max_num_results` (integer) – limit the number of vector search matches.
-  - `include_results` (boolean, default `false`) – when true, includes top search matches in the response text.
-- **Behavior**:
-  - Resolves or creates the target vector store.
-  - Hashes local files, uploads new/changed ones, and deletes removed ones (change-based reindexing).
-  - Waits for indexing, then calls the Responses API with a `file_search` tool to answer the query.
-- **Response**:
-  - `result` contains a `content` array:
-    - First item: natural-language answer text.
-    - Optional second item: JSON summary of the reindexing operations (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
-
-#### CodeQuery Architecture
-
-At a high level, CodeQuery is split across the feature crate `tools-mcp-codequery/` and the reusable OpenAI/vector-store client crate `openai-file-search-core/`.
-
-**Key modules**
-- `tools-mcp-server/src/main.rs`: composition root and stdin/stdout loop; JSON-RPC routing lives in `tools-mcp-server/src/mcp_server.rs`.
-- `tools-mcp-codequery/src/tool_handler.rs`: CodeQuery MCP handler (validation, defaults, file discovery, vector-store resolution, response shaping); delegates semantic search to `openai_file_search_core` via the feature crate's `CodeQueryEngine`.
-- `tools-mcp-codequery/src/codequery_cache.rs`: tiny on-disk cache mapping the resolved store lookup key to `vector_store_id` to avoid repeated list/create calls.
-- `openai-file-search-core/src/lib.rs`: public crate root and stable re-export surface for the reusable OpenAI/vector-store client.
-- `openai-file-search-core/src/files.rs`, `vector_stores.rs`, `responses.rs`, `reindex.rs`: implementation modules for uploads, vector stores, Responses API calls, and change-based reindexing.
-
-**Data flow (single CodeQuery call)**
-```text
-MCP client
-  -> tools-mcp-server/src/mcp_server.rs (route tool)
-    -> tools-mcp-codequery/src/tool_handler.rs::handle_code_query (validate args, choose store, choose files)
-      -> openai-file-search-core/src/reindex.rs::code_query (sync files, then query with file_search)
-        -> openai-file-search-core/src/reindex.rs::reindex_with_retry / reindex_files (optional)
-        -> openai-file-search-core/src/vector_stores.rs::wait_for_vector_store_ready (poll once for batch indexing)
-        -> openai-file-search-core/src/responses.rs::responses_with_file_search (Responses API w/ file_search tool)
-      <- returns: answer text (+ optional JSON reindex summary)
-```
-
-**Vector store selection**
-- If `vector_store_id` is provided, CodeQuery uses it directly.
-- Otherwise, it uses `vector_store_name`:
-  - If omitted, it defaults to the git top-level directory name plus a workspace fingerprint (so same-named repos do not collide).
-  - It attempts to load an ID from `~/.codex/mcp/stores.json` (via `tools-mcp-codequery/src/codequery_cache.rs`).
-  - If not cached, it lists vector stores and matches by name; if no match exists, it creates a new vector store and caches its ID.
-  - Note: the cache path is based on `HOME` (so on Windows you may need `HOME` set for caching to work).
-
-**Local file discovery and filtering**
-- If `file_paths` is omitted/empty, CodeQuery walks the git top level recursively when inside a repository, otherwise the current directory, and collects indexable files.
-- It skips common "noise" directories (e.g., `.git/`, `node_modules/`, `target/`, `dist/`) and hidden directories.
-- It indexes:
-  - source code files with allowed extensions (see `openai-file-search-core/src/openai/file_ext.rs` `is_codequery_indexable_ext`).
-
-**Change-based reindexing algorithm**
-When `file_paths` is non-empty, `openai-file-search-core/src/reindex.rs::code_query` syncs local files into the chosen vector store before asking the question:
-- Lists current vector-store files and builds lookups by `attributes.path`, `attributes.hash`, and `filename` (for legacy entries).
-- Computes SHA-256 for each local file.
-- Decides actions:
-  - **skip** when the stored hash matches the local hash for the same path/filename.
-  - **upload** when new/changed, and includes `attributes = { path, hash, indexed_at }` for future comparisons.
-  - **delete** when files exist in the store but are no longer present locally (orphans), plus old versions of changed files.
-- Upload/attach operations are concurrency-limited (`concurrent_limit`) and wrapped in a small retry loop (`reindex_with_retry`) for transient errors.
-- Instead of waiting per-file, it does a single poll for vector-store readiness (`wait_for_vector_store_ready`) to keep the call latency reasonable.
-
-**Query execution**
-- After indexing is ready, CodeQuery uses the OpenAI Responses API and enables the `file_search` tool bound to the selected vector store.
-- The tool returns the assistant's answer text. If `include_results=true`, CodeQuery also includes top search matches in the extracted response text.
-
-**Response shape**
-- The MCP result always returns `content[0].text` as the assistant answer.
-- If reindexing ran, it also returns `content[1].text` containing a JSON "reindex summary" with uploaded/skipped/deleted/errors counts and entries (compact by default; set `TOOLS_PRETTY_JSON=true` to pretty-print).
 
 ### WebFetch
 
@@ -1383,73 +1105,6 @@ The server handles the following notifications (no response sent):
 
 ## Data Structures
 
-### OpenAI Response Types
-
-```rust
-/// OpenAI Responses API response object
-pub struct ResponseObject {
-    pub id: String,
-    pub object: String,
-    pub created_at: i64,
-    pub status: String,
-    pub model: String,
-    pub output: Vec<OutputItem>,
-    pub error: Option<Value>,
-    pub usage: Option<Value>,
-}
-
-/// Output item variants
-pub enum OutputItem {
-    Message(MessageOutput),
-    FileSearchCall(FileSearchOutput),
-    Other,
-}
-
-/// Message output with content
-pub struct MessageOutput {
-    pub id: String,
-    pub role: String,
-    pub status: String,
-    pub content: Vec<ContentItem>,
-}
-
-/// File search results
-pub struct FileSearchOutput {
-    pub id: String,
-    pub status: String,
-    pub queries: Option<Vec<String>>,
-    pub results: Option<Vec<Value>>,
-}
-```
-
-### Vector Store Types
-
-```rust
-/// Vector store with file counts
-pub struct VectorStoreDetails {
-    pub id: String,
-    pub file_counts: FileCounts,
-}
-
-pub struct FileCounts {
-    pub in_progress: u64,
-    pub completed: u64,
-    pub failed: u64,
-    pub cancelled: u64,
-    pub total: u64,
-}
-
-/// File metadata
-pub struct FileInfo {
-    pub id: String,
-    pub filename: Option<String>,
-    pub purpose: Option<String>,
-    pub bytes: Option<u64>,
-    pub created_at: Option<i64>,
-    pub attributes: Option<Map<String, Value>>,
-}
-```
-
 ### WebFetch Types
 
 ```rust
@@ -1488,7 +1143,6 @@ pub struct FetchChunk {
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| OPENAI_API_KEY | Optional (required for CodeQuery) | OpenAI API key for vector store operations |
 | MCP_SKIP_HEADERS | No | Set to "true" for raw JSON output (no Content-Length headers) |
 | RUST_LOG | No | Logging level (debug, info, warn, error) |
 | APP_VERSION | No | Version string exposed in server info |
@@ -1500,7 +1154,6 @@ pub struct FetchChunk {
 
 | Cache | Path | Purpose |
 |-------|------|---------|
-| CodeQuery stores | `$HOME/.codex/mcp/stores.json` | Vector store ID mapping |
 | WebFetch content | System temp dir (`/tmp/tools-webfetch` on Unix, `%TEMP%\tools-webfetch` on Windows) | HTTP response cache |
 
 ### MCP Client Configuration Example
@@ -1509,7 +1162,6 @@ pub struct FetchChunk {
 [mcp_servers.tools]
 command = "/path/to/tools-mcp/target/release/tools-mcp-server"
 env = {
-  OPENAI_API_KEY = "${OPENAI_API_KEY}",
   MCP_SKIP_HEADERS = "true",
   RUST_LOG = "error"
 }
@@ -1647,17 +1299,7 @@ Tool errors are returned in the MCP content format:
 1. **Validation Errors**: Invalid parameters, missing required fields
 2. **File Errors**: Not found, permission denied, already exists
 3. **Network Errors**: Connection failed, timeout, HTTP errors
-4. **API Errors**: OpenAI API failures, rate limiting
-5. **Process Errors**: Command spawn failed, timeout, non-zero exit
-
-### Retry Logic
-
-The `reindex_with_retry` function implements exponential backoff:
-
-- Max attempts: 3
-- Backoff delays: 200ms, 500ms, 1000ms
-- Jitter: cumulative (50ms, 100ms, 150ms per attempt)
-- Retries on: timeout, connection reset, 429/5xx errors
+4. **Process Errors**: Command spawn failed, timeout, non-zero exit
 
 ---
 
@@ -1751,7 +1393,6 @@ APP_VERSION="1.0.0" cargo build -p tools-mcp-server --release
 - Rust toolchain (2024 edition)
 
 **Optional**:
-- `OPENAI_API_KEY` environment variable (required only for CodeQuery tool)
 - Chrome/Chromium for browser rendering (WebFetch)
 - ugrep for Search tool (regex and fuzzy search)
 - Git for git tools

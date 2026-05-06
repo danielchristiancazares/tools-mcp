@@ -1,0 +1,4 @@
+interface:
+  display_name: "Security Audit"
+  short_description: "Audit security changes and control regressions"
+  default_prompt: "Use $security-audit to audit this repository or change for concrete vulnerabilities, trust-boundary failures, or regressions in protections and security-visible behavior."

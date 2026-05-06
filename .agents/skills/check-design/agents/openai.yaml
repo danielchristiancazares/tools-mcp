@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check Design"
+  short_description: "Audit code for design drift and behavior risk"
+  default_prompt: "Use $check-design to audit the staged diff for docs/IFA.md and repo-rule violations, and tell me whether external behavior is preserved, intentionally changed, or unclear."

@@ -1,13 +1,11 @@
 # Repository Guidelines
 
 ## Project Overview
-Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for code search (OpenAI vector stores), web fetching, git operations, and newline-safe file editing.
+Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for local code search, web fetching, git operations, and newline-safe file editing.
 
 ## Project Structure
 - `tools-mcp-server/` — binary crate with stdin/stdout loop, JSON-RPC routing, and feature-crate composition.
 - `tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process`, `text`, config).
-- `openai-file-search-core/` — OpenAI/vector-store client library.
-- `tools-mcp-codequery/` — CodeQuery tool and vector-store cache/orchestration.
 - `tools-mcp-webfetch/` — WebFetch pipeline and tool registration.
 - `tools-mcp-local/` — local file/search/edit tools, including `smart_file_edit`.
 - `tools-mcp-git/` — git tool implementations.
@@ -21,14 +19,13 @@ Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with too
 - `cargo fmt --all` / `cargo clippy --workspace --all-targets` — format/lint.
 
 Env vars:
-- `OPENAI_API_KEY` — required for OpenAI-backed tools.
 - `MCP_SKIP_HEADERS=true` — no `Content-Length` framing.
 - `RUST_LOG=debug` — verbose logs.
 - `APP_VERSION=...` - baked into init responses.
 
 ## Style & Testing
 - Keep changes `cargo fmt`-clean; follow standard Rust naming (`snake_case`, `CamelCase`).
-- Keep network/OpenAI tests ignored by default; run with `OPENAI_API_KEY` via `cargo test --workspace -- --ignored`.
+- Keep network-dependent tests ignored by default.
 - If you change tool schemas or response shapes, update `README.md` and `tools-mcp-server/tests/integration_test.rs`.
 
 ## Commits & Pull Requests
@@ -53,6 +50,6 @@ echo '{"jsonrpc":"2.0","id":1,"method":"mcp/tools/call","params":{"name":"ping",
 
 ### Testing caveats
 - `cargo test --workspace` runs all non-ignored tests across the workspace. No external services required.
-- Tests tagged `#[ignore]` need `OPENAI_API_KEY`; run with `cargo test --workspace -- --ignored`.
+- Tests tagged `#[ignore]` may require network access or host-specific configuration; run with `cargo test --workspace -- --ignored` only when those prerequisites are available.
 - The `Search` tool uses **ugrep** (not ripgrep) as its backend; some integration tests exercise it.
 - The app integration tests spawn the compiled `tools-mcp-server` binary via Cargo's `CARGO_BIN_EXE_...` support.

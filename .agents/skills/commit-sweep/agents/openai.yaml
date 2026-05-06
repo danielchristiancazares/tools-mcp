@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit Sweep"
+  short_description: "Split worktree into bisect-friendly commits"
+  default_prompt: "Use $commit-sweep to turn the full current worktree into atomic, bisect-friendly commits, isolating observable behavior changes from refactors where possible."

@@ -10,7 +10,6 @@ pub fn build_tool_registry() -> ToolRegistry {
     registry.register::<crate::gemini_gate::GeminiGateTool>();
     tools_mcp_webfetch::register_tools(&mut registry);
     tools_mcp_local::register_tools(&mut registry);
-    tools_mcp_codequery::register_tools(&mut registry);
     tools_mcp_git::register_tools(&mut registry);
 
     registry

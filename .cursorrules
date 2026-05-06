@@ -39,10 +39,10 @@ Importance Score: 75
 - Dynamic rendering strategy selection
 Importance Score: 70
 
-5. Code Search Vector Management (`src/codequery/mod.rs`)
-- Semantic code search orchestration
-- Change-based reindexing system
-- Incremental update processing
+5. Local Code Search (`tools-mcp-local/src/tools/handlers/ripgrep.rs`)
+- Regex search orchestration over local files
+- ugrep-backed line and structured match output
+- Pattern and path validation
 Importance Score: 65
 
 ## Architecture Integration

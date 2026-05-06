@@ -1,0 +1,4 @@
+interface:
+  display_name: "Blueprint"
+  short_description: "Draft regression-aware Hauberk implementation plans"
+  default_prompt: "Use $blueprint to draft a detailed implementation plan artifact for this Hauberk change, including preserved behavior, intentional deltas, and concrete regression ratchets."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check Docs"
+  short_description: "Audit docs for code and behavior drift"
+  default_prompt: "Use $check-docs to do a read-only sweep of docs/ and the crate READMEs, checking both reference accuracy and whether documented behavior still matches the live code."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check Regressions"
+  short_description: "Audit behavior-preserving changes for regressions"
+  default_prompt: "Use $check-regressions to build baseline and proposed behavior contracts, freeze an initial set of atomic candidate regression claims per observation surface, and never batch multiple claims into one disprover. Spawn one dedicated disprover agent per claim whose sole job is to refute that claim by tracing code paths. Retry once with a fresh disprover on no result or invalid tracing, require a fresh disprover after narrowing, carry unresolved claims forward, and return the full report sections and verdict rules exactly as defined in the skill, including candidate claims, disproved concerns, unresolved claims, surviving risks, intentional changes, coverage gaps, and verdict."

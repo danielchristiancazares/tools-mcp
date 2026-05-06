@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "tools-mcp-server",
-    "openai-file-search-core",
-    "tools-mcp-codequery",
     "tools-mcp-core",
     "tools-mcp-git",
     "tools-mcp-local",

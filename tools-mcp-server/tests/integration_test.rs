@@ -61,8 +61,8 @@ fn test_tools_list() {
     let tools = response["result"]["tools"].as_array().unwrap();
     // Tool inventory can grow over time; assert a minimum and validate key tools exist.
     assert!(
-        tools.len() >= 18,
-        "expected at least 18 tools, got {}",
+        tools.len() >= 17,
+        "expected at least 17 tools, got {}",
         tools.len()
     );
 
@@ -73,7 +73,7 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"GeminiGate"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
-    assert!(tool_names.contains(&"CodeQuery"));
+    assert!(!tool_names.contains(&"CodeQuery"));
     assert!(tool_names.contains(&"Read"));
     assert!(tool_names.contains(&"Edit"));
     assert!(tool_names.contains(&"GitStatus"));
@@ -765,76 +765,6 @@ fn test_protocol_aliases() {
 }
 
 #[test]
-fn test_code_query_requires_api_key() {
-    // Spawn process WITHOUT OPENAI_API_KEY in environment
-    let mut command = spawn_server();
-    command.env_remove("OPENAI_API_KEY");
-    let mut child = command.spawn().expect("Failed to spawn");
-
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 30,
-        "method": "mcp/tools/call",
-        "params": {
-            "name": "CodeQuery",
-            "arguments": {
-                "vector_store_name": "test-store",
-                "query": "How does this work?"
-            }
-        }
-    });
-
-    // Send message
-    let msg_str = request.to_string();
-    stdin.write_all(msg_str.as_bytes()).unwrap();
-    stdin.write_all(b"\n").unwrap();
-    stdin.flush().unwrap();
-    drop(stdin);
-
-    // Read response
-    let mut reader = BufReader::new(stdout);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).unwrap();
-        if bytes_read == 0 {
-            break;
-        }
-        if line.starts_with("Content-Length:") || line.trim().is_empty() {
-            continue;
-        }
-        response = line;
-        break;
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let json_response: Value = serde_json::from_str(&response).expect("Failed to parse response");
-
-    assert_eq!(json_response["jsonrpc"], "2.0");
-    assert_eq!(json_response["id"], 30);
-
-    let text = json_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("missing CodeQuery error text");
-    assert!(
-        text.contains("OPENAI_API_KEY"),
-        "expected error to mention OPENAI_API_KEY, got: {text}"
-    );
-    assert_eq!(json_response["result"]["isError"].as_bool(), Some(true));
-
-    // Structured hints
-    assert_eq!(json_response["result"]["error_type"], "missing_env");
-    assert_eq!(json_response["result"]["env_var"], "OPENAI_API_KEY");
-    assert!(json_response["result"]["remediation"].is_array());
-}
-
-#[test]
 fn test_webfetch_blocks_localhost_ssrf() {
     let request = json!({
         "jsonrpc": "2.0",
@@ -864,57 +794,6 @@ fn test_webfetch_blocks_localhost_ssrf() {
     );
 
     assert_eq!(response["result"]["error_type"], "ssrf_blocked");
-}
-
-#[cfg(test)]
-mod api_tests {
-    use super::*;
-    use std::env;
-
-    fn skip_if_no_api_key() -> bool {
-        if env::var("OPENAI_API_KEY").is_err() {
-            eprintln!("Skipping API test: OPENAI_API_KEY not set");
-            return true;
-        }
-        false
-    }
-
-    #[test]
-    #[ignore = "requires OPENAI_API_KEY"]
-    fn test_code_query_with_api_key() {
-        if skip_if_no_api_key() {
-            return;
-        }
-
-        // Use CodeQuery with auto-discovery; it will create a vector store if needed.
-        let store_name = format!("test-code-query-{}", uuid::Uuid::new_v4());
-        let query_request = json!({
-            "jsonrpc": "2.0",
-            "id": 61,
-            "method": "mcp/tools/call",
-            "params": {
-                "name": "CodeQuery",
-                "arguments": {
-                    "vector_store_name": store_name,
-                    "query": "What is the main purpose of this codebase?",
-                    "file_paths": ["Cargo.toml"],
-                    "include_results": false
-                }
-            }
-        });
-
-        let query_response =
-            send_mcp_message(&query_request).expect("Failed to call CodeQuery with API key");
-        assert_eq!(query_response["jsonrpc"], "2.0");
-        assert_eq!(query_response["id"], 61);
-        assert_eq!(query_response["result"]["isError"], false);
-        assert!(
-            query_response["result"]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-            "CodeQuery response text should not be empty"
-        );
-    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brainstorm"
+  short_description: "Generate grounded Hauberk harness ideas"
+  default_prompt: "Use $brainstorm to generate tail-sampled architectural and capability ideas for Hauberk."

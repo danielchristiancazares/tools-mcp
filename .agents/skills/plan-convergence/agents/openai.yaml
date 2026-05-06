@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Convergence"
+  short_description: "Orchestrate multi-agent plan convergence"
+  default_prompt: "Use $plan-convergence to orchestrate a four-agent review of this design plan."
