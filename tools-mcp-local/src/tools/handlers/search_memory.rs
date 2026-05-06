@@ -13,7 +13,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tools_mcp_core::ToolCallOutcome;
@@ -549,20 +548,36 @@ fn warm_cache_for_root(root: String) -> Result<WarmCacheSummary, MemoryError> {
 }
 
 fn git_worktree_root_from(cwd: &Path) -> Option<PathBuf> {
-    let output = Command::new(git_bin())
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let root = stdout.trim();
-    (!root.is_empty()).then(|| PathBuf::from(root))
+    let start = fs::canonicalize(cwd).ok()?;
+    start
+        .ancestors()
+        .find(|dir| has_git_worktree_marker(dir))
+        .map(Path::to_path_buf)
 }
 
+fn has_git_worktree_marker(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    let Ok(metadata) = fs::metadata(&marker) else {
+        return false;
+    };
+
+    if metadata.is_dir() {
+        return true;
+    }
+
+    metadata.is_file() && fs::read(&marker).is_ok_and(|content| is_gitdir_file_marker(&content))
+}
+
+fn is_gitdir_file_marker(content: &[u8]) -> bool {
+    let content = content.strip_prefix(b"\xef\xbb\xbf").unwrap_or(content);
+    let first_non_whitespace = content
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(content.len());
+    content[first_non_whitespace..].starts_with(b"gitdir:")
+}
+
+#[cfg(test)]
 fn git_bin() -> &'static str {
     if cfg!(target_os = "windows") {
         "git.exe"
@@ -2754,6 +2769,57 @@ mod tests {
         assert!(Arc::ptr_eq(&first.snapshot, &second.snapshot));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_worktree_root_from_detects_parent_git_directory() {
+        let root = workspace_test_dir("git_worktree_root_from_detects_parent_git_directory");
+        let nested = root.join("nested").join("child");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".git")).expect("create git marker directory");
+        fs::create_dir_all(&nested).expect("create nested worktree directory");
+
+        let repo_root = git_worktree_root_from(&nested).expect("git repo root");
+
+        assert_eq!(repo_root, fs::canonicalize(&root).expect("canonical root"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_worktree_root_from_detects_gitdir_file_marker() {
+        let root = workspace_test_dir("git_worktree_root_from_detects_gitdir_file_marker");
+        let nested = root.join("nested");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&nested).expect("create nested worktree directory");
+        fs::write(root.join(".git"), "gitdir: ../actual-git-dir\n").expect("write gitdir marker");
+
+        let repo_root = git_worktree_root_from(&nested).expect("git repo root");
+
+        assert_eq!(repo_root, fs::canonicalize(&root).expect("canonical root"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn has_git_worktree_marker_ignores_non_git_file_marker() {
+        let root = workspace_test_dir("has_git_worktree_marker_ignores_non_git_file_marker");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create directory");
+        fs::write(root.join(".git"), "not a gitdir marker\n").expect("write non-git marker");
+
+        assert!(!has_git_worktree_marker(&root));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_gitdir_file_marker_accepts_bom_whitespace_and_non_utf8_path() {
+        assert!(is_gitdir_file_marker(
+            b"\xef\xbb\xbf  gitdir: ../actual-git-dir\n"
+        ));
+        assert!(is_gitdir_file_marker(b"gitdir: \xff\n"));
+        assert!(!is_gitdir_file_marker(b"not gitdir: ../actual-git-dir\n"));
     }
 
     #[test]
