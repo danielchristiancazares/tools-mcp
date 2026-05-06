@@ -101,40 +101,9 @@ where
 
     // Parse headers or detect raw JSON
     loop {
-        let mut line_bytes = Vec::new();
-        let mut bytes_read = 0;
-
-        // Bounded read to prevent DoS from oversized lines without newlines.
-        // We read byte-by-byte from the BufReader, which is efficient due to buffering.
-        loop {
-            if bytes_read > MAX_MCP_MESSAGE_BYTES {
-                return Err(McpReadError {
-                    error: io::Error::new(
-                        ErrorKind::InvalidData,
-                        "message line exceeds maximum allowed size",
-                    ),
-                    response_has_headers: saw_headers || saw_non_empty_non_json_line,
-                    should_continue: false,
-                });
-            }
-
-            let mut b = [0u8; 1];
-            let n = reader.read(&mut b).await.map_err(|err| McpReadError {
-                error: err,
-                response_has_headers: saw_headers || saw_non_empty_non_json_line,
-                should_continue: false,
-            })?;
-
-            if n == 0 {
-                break;
-            }
-
-            bytes_read += n;
-            line_bytes.push(b[0]);
-            if b[0] == b'\n' {
-                break;
-            }
-        }
+        let line_bytes =
+            read_line_bytes_bounded(reader, saw_headers || saw_non_empty_non_json_line).await?;
+        let bytes_read = line_bytes.len();
 
         // Clean EOF - no more messages
         if bytes_read == 0 {
@@ -255,6 +224,54 @@ where
         body: message,
         has_headers: saw_headers,
     }))
+}
+
+async fn read_line_bytes_bounded<R>(
+    reader: &mut R,
+    response_has_headers: bool,
+) -> std::result::Result<Vec<u8>, McpReadError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    use std::io::ErrorKind;
+
+    let mut line_bytes = Vec::new();
+
+    loop {
+        let available = reader.fill_buf().await.map_err(|err| McpReadError {
+            error: err,
+            response_has_headers,
+            should_continue: false,
+        })?;
+
+        if available.is_empty() {
+            return Ok(line_bytes);
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+
+        if line_bytes.len().saturating_add(take) > MAX_MCP_MESSAGE_BYTES {
+            return Err(McpReadError {
+                error: io::Error::new(
+                    ErrorKind::InvalidData,
+                    "message line exceeds maximum allowed size",
+                ),
+                response_has_headers,
+                should_continue: false,
+            });
+        }
+
+        let reached_newline = available[take - 1] == b'\n';
+        line_bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if reached_newline {
+            return Ok(line_bytes);
+        }
+    }
 }
 
 /// Writes an MCP response to the output stream.
