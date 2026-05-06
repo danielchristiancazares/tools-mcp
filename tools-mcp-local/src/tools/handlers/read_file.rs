@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::path::Path;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::validation;
@@ -70,8 +71,8 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         return ToolCallOutcome::ok(payload);
     }
 
-    let lines = split_lines_with_endings(&text);
-    let line_count = lines.len();
+    let scan = scan_line_range(&text, req.start_line.unwrap_or(1), req.end_line);
+    let line_count = scan.total_lines;
 
     let start = req.start_line.unwrap_or(1);
     let end = req.end_line.unwrap_or(line_count);
@@ -95,26 +96,18 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
     }
 
     let resolved_end = end.min(line_count);
-    let width = resolved_end.max(1).to_string().len();
     let show_line_numbers = req.show_line_numbers.unwrap_or(false);
+    let selected_range = scan
+        .selected_range()
+        .expect("valid line range should have selected bytes");
 
-    let mut body = String::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let line_no = idx + 1;
-        if line_no < start {
-            continue;
-        }
-        if line_no > resolved_end {
-            break;
-        }
-
-        // Keep the file's original line endings from `split_lines_with_endings`.
-        if show_line_numbers {
-            let _ = write!(body, "{line_no:>width$}\t{line}");
-        } else {
-            body.push_str(line);
-        }
-    }
+    let body = if show_line_numbers {
+        render_numbered_range(&text, selected_range, start, resolved_end)
+    } else if selected_range.start == 0 && selected_range.end == text.len() {
+        text.into_owned()
+    } else {
+        text[selected_range].to_owned()
+    };
 
     let payload = json!({
         "content": [{"type": "text", "text": body}],
@@ -128,55 +121,132 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
     ToolCallOutcome::ok(payload)
 }
 
-fn split_lines_with_endings(text: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
-    let mut start = 0;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineRangeScan {
+    total_lines: usize,
+    selected_start: Option<usize>,
+    selected_end: usize,
+}
+
+impl LineRangeScan {
+    fn selected_range(&self) -> Option<Range<usize>> {
+        self.selected_start.map(|start| start..self.selected_end)
+    }
+}
+
+fn scan_line_range(text: &str, start_line: usize, end_line: Option<usize>) -> LineRangeScan {
+    let mut selected_start = None;
+    let mut selected_end = 0;
+
+    let total_lines = for_each_line_with_endings(text, |line_no, line_start, line_end| {
+        if line_no >= start_line && end_line.is_none_or(|end_line| line_no <= end_line) {
+            selected_start.get_or_insert(line_start);
+            selected_end = line_end;
+        }
+    });
+
+    LineRangeScan {
+        total_lines,
+        selected_start,
+        selected_end,
+    }
+}
+
+fn render_numbered_range(
+    text: &str,
+    selected_range: Range<usize>,
+    start_line: usize,
+    resolved_end: usize,
+) -> String {
+    let selected_text = &text[selected_range];
+    let width = resolved_end.max(1).to_string().len();
+    let line_count = resolved_end - start_line + 1;
+    let prefix_capacity = line_count.saturating_mul(width + 1);
+    let mut body = String::with_capacity(selected_text.len().saturating_add(prefix_capacity));
+    let mut line_no = start_line;
+
+    for_each_line_with_endings(selected_text, |_, line_start, line_end| {
+        let line = &selected_text[line_start..line_end];
+        let _ = write!(body, "{line_no:>width$}\t{line}");
+        line_no += 1;
+    });
+
+    body
+}
+
+fn for_each_line_with_endings(text: &str, mut visit: impl FnMut(usize, usize, usize)) -> usize {
+    let mut line_count = 0;
+    let mut line_start = 0;
     let bytes = text.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                lines.push(&text[start..=i]);
-                start = i + 1;
-                i += 1;
-            }
-            b'\r' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    lines.push(&text[start..i + 2]);
-                    start = i + 2;
-                    i += 2;
-                } else {
-                    lines.push(&text[start..=i]);
-                    start = i + 1;
-                    i += 1;
-                }
-            }
-            _ => i += 1,
+        let line_end = match bytes[i] {
+            b'\n' => Some(i + 1),
+            b'\r' if i + 1 < bytes.len() && bytes[i + 1] == b'\n' => Some(i + 2),
+            b'\r' => Some(i + 1),
+            _ => None,
+        };
+
+        if let Some(line_end) = line_end {
+            line_count += 1;
+            visit(line_count, line_start, line_end);
+            line_start = line_end;
+            i = line_end;
+        } else {
+            i += 1;
         }
     }
 
-    if start < bytes.len() {
-        lines.push(&text[start..]);
+    if line_start < bytes.len() {
+        line_count += 1;
+        visit(line_count, line_start, bytes.len());
     }
 
-    lines
+    line_count
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_lines_with_endings;
+    use super::{LineRangeScan, for_each_line_with_endings, scan_line_range};
+
+    fn lines_with_endings(text: &str) -> Vec<&str> {
+        let mut lines = Vec::new();
+        for_each_line_with_endings(text, |_, start, end| {
+            lines.push(&text[start..end]);
+        });
+        lines
+    }
 
     #[test]
-    fn split_lines_with_endings_handles_cr_only_files() {
-        let lines = split_lines_with_endings("line1\rline2\rline3");
+    fn line_scanner_handles_cr_only_files() {
+        let lines = lines_with_endings("line1\rline2\rline3");
         assert_eq!(lines, vec!["line1\r", "line2\r", "line3"]);
     }
 
     #[test]
-    fn split_lines_with_endings_handles_mixed_newlines() {
-        let lines = split_lines_with_endings("a\r\nb\nc\rd");
+    fn line_scanner_handles_mixed_newlines() {
+        let lines = lines_with_endings("a\r\nb\nc\rd");
         assert_eq!(lines, vec!["a\r\n", "b\n", "c\r", "d"]);
+    }
+
+    #[test]
+    fn line_scanner_returns_empty_count_for_empty_input() {
+        assert_eq!(for_each_line_with_endings("", |_, _, _| {}), 0);
+    }
+
+    #[test]
+    fn scan_line_range_counts_all_lines_without_collecting_them() {
+        let scan = scan_line_range("a\nb\nc\nd\n", 2, Some(3));
+        assert_eq!(
+            scan,
+            LineRangeScan {
+                total_lines: 4,
+                selected_start: Some(2),
+                selected_end: 6
+            }
+        );
+        assert_eq!(scan.selected_range().unwrap(), 2..6);
     }
 
     // REGRESSION: show_line_numbers should default to false (raw content).
@@ -223,22 +293,6 @@ mod tests {
         assert_eq!(text, "", "empty file should return empty content");
     }
 
-    // BUG: split_lines_with_endings does not handle an empty string correctly.
-    // An empty input should produce an empty Vec or a Vec with one empty string,
-    // but the current implementation returns an empty Vec which is ambiguous.
-    #[test]
-    fn split_lines_with_endings_empty_input_returns_empty_vec() {
-        let lines = split_lines_with_endings("");
-        // BUG: Returns empty vec, but arguably should return vec![""] to represent
-        // "one empty line" — this is ambiguous with "no lines at all".
-        assert!(
-            lines.is_empty(),
-            "BUG CONFIRMED: empty input returns empty vec (ambiguous with 'no lines')"
-        );
-    }
-
-    // BUG: The `end_line` validation allows end_line=0 which should be invalid
-    // (lines are 1-indexed), but the check only catches it after computing resolved_end.
     #[tokio::test]
     async fn read_file_end_line_zero_returns_error() {
         use tempfile::tempdir;
@@ -255,7 +309,56 @@ mod tests {
         let outcome = super::handle_read_file(None, args).await;
         let is_error = outcome.0["isError"].as_bool().unwrap();
 
-        // This correctly returns an error for end_line=0, which is good.
         assert!(is_error, "end_line=0 should be an error");
+    }
+
+    #[tokio::test]
+    async fn read_file_range_preserves_mixed_newline_endings() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mixed.txt");
+        std::fs::write(&path, "a\r\nb\nc\rd").expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 2,
+            "end_line": 3,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(!outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(outcome.0["content"][0]["text"].as_str().unwrap(), "b\nc\r");
+        assert_eq!(outcome.0["start_line"], 2);
+        assert_eq!(outcome.0["end_line"], 3);
+        assert_eq!(outcome.0["total_lines"], 4);
+    }
+
+    #[tokio::test]
+    async fn read_file_numbered_range_uses_resolved_end_width() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("numbered.txt");
+        std::fs::write(&path, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 9,
+            "end_line": 10,
+            "show_line_numbers": true,
+        });
+
+        let outcome = super::handle_read_file(None, args).await;
+
+        assert!(!outcome.0["isError"].as_bool().unwrap());
+        assert_eq!(
+            outcome.0["content"][0]["text"].as_str().unwrap(),
+            " 9\t9\n10\t10\n"
+        );
+        assert_eq!(outcome.0["start_line"], 9);
+        assert_eq!(outcome.0["end_line"], 10);
+        assert_eq!(outcome.0["total_lines"], 10);
     }
 }
