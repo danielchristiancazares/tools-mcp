@@ -10,6 +10,7 @@
 
 mod read_file;
 mod ripgrep;
+mod search_memory;
 
 pub use read_file::handle_read_file;
 pub use ripgrep::handle_search;

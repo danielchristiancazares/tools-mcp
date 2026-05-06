@@ -1,6 +1,5 @@
 //! ugrep search handler implementation.
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Stdio;
@@ -10,6 +9,93 @@ use tokio::process::Command;
 use tokio::time::{self, Instant};
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::validation;
+
+use super::search_memory::handle_memory_search;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SearchRequest {
+    /// Regex (or literal if `fixed_strings=true`).
+    pub(super) pattern: String,
+    /// Root path (file or directory). Defaults to ".".
+    #[serde(default)]
+    pub(super) path: Option<String>,
+    /// Case handling: "smart" (default), "sensitive", or "insensitive".
+    #[serde(default)]
+    pub(super) case: Option<String>,
+    /// Treat pattern as literal text (-F).
+    #[serde(default)]
+    pub(super) fixed_strings: Option<bool>,
+    /// Whole-word search (-w).
+    #[serde(default)]
+    pub(super) word_regexp: Option<bool>,
+    /// Add `--glob <pattern>` entries.
+    #[serde(default)]
+    pub(super) glob: Option<Vec<String>>,
+    /// Include hidden files/directories (`--hidden`).
+    #[serde(default)]
+    pub(super) hidden: Option<bool>,
+    /// Follow symlinks (`--follow`).
+    #[serde(default)]
+    pub(super) follow: Option<bool>,
+    /// Do not respect ignore files (`--no-ignore`).
+    #[serde(default)]
+    pub(super) no_ignore: Option<bool>,
+    /// Context lines around each match (`-C`).
+    #[serde(default)]
+    pub(super) context: Option<usize>,
+    /// Maximum number of match/context events to return (global). Defaults to 200.
+    #[serde(default)]
+    pub(super) max_results: Option<usize>,
+    /// Kill the search if it runs longer than this (ms). Defaults to `20_000`.
+    #[serde(default)]
+    pub(super) timeout_ms: Option<u64>,
+    /// Fuzzy match tolerance (1-4 edits). Uses the memory backend when eligible, otherwise ugrep.
+    #[serde(default)]
+    pub(super) fuzzy: Option<u8>,
+}
+
+impl SearchRequest {
+    pub(super) fn root(&self) -> &str {
+        self.path.as_deref().unwrap_or(".")
+    }
+
+    pub(super) fn max_results(&self) -> usize {
+        validation::clamp_limit(self.max_results, 200, 1, 10_000)
+    }
+
+    pub(super) fn timeout_ms(&self) -> u64 {
+        validation::clamp_timeout(self.timeout_ms, 20_000, 100, 300_000)
+    }
+
+    pub(super) fn fuzzy_distance(&self) -> Option<u8> {
+        self.fuzzy.map(|f| f.clamp(1, 4))
+    }
+
+    pub(super) fn case_mode(&self) -> String {
+        self.case.as_deref().unwrap_or("smart").to_ascii_lowercase()
+    }
+}
+
+fn parse_and_validate(args: &Value) -> Result<SearchRequest, ToolCallOutcome> {
+    let req = ToolCallOutcome::parse_args::<SearchRequest>(args)?;
+
+    validation::validate_non_empty(&req.pattern, "pattern", None)?;
+    validation::validate_non_empty(req.root(), "path", None)?;
+
+    Ok(req)
+}
+
+fn add_fallback_metadata(mut outcome: ToolCallOutcome, fallback_reason: &str) -> ToolCallOutcome {
+    if let Some(obj) = outcome.0.as_object_mut() {
+        obj.insert("backend".to_string(), Value::String("ugrep".to_string()));
+        obj.insert(
+            "fallback_reason".to_string(),
+            Value::String(fallback_reason.to_string()),
+        );
+    }
+    outcome
+}
 
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
 /// Returns (path, `line_number`, text, `is_match`)
@@ -96,66 +182,25 @@ fn classify_success(
 /// - Uses text output with -n -H for simpler parsing.
 /// - Exit code semantics: 0 = matches found, 1 = no matches, 2 = error.
 pub async fn handle_search(_id: Option<Value>, args: Value) -> ToolCallOutcome {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct RgRequest {
-        /// Regex (or literal if `fixed_strings=true`).
-        pattern: String,
-        /// Root path (file or directory). Defaults to ".".
-        #[serde(default)]
-        path: Option<String>,
-        /// Case handling: "smart" (default), "sensitive", or "insensitive".
-        #[serde(default)]
-        case: Option<String>,
-        /// Treat pattern as literal text (-F).
-        #[serde(default)]
-        fixed_strings: Option<bool>,
-        /// Whole-word search (-w).
-        #[serde(default)]
-        word_regexp: Option<bool>,
-        /// Add `--glob <pattern>` entries.
-        #[serde(default)]
-        glob: Option<Vec<String>>,
-        /// Include hidden files/directories (`--hidden`).
-        #[serde(default)]
-        hidden: Option<bool>,
-        /// Follow symlinks (`--follow`).
-        #[serde(default)]
-        follow: Option<bool>,
-        /// Do not respect ignore files (`--no-ignore`).
-        #[serde(default)]
-        no_ignore: Option<bool>,
-        /// Context lines around each match (`-C`).
-        #[serde(default)]
-        context: Option<usize>,
-        /// Maximum number of match/context events to return (global). Defaults to 200.
-        #[serde(default)]
-        max_results: Option<usize>,
-        /// Kill the search if it runs longer than this (ms). Defaults to `20_000`.
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-        /// Fuzzy match tolerance (1-4 edits). Uses ugrep backend.
-        #[serde(default)]
-        fuzzy: Option<u8>,
-    }
-
-    let req = match ToolCallOutcome::parse_args::<RgRequest>(&args) {
+    let req = match parse_and_validate(&args) {
         Ok(req) => req,
         Err(o) => return o,
     };
 
-    if let Err(o) = validation::validate_non_empty(&req.pattern, "pattern", None) {
-        return o;
+    match handle_memory_search(&req).await {
+        Ok(outcome) => outcome,
+        Err(err) if err.fallback_allowed => {
+            add_fallback_metadata(handle_search_ugrep(req).await, err.fallback_reason)
+        }
+        Err(err) => err.into_tool_outcome(&req),
     }
+}
 
-    let root = req.path.as_deref().unwrap_or(".");
-    if let Err(o) = validation::validate_non_empty(root, "path", None) {
-        return o;
-    }
-
-    let max_results = validation::clamp_limit(req.max_results, 200, 1, 10_000);
-    let timeout_ms = validation::clamp_timeout(req.timeout_ms, 20_000, 100, 300_000);
-    let fuzzy_distance = req.fuzzy.map(|f| f.clamp(1, 4));
+async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
+    let root = req.root().to_string();
+    let max_results = req.max_results();
+    let timeout_ms = req.timeout_ms();
+    let fuzzy_distance = req.fuzzy_distance();
     let bin = if cfg!(target_os = "windows") {
         "ugrep.exe"
     } else {
@@ -223,7 +268,7 @@ pub async fn handle_search(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 
         // End of options marker prevents patterns like "//" or "-foo" from being
         // interpreted as flags
-        cmd.arg("--").arg(&req.pattern).arg(root);
+        cmd.arg("--").arg(&req.pattern).arg(&root);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

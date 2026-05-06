@@ -28,13 +28,13 @@
 - **Web Content Fetching**: Retrieve and process web pages with SSRF protection and robots.txt compliance
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
 - **Git Integration**: Execute git commands (status, diff, restore, add, commit)
-- **Code Search**: Regex and fuzzy file search using ugrep
+- **Code Search**: Fast in-memory search for eligible fixed-string and fuzzy fixed-string queries with ugrep fallback for regex and unsupported search modes
 - **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
 
 ### Highlights
 
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
-- **Search** - Fast local regex search via ugrep with both line-oriented output and structured match records.
+- **Search** - Fast local search with an automatic in-memory path for eligible fixed-string and fuzzy fixed-string queries, plus ugrep fallback for regex and unsupported modes.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
 - **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
@@ -57,7 +57,7 @@
 
 - Rust toolchain 1.94 or newer (edition 2024).
 - Cargo in PATH (for running the MCP binary).
-- `ugrep` in PATH (required for `Search`).
+- `ugrep` in PATH (required for `Search` regex, unsupported fuzzy modes, and fallback behavior).
 - Git in PATH (required for all `Git*` tools).
 - **WebFetch browser support** (optional)
   - Chrome or Chromium installed and discoverable on PATH to enable headless rendering of JavaScript-heavy sites. Without it, WebFetch still works in HTTP-only mode.
@@ -465,14 +465,15 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> ToolCallOutcom
 
 **Location**: `tools-mcp-local/src/tools/search.rs`
 
-Provides file content search using ugrep.
+Provides file content search using an automatic in-memory fast path for eligible fixed-string and fuzzy fixed-string queries, with ugrep fallback for regex and unsupported cases.
 
 ```rust
 /// Searches files using regex or fuzzy patterns
 ///
 /// # Backend Selection
-/// - Uses ugrep for all searches
-/// - Fuzzy parameter present (1-4): Adds -Z<N> flag
+/// - Uses the in-memory POC for eligible fixed-string and fuzzy fixed-string queries
+/// - Falls back to ugrep for regex and unsupported cases
+/// - Fuzzy parameter present (1-4): memory-backed only for eligible fixed-string searches; otherwise falls back to ugrep -Z<N>
 ///
 /// # Parameters
 /// - pattern: String (required) - Search pattern (regex by default)
@@ -491,7 +492,7 @@ Provides file content search using ugrep.
 ///
 /// # Response Format
 /// Returns structured matches with file paths, line numbers, and content
-pub async fn handle_ripgrep(id: Option<Value>, args: Value) -> ToolCallOutcome
+pub async fn handle_search(id: Option<Value>, args: Value) -> ToolCallOutcome
 ```
 
 ---
@@ -640,7 +641,7 @@ Fetch and normalize external web content with caching and JS-aware rendering.
 
 ### Search
 
-Fast local regex search using ugrep.
+Fast local search that automatically uses the in-memory POC for a conservative fixed-string subset, including eligible fuzzy fixed-string searches, and delegates regex and unsupported cases to ugrep.
 
 - **Tool name**: `Search`
 - **Required**:
@@ -662,7 +663,20 @@ Fast local regex search using ugrep.
   - `content[0].text` - readable text output.
   - `matches` - structured match results.
 - **Notes**:
-  - Requires `ugrep` to be installed and discoverable on PATH on the machine running the MCP server.
+  - Requires `ugrep` to be installed and discoverable on PATH on the machine running the MCP server for regex, unsupported fuzzy modes, and fallback behavior.
+  - Backend selection is automatic; there is no environment flag or MCP request parameter for choosing the backend.
+  - Eligible fixed-string requests, including the narrow fuzzy fixed-string subset below, use the in-memory POC. Unsupported or ambiguous requests fall back to ugrep.
+  - The initial in-memory eligible subset is intentionally narrow:
+    - Exact literals: `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and no `fuzzy`.
+    - Fuzzy literals: `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and `fuzzy` set to `1` through `4`, when the pattern has no newline and can be partitioned into `fuzzy + 1` contiguous UTF-8 seed segments of at least three bytes each.
+    - Exact fixed strings must contain at least three bytes and must not contain newlines.
+    - Regex patterns are delegated to ugrep in this POC; they are not memory-backed yet.
+    - Glob include filters can remain memory-backed for eligible fixed-string searches when file-selection semantics can be preserved; otherwise the request falls back to ugrep.
+    - File-selection semantics (`path`, `glob`, `hidden`, `follow`, `no_ignore`, binary handling, and size limits) must be preserved exactly; otherwise the request falls back to ugrep.
+  - The in-memory POC falls back for regex fuzzy searches, word-regexp searches, case-insensitive searches, smart-case searches unless parity is proven, unsupported regex features such as look-around or backreferences, patterns without a required three-byte literal, fuzzy patterns that cannot produce the required seeds, incomplete index coverage, stale verification, or exceeded index limits.
+  - Additional response fields are additive and do not replace existing fields. Memory-backed responses include `backend: "memory"` and may include diagnostics such as `index_generation`, `indexed_files`, `indexed_bytes`, `candidate_count`, `fuzzy_seed_count`, `fuzzy_verified_lines`, `phase_one_ms`, and `phase_two_ms`. Fallback responses may include `backend: "ugrep"` and `fallback_reason`.
+  - Resource limits are configurable with `TOOLS_SEARCH_INDEX_MAX_FILE_BYTES` (default 1 MiB), `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES` (default 256 MiB per file-selection key), `TOOLS_SEARCH_INDEX_MAX_FILES` (default 50,000), `TOOLS_SEARCH_MAX_CANDIDATES` (default 20,000), and the fuzzy verifier limits `TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS` (default 512), `TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES` (default 200,000), and `TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS` (default 16,384). Existing `timeout_ms` and `max_results` still apply.
+  - Limitations: this POC is not semantic search, does not provide ranking or embeddings, does not persist an on-disk index, does not require file-system watchers, does not accelerate `Read`, and is not a full ugrep replacement or final Hauberk design.
 
 ### Read
 
@@ -1148,6 +1162,13 @@ pub struct FetchChunk {
 | APP_VERSION | No | Version string exposed in server info |
 | HOME | No | Home directory for cache storage |
 | TOOLS_PRETTY_JSON | No | Set to "true" (or 1/yes/on) to pretty-print JSON payloads returned as text (default: compact) |
+| TOOLS_SEARCH_INDEX_MAX_FILE_BYTES | No | Maximum file size for the in-memory Search POC index (default: 1 MiB) |
+| TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES | No | Maximum indexed bytes per Search file-selection key (default: 256 MiB) |
+| TOOLS_SEARCH_INDEX_MAX_FILES | No | Maximum indexed files per Search file-selection key (default: 50,000) |
+| TOOLS_SEARCH_MAX_CANDIDATES | No | Maximum candidate files verified by the in-memory Search POC (default: 20,000) |
+| TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS | No | Maximum fuzzy fixed-string pattern length verified by the in-memory Search POC (default: 512 Unicode scalar values) |
+| TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES | No | Maximum candidate lines verified by the in-memory fuzzy Search POC (default: 200,000) |
+| TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS | No | Maximum line length verified by the in-memory fuzzy Search POC (default: 16,384 Unicode scalar values) |
 | WEBFETCH_ENABLE_BROWSER_UNSAFE | No | Set to "true" to enable headless browser rendering in WebFetch (disabled by default) |
 
 ### Cache Locations
@@ -1391,10 +1412,10 @@ APP_VERSION="1.0.0" cargo build -p tools-mcp-server --release
 
 **Required**:
 - Rust toolchain (2024 edition)
+- ugrep for Search baseline and fallback behavior
 
 **Optional**:
 - Chrome/Chromium for browser rendering (WebFetch)
-- ugrep for Search tool (regex and fuzzy search)
 - Git for git tools
 
 ---

@@ -2,12 +2,41 @@ mod support;
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use support::{
     read_server_response, send_mcp_message, send_mcp_message_with_headers, spawn_server,
+    workspace_root,
 };
 
 const READ_HANDLER_PATH: &str = "tools-mcp-local/src/tools/handlers/read_file.rs";
+
+fn ugrep_bin() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ugrep.exe"
+    } else {
+        "ugrep"
+    }
+}
+
+fn command_available(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn workspace_tempdir(prefix: &str) -> tempfile::TempDir {
+    let root: PathBuf = workspace_root().join("target").join("test-work");
+    std::fs::create_dir_all(&root).expect("failed to create workspace test-work directory");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(root)
+        .expect("failed to create workspace tempdir")
+}
 
 #[test]
 fn test_ping() {
@@ -289,21 +318,8 @@ fn test_read_file_shows_line_numbers_when_enabled() {
 
 #[test]
 fn test_search_tool_call_if_ugrep_installed() {
-    let ugrep_bin = if cfg!(target_os = "windows") {
-        "ugrep.exe"
-    } else {
-        "ugrep"
-    };
-
-    let ugrep_available = Command::new(ugrep_bin)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !ugrep_available {
+    let ugrep_bin = ugrep_bin();
+    if !command_available(ugrep_bin) {
         eprintln!("Skipping Search test: {ugrep_bin} not found on PATH");
         return;
     }
@@ -336,6 +352,153 @@ fn test_search_tool_call_if_ugrep_installed() {
 }
 
 #[test]
+fn test_search_fuzzy_fixed_string_uses_memory_backend() {
+    let dir = workspace_tempdir("search-fuzzy-memory");
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        "intro\ncandidate foobarbzzqux suffix\nunrelated line\n",
+    )
+    .expect("write fuzzy fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 410,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "foobarbazqux",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "sensitive",
+                "fixed_strings": true,
+                "fuzzy": 1,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call fuzzy Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 410);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "memory");
+    assert_eq!(response["result"]["pattern"], "foobarbazqux");
+    assert_eq!(
+        response["result"]["path"].as_str(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
+    assert_eq!(response["result"]["count"], 1);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert!(
+        text.contains("foobarbzzqux"),
+        "expected fuzzy match, got: {text}"
+    );
+}
+
+#[test]
+fn test_search_unsupported_fuzzy_mode_falls_back_to_ugrep() {
+    let ugrep_bin = ugrep_bin();
+    if !command_available(ugrep_bin) {
+        eprintln!("Skipping fuzzy Search fallback test: {ugrep_bin} not found on PATH");
+        return;
+    }
+
+    let dir = workspace_tempdir("search-fuzzy-fallback");
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        "candidate foobarbzzqux suffix\n",
+    )
+    .expect("write fuzzy fallback fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 411,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "foobarbazqux",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "insensitive",
+                "fixed_strings": true,
+                "fuzzy": 1,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call fuzzy fallback Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 411);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "ugrep");
+    let fallback_reason = response["result"]["fallback_reason"]
+        .as_str()
+        .expect("missing fuzzy fallback reason");
+    assert!(
+        fallback_reason.contains("fuzzy"),
+        "expected fuzzy-specific fallback_reason, got: {fallback_reason}"
+    );
+    assert!(response["result"]["count"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn test_search_glob_filtered_fixed_string_uses_memory_backend() {
+    let dir = workspace_tempdir("search-glob-memory");
+    std::fs::write(
+        dir.path().join("keep.rs"),
+        "fn main() { /* sharedneedle */ }\n",
+    )
+    .expect("write matching rust fixture");
+    std::fs::write(dir.path().join("skip.txt"), "sharedneedle in text\n")
+        .expect("write non-glob fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 412,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "sharedneedle",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "sensitive",
+                "fixed_strings": true,
+                "glob": ["*.rs"],
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call glob-filtered Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 412);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "memory");
+    assert_eq!(response["result"]["count"], 1);
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert!(text.contains("keep.rs"), "expected glob match, got: {text}");
+    assert!(
+        !text.contains("skip.txt"),
+        "glob-filtered memory search should exclude non-matching files, got: {text}"
+    );
+}
+
+#[test]
 fn test_git_status_tool_call_if_git_installed() {
     let git_bin = if cfg!(target_os = "windows") {
         "git.exe"
@@ -356,7 +519,7 @@ fn test_git_status_tool_call_if_git_installed() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let dir = workspace_tempdir("git-status");
 
     // Initialize a small repo and create an untracked file so porcelain output is non-empty.
     let init_status = Command::new(git_bin)
@@ -415,8 +578,8 @@ fn test_git_diff_ref_export_preserves_rename_metadata() {
         return;
     }
 
-    let dir = tempfile::tempdir().expect("failed to create tempdir");
-    let patches_dir = tempfile::tempdir().expect("failed to create patch dir");
+    let dir = workspace_tempdir("git-diff-repo");
+    let patches_dir = workspace_tempdir("git-diff-patches");
 
     let init_status = Command::new(git_bin)
         .args(["init", "-q"])

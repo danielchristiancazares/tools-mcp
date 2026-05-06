@@ -4,7 +4,7 @@ use tools_mcp_core::define_mcp_tool;
 define_mcp_tool! {
     SearchTool,
     name: "Search",
-    description: "Search file contents using ugrep with regex support",
+    description: "Search file contents with an in-memory fast path and ugrep fallback",
     schema: {
         "type": "object",
         "properties": {
