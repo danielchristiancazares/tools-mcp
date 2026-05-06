@@ -200,9 +200,9 @@ The following changes are approved for POC mode:
 4. Narrow fuzzy memory support for eligible fixed-string, case-sensitive,
    non-word, single-line UTF-8 queries with partitionable exact seeds.
 5. Common exact literal support for plain regex patterns without metacharacters,
-   conservative case-sensitive seeded regex support for regex patterns with
-   metacharacters, plus ugrep-compatible ASCII case folding for fixed-string
-   smart and insensitive searches.
+   case-sensitive seeded regex acceleration for line-oriented default-ugrep ERE
+   compatible patterns with metacharacters, plus ugrep-compatible ASCII case
+   folding for fixed-string smart and insensitive searches.
 
 The following changes are not approved by this document:
 
@@ -237,11 +237,17 @@ The initial implemented eligible query subset is:
    1. `fixed_strings=false`, `case=sensitive`, `word_regexp=false`, and `fuzzy`
       absent.
    2. The pattern compiles with the configured Rust byte-regex verifier.
-   3. The pattern is line-oriented and does not require matching `\n` or `\r`.
-   4. The selected scope is proven valid UTF-8 text and non-binary.
-   5. The query planner can prove at least one required literal byte substring
+   3. The pattern is compatible with the supported default-ugrep ERE subset for
+      line-oriented matching. Common anchors, character classes, grouping,
+      alternation, greedy repetition, and lazy repetition MAY be accelerated
+      when the verifier and required-literal planner can preserve semantics.
+   4. The pattern is line-oriented and does not require or permit matching
+      `\n`, `\r`, `\R`, `\X`, or another construct that can consume a line
+      terminator.
+   5. The selected scope is proven valid UTF-8 text and non-binary.
+   6. The query planner can prove at least one required literal byte substring
       of length at least three for every possible match path.
-   6. Concatenation seeds are intersected, alternation seeds are unioned only
+   7. Concatenation seeds are intersected, alternation seeds are unioned only
       when every branch has a required seed, and Phase Two regex verification is
       authoritative for all candidate lines.
 3. Fuzzy literal memory queries:
@@ -267,11 +273,14 @@ The in-memory backend MUST fall back for:
    folding.
 6. Queries with no proven required literal byte substring of length at least
    three.
-7. Multiline fixed-string or multiline fuzzy queries.
+7. Multiline regex, fixed-string, or fuzzy queries.
 8. Invalid UTF-8 or binary fuzzy or seeded-regex scope.
 9. Fuzzy patterns that are too short or unseedable under the `N + 1` seed rule.
 10. Requests whose file-selection semantics cannot be matched exactly.
 11. Any fuzzy query whose parity with ugrep is unproven.
+12. Regexes using unsupported dialect constructs such as inline `(?...)`
+    syntax, lookaround, backreferences, PCRE-only grouping, or other constructs
+    outside the verified default-ugrep ERE subset.
 
 The POC MAY later expand eligibility, but every expansion MUST include parity
 tests against the existing `ugrep` backend.
@@ -297,6 +306,13 @@ specified verifier and configure regex compilation with:
 
 If a non-literal regex query is received without a proven required literal seed
 or supported verifier plan, the backend MUST delegate to `ugrep`.
+
+For this POC, **full regex acceleration** means that every regex inside the
+supported seeded, line-oriented, verifier-compatible subset is eligible for the
+memory backend. It does not mean full `ugrep` replacement. Unseeded regexes,
+unsupported dialect constructs, multiline-capable regexes, `word_regexp=true`,
+`follow=true`, fuzzy regexes, and case-insensitive Unicode regex behavior MUST
+continue to fall back until parity is specified and tested.
 
 Phase Two is authoritative. A result MUST NOT be returned unless Phase Two
 verifies the requested match against content observed by the query snapshot.
@@ -640,15 +656,21 @@ Unit tests SHALL cover:
 2. Unseeded or unsupported regex queries fall back to ugrep.
 3. Seeded regex candidate planning intersects concatenation seeds and unions
    fully seeded alternation branches without false negatives.
-4. Ineligible option combinations.
-5. Candidate intersection ordering.
-6. Line-offset rendering and context de-duplication.
-7. Freshness checks for deleted and modified files.
-8. Structured error payloads for non-fallback memory errors.
-9. Fuzzy seed partitioning into `distance + 1` searchable seed segments.
-10. Fuzzy verifier insertion, deletion, and substitution behavior.
-11. Fuzzy seed no-false-negative fixtures.
-12. Invalid UTF-8 fuzzy scope fallback.
+4. Expanded seeded-regex compatibility for common verifier-supported constructs
+   such as character classes, anchors, grouping, alternation, and lazy
+   repetition.
+5. Ineligible option combinations.
+6. Candidate intersection ordering.
+7. Line-offset rendering and context de-duplication.
+8. Freshness checks for deleted and modified files.
+9. Structured error payloads for non-fallback memory errors.
+10. Fuzzy seed partitioning into `distance + 1` searchable seed segments.
+11. Fuzzy verifier insertion, deletion, and substitution behavior.
+12. Fuzzy seed no-false-negative fixtures.
+13. Invalid UTF-8 fuzzy scope fallback.
+14. Explicit fallback for case-insensitive Unicode regex behavior, unseeded
+    regexes, unsupported dialect constructs, multiline regexes, word regex,
+    follow-symlink requests, and fuzzy regexes.
 
 Integration tests SHALL cover:
 

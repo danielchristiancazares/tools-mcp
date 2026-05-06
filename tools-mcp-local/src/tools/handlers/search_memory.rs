@@ -6,7 +6,7 @@ use ignore::WalkBuilder;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::{
     ParserBuilder as RegexParserBuilder,
-    hir::{Hir, HirKind},
+    hir::{Class, Hir, HirKind},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -636,13 +636,20 @@ fn eligible_query_plan_with_limits(
 
 fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan, MemoryError> {
     ensure_regex_case_sensitive(req)?;
-    ensure_supported_common_regex_syntax(&req.pattern)?;
+    ensure_no_unsupported_inline_regex_construct(&req.pattern)?;
 
     if req.pattern.contains('\n') || req.pattern.contains('\r') {
         return Err(MemoryError::new(
             "unsupported_regex_dialect",
             "unsupported_multiline_regex",
             "memory regex search does not support multiline regex patterns",
+        ));
+    }
+    if has_line_break_escape(&req.pattern) {
+        return Err(MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_multiline_regex",
+            "memory regex search does not support regex patterns that match line breaks",
         ));
     }
 
@@ -658,6 +665,13 @@ fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan
                 format!("memory regex search could not parse the pattern: {err}"),
             )
         })?;
+    if hir_can_match_lf(&hir) {
+        return Err(MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_multiline_regex",
+            "memory regex search does not support regex patterns that can match line breaks",
+        ));
+    }
     let candidates = required_candidate_expr(&hir).ok_or_else(|| {
         MemoryError::new(
             "unsupported_regex_dialect",
@@ -709,32 +723,48 @@ fn ensure_regex_case_sensitive(req: &SearchRequest) -> Result<(), MemoryError> {
     }
 }
 
-fn ensure_supported_common_regex_syntax(pattern: &str) -> Result<(), MemoryError> {
-    if pattern.contains("(?") {
+fn ensure_no_unsupported_inline_regex_construct(pattern: &str) -> Result<(), MemoryError> {
+    if has_inline_regex_construct(pattern) {
         return Err(MemoryError::new(
             "unsupported_regex_dialect",
             "unsupported_regex_backend",
             "memory regex search does not support inline flags, look-around, or special group syntax",
         ));
     }
-    if has_unsupported_regex_escape(pattern) {
-        return Err(MemoryError::new(
-            "unsupported_regex_dialect",
-            "unsupported_regex_backend",
-            "memory regex search does not support regex escapes outside the conservative ugrep-compatible subset",
-        ));
-    }
-    if has_lazy_quantifier_suffix(pattern) {
-        return Err(MemoryError::new(
-            "unsupported_regex_dialect",
-            "unsupported_regex_backend",
-            "memory regex search does not support lazy quantifier syntax",
-        ));
-    }
     Ok(())
 }
 
-fn has_unsupported_regex_escape(pattern: &str) -> bool {
+fn has_inline_regex_construct(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut in_class = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if in_class {
+            if byte == b']' {
+                in_class = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'[' => in_class = true,
+            b'(' if bytes.get(index + 1) == Some(&b'?') => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+
+    false
+}
+
+fn has_line_break_escape(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -743,78 +773,14 @@ fn has_unsupported_regex_escape(pattern: &str) -> bool {
             continue;
         }
         let Some(&escaped) = bytes.get(index + 1) else {
-            return true;
+            return false;
         };
-        if !is_supported_escaped_regex_byte(escaped) {
+        if matches!(escaped, b'n' | b'r' | b'R' | b'X') {
             return true;
         }
         index += 2;
     }
     false
-}
-
-fn has_lazy_quantifier_suffix(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut escaped = false;
-    let mut in_class = false;
-    let mut previous_quantifier = false;
-
-    for &byte in bytes {
-        if escaped {
-            escaped = false;
-            previous_quantifier = false;
-            continue;
-        }
-        if byte == b'\\' {
-            escaped = true;
-            previous_quantifier = false;
-            continue;
-        }
-        if in_class {
-            if byte == b']' {
-                in_class = false;
-            }
-            previous_quantifier = false;
-            continue;
-        }
-
-        match byte {
-            b'[' => {
-                in_class = true;
-                previous_quantifier = false;
-            }
-            b'?' if previous_quantifier => return true,
-            b'*' | b'+' | b'?' | b'}' => {
-                previous_quantifier = true;
-            }
-            _ => {
-                previous_quantifier = false;
-            }
-        }
-    }
-
-    false
-}
-
-fn is_supported_escaped_regex_byte(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'\\'
-            | b'.'
-            | b'^'
-            | b'$'
-            | b'|'
-            | b'?'
-            | b'*'
-            | b'+'
-            | b'('
-            | b')'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'-'
-    )
 }
 
 fn literal_case_for_request(
@@ -1495,6 +1461,30 @@ fn contains_uppercase_letter(pattern: &str) -> bool {
     pattern.chars().any(char::is_uppercase)
 }
 
+fn hir_can_match_lf(hir: &Hir) -> bool {
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => false,
+        HirKind::Literal(literal) => literal.0.contains(&b'\n'),
+        HirKind::Class(class) => class_can_match_lf(class),
+        HirKind::Capture(capture) => hir_can_match_lf(capture.sub.as_ref()),
+        HirKind::Repetition(repetition) => hir_can_match_lf(repetition.sub.as_ref()),
+        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts.iter().any(hir_can_match_lf),
+    }
+}
+
+fn class_can_match_lf(class: &Class) -> bool {
+    match class {
+        Class::Unicode(class) => class
+            .ranges()
+            .iter()
+            .any(|range| range.start() <= '\n' && '\n' <= range.end()),
+        Class::Bytes(class) => class
+            .ranges()
+            .iter()
+            .any(|range| range.start() <= b'\n' && b'\n' <= range.end()),
+    }
+}
+
 fn required_candidate_expr(hir: &Hir) -> Option<CandidateExpr> {
     match hir.kind() {
         HirKind::Empty | HirKind::Class(_) | HirKind::Look(_) => None,
@@ -2081,9 +2071,9 @@ mod tests {
     }
 
     #[test]
-    fn regex_escapes_outside_common_subset_fall_back() {
+    fn regex_common_escapes_with_required_literals_are_memory_eligible() {
         let req = SearchRequest {
-            pattern: "needle\\d+".to_string(),
+            pattern: "needle\\d+haystack".to_string(),
             path: Some(".".to_string()),
             case: Some("sensitive".to_string()),
             fixed_strings: Some(false),
@@ -2097,13 +2087,25 @@ mod tests {
             timeout_ms: None,
             fuzzy: None,
         };
-        let error = eligible_query_plan(&req).expect_err("unsupported escape should fall back");
-        assert_eq!(error.error_type, "unsupported_regex_dialect");
-        assert_eq!(error.fallback_reason, "unsupported_regex_backend");
+        let plan = eligible_query_plan(&req).expect("common escaped class should be eligible");
+        match plan {
+            QueryPlan::Regex { candidates, .. } => {
+                assert_eq!(
+                    candidates,
+                    CandidateExpr::And(vec![
+                        CandidateExpr::Seed(b"needle".to_vec()),
+                        CandidateExpr::Seed(b"haystack".to_vec())
+                    ])
+                );
+            }
+            QueryPlan::Exact { .. } | QueryPlan::Fuzzy { .. } => {
+                panic!("expected regex plan")
+            }
+        }
     }
 
     #[test]
-    fn regex_lazy_quantifier_syntax_falls_back() {
+    fn regex_lazy_quantifier_syntax_is_memory_eligible() {
         let req = SearchRequest {
             pattern: "needle.*?haystack".to_string(),
             path: Some(".".to_string()),
@@ -2119,9 +2121,138 @@ mod tests {
             timeout_ms: None,
             fuzzy: None,
         };
-        let error = eligible_query_plan(&req).expect_err("lazy quantifier should fall back");
+        let plan = eligible_query_plan(&req).expect("lazy quantifier should be eligible");
+        match plan {
+            QueryPlan::Regex { candidates, .. } => {
+                assert_eq!(
+                    candidates,
+                    CandidateExpr::And(vec![
+                        CandidateExpr::Seed(b"needle".to_vec()),
+                        CandidateExpr::Seed(b"haystack".to_vec())
+                    ])
+                );
+            }
+            QueryPlan::Exact { .. } | QueryPlan::Fuzzy { .. } => {
+                panic!("expected regex plan")
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_inline_regex_constructs_fall_back() {
+        let req = SearchRequest {
+            pattern: "needle(?=haystack)".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("inline construct should fall back");
         assert_eq!(error.error_type, "unsupported_regex_dialect");
         assert_eq!(error.fallback_reason, "unsupported_regex_backend");
+    }
+
+    #[test]
+    fn multiline_regex_constructs_fall_back() {
+        let req = SearchRequest {
+            pattern: "needle\\nhaystack".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("line break escape should fall back");
+        assert_eq!(error.error_type, "unsupported_regex_dialect");
+        assert_eq!(error.fallback_reason, "unsupported_multiline_regex");
+    }
+
+    #[test]
+    fn regex_classes_that_can_match_lf_fall_back() {
+        let req = SearchRequest {
+            pattern: "needle\\D+haystack".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("LF-capable class should fall back");
+        assert_eq!(error.error_type, "unsupported_regex_dialect");
+        assert_eq!(error.fallback_reason, "unsupported_multiline_regex");
+    }
+
+    #[test]
+    fn case_insensitive_unicode_regex_still_falls_back() {
+        let req = SearchRequest {
+            pattern: "straße.*needle".to_string(),
+            path: Some(".".to_string()),
+            case: Some("insensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error =
+            eligible_query_plan(&req).expect_err("Unicode case-insensitive regex should fall back");
+        assert_eq!(error.error_type, "unsupported_search_option");
+        assert_eq!(error.fallback_reason, "unsupported_regex_case_insensitive");
+    }
+
+    #[test]
+    fn word_regex_and_follow_symlink_requests_fall_back() {
+        let mut req = SearchRequest {
+            pattern: "needle.*haystack".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: Some(true),
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("word regex should fall back");
+        assert_eq!(error.error_type, "unsupported_search_option");
+        assert_eq!(error.fallback_reason, "unsupported_word_regexp");
+
+        req.word_regexp = None;
+        req.follow = Some(true);
+        let error = eligible_query_plan(&req).expect_err("follow symlink search should fall back");
+        assert_eq!(error.error_type, "unsupported_search_option");
+        assert_eq!(error.fallback_reason, "unsupported_follow");
     }
 
     #[test]

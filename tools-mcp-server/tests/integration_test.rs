@@ -444,6 +444,55 @@ fn test_search_seeded_regex_uses_memory_backend() {
 }
 
 #[test]
+fn test_search_common_seeded_regex_escape_uses_memory_backend() {
+    let dir = workspace_tempdir("search-regex-escape-memory");
+    std::fs::write(
+        dir.path().join("match.txt"),
+        "intro\ncandidate needle123haystack suffix\n",
+    )
+    .expect("write regex escape match fixture");
+    std::fs::write(dir.path().join("miss.txt"), "needleabc haystack\n")
+        .expect("write regex escape miss fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 416,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "needle\\d+haystack",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "sensitive",
+                "fixed_strings": false,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call escaped regex Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 416);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "memory");
+    assert_eq!(response["result"]["count"], 1);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert!(
+        text.contains("match.txt"),
+        "expected escaped regex match, got: {text}"
+    );
+    assert!(
+        !text.contains("miss.txt"),
+        "escaped regex verifier should remove false positives, got: {text}"
+    );
+}
+
+#[test]
 fn test_search_unseeded_regex_falls_back_to_ugrep() {
     let ugrep_bin = ugrep_bin();
     if !command_available(ugrep_bin) {
