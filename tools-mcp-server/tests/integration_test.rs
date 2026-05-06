@@ -539,6 +539,72 @@ fn test_search_glob_filtered_fixed_string_uses_memory_backend() {
 }
 
 #[test]
+fn test_search_ugrep_fallback_preserves_slash_glob_or_semantics() {
+    let ugrep_bin = ugrep_bin();
+    if !command_available(ugrep_bin) {
+        eprintln!("Skipping ugrep glob fallback test: {ugrep_bin} not found on PATH");
+        return;
+    }
+
+    let dir = workspace_tempdir("search-glob-ugrep-fallback");
+    let nested = dir.path().join("tools-mcp-server").join("tests");
+    std::fs::create_dir_all(&nested).expect("create nested fixture directory");
+    std::fs::write(dir.path().join("README.md"), "Search root hit\n").expect("write root fixture");
+    std::fs::write(nested.join("integration_test.rs"), "backend nested hit\n")
+        .expect("write nested fixture");
+    std::fs::write(dir.path().join("skip.txt"), "Search skipped by glob\n")
+        .expect("write skipped fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 415,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "Search|backend",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "smart",
+                "word_regexp": true,
+                "glob": ["README.md", "tools-mcp-server/tests/integration_test.rs"],
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response =
+        send_mcp_message(&request).expect("Failed to call glob-filtered ugrep Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 415);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "ugrep");
+    assert_eq!(
+        response["result"]["fallback_reason"],
+        "unsupported_word_regexp"
+    );
+    assert_eq!(response["result"]["count"], 2);
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert!(
+        text.contains("README.md"),
+        "expected root glob match, got: {text}"
+    );
+    assert!(
+        text.contains("tools-mcp-server/tests/integration_test.rs"),
+        "expected slash glob match, got: {text}"
+    );
+    assert!(
+        !text.contains("skip.txt"),
+        "glob-filtered ugrep search should exclude non-matching files, got: {text}"
+    );
+}
+
+#[test]
 fn test_git_status_tool_call_if_git_installed() {
     let git_bin = if cfg!(target_os = "windows") {
         "git.exe"

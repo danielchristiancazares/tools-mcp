@@ -1,10 +1,12 @@
 //! ugrep search handler implementation.
 
+use glob::{MatchOptions, Pattern};
+use ignore::WalkBuilder;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{self, Instant};
 use tools_mcp_core::ToolCallOutcome;
@@ -95,6 +97,136 @@ fn add_fallback_metadata(mut outcome: ToolCallOutcome, fallback_reason: &str) ->
         );
     }
     outcome
+}
+
+#[derive(Clone, Debug)]
+struct CompiledGlob {
+    pattern: Pattern,
+    match_basename: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SearchGlobFilter {
+    patterns: Vec<CompiledGlob>,
+    match_options: MatchOptions,
+}
+
+impl SearchGlobFilter {
+    fn from_request(req: &SearchRequest, include_hidden: bool) -> Option<Self> {
+        let globs = req.glob.as_ref()?;
+        let mut patterns = Vec::new();
+
+        for raw_glob in globs {
+            let trimmed = raw_glob.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if contains_unsupported_glob_syntax(trimmed) {
+                return None;
+            }
+            let pattern = Pattern::new(trimmed).ok()?;
+            patterns.push(CompiledGlob {
+                pattern,
+                match_basename: !contains_path_separator(trimmed),
+            });
+        }
+
+        (!patterns.is_empty()).then_some(Self {
+            patterns,
+            match_options: MatchOptions {
+                case_sensitive: true,
+                require_literal_separator: true,
+                require_literal_leading_dot: !include_hidden,
+            },
+        })
+    }
+
+    fn is_match(&self, root: &Path, path: &Path) -> bool {
+        self.patterns
+            .iter()
+            .any(|compiled| self.compiled_pattern_matches(compiled, root, path))
+    }
+
+    fn compiled_pattern_matches(&self, compiled: &CompiledGlob, root: &Path, path: &Path) -> bool {
+        if let Some(relative) = path_relative_to_root(root, path)
+            && compiled
+                .pattern
+                .matches_path_with(relative, self.match_options)
+        {
+            return true;
+        }
+
+        if compiled.match_basename
+            && let Some(file_name) = path.file_name()
+            && compiled
+                .pattern
+                .matches_path_with(Path::new(file_name), self.match_options)
+        {
+            return true;
+        }
+
+        compiled.pattern.matches_path_with(path, self.match_options)
+    }
+}
+
+fn path_relative_to_root<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
+    if root.is_file() {
+        return path.file_name().map(Path::new);
+    }
+
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative);
+    }
+
+    if matches!(root.to_str(), Some(".") | Some("./")) {
+        return Some(path);
+    }
+
+    None
+}
+
+fn contains_path_separator(pattern: &str) -> bool {
+    pattern.contains('/') || pattern.contains('\\')
+}
+
+fn contains_unsupported_glob_syntax(pattern: &str) -> bool {
+    pattern.starts_with('!') || pattern.contains('{') || pattern.contains('}')
+}
+
+fn resolve_globbed_files_for_ugrep(req: &SearchRequest) -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let include_hidden = req.hidden.unwrap_or(false);
+    let Some(glob_filter) = SearchGlobFilter::from_request(req, include_hidden) else {
+        return Ok(None);
+    };
+
+    let root = Path::new(req.root());
+    let no_ignore = req.no_ignore.unwrap_or(false);
+    let follow = req.follow.unwrap_or(false);
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(!include_hidden)
+        .follow_links(follow)
+        .ignore(!no_ignore)
+        .git_ignore(!no_ignore)
+        .git_global(!no_ignore)
+        .git_exclude(!no_ignore);
+
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        let entry = entry?;
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) && !follow {
+            continue;
+        }
+        let path = entry.into_path();
+        if glob_filter.is_match(root, &path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(Some(files))
 }
 
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
@@ -208,6 +340,19 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
     };
 
     let run = async {
+        let globbed_files = resolve_globbed_files_for_ugrep(&req)?;
+        if matches!(globbed_files, Some(ref files) if files.is_empty()) {
+            return Ok::<_, anyhow::Error>((
+                Vec::new(),
+                Vec::new(),
+                false,
+                Some(1),
+                String::new(),
+                true,
+                false,
+            ));
+        }
+
         let mut cmd = Command::new(bin);
 
         // ugrep: use text output with -n -H for simpler parsing
@@ -258,7 +403,9 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
         {
             cmd.arg("-C").arg(c.to_string());
         }
-        if let Some(globs) = &req.glob {
+        if globbed_files.is_some() {
+            cmd.arg("--from=-");
+        } else if let Some(globs) = &req.glob {
             for g in globs {
                 if !g.trim().is_empty() {
                     cmd.arg("-g").arg(g);
@@ -268,13 +415,45 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
 
         // End of options marker prevents patterns like "//" or "-foo" from being
         // interpreted as flags
-        cmd.arg("--").arg(&req.pattern).arg(&root);
+        cmd.arg("--").arg(&req.pattern);
+        if globbed_files.is_none() {
+            cmd.arg(&root);
+        }
 
+        if globbed_files.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!("failed to spawn ugrep. Install: winget install Genivia.ugrep / brew install ugrep / apt install ugrep. Error: {e}")
         })?;
+
+        let stdin_task = if let Some(files) = globbed_files {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed to capture stdin"))?;
+            Some(tokio::spawn(async move {
+                for path in files {
+                    if stdin
+                        .write_all(path.to_string_lossy().as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if stdin.write_all(b"\n").await.is_err() {
+                        return;
+                    }
+                }
+                let _ = stdin.shutdown().await;
+            }))
+        } else {
+            None
+        };
 
         let stdout = child
             .stdout
@@ -366,6 +545,14 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
         }
         .trim()
         .to_string();
+
+        if let Some(mut stdin_task) = stdin_task
+            && time::timeout(Duration::from_millis(2_000), &mut stdin_task)
+                .await
+                .is_err()
+        {
+            stdin_task.abort();
+        }
 
         // ugrep: 0 = matches, 1 = no matches, 2 = error
         let success = classify_success(status, exit_code, truncated, timed_out);
