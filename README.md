@@ -1344,6 +1344,13 @@ cargo test --workspace -- --nocapture
 cargo test --workspace test_name
 ```
 
+### Benchmarks
+
+```bash
+# Run the Read tool micro-benchmark
+READ_FILE_BENCH_ITERS=100 cargo bench -p tools-mcp-local --bench read_file
+```
+
 ### Coverage (Local HTML)
 
 This repo supports local code coverage via `cargo llvm-cov` (HTML output).

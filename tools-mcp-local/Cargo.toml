@@ -24,3 +24,7 @@ tools-mcp-core = { path = "../tools-mcp-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[bench]]
+name = "read_file"
+harness = false
