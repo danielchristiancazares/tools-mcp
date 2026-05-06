@@ -187,8 +187,8 @@ failures other than `max_results` truncation.
 ## 8. Behavior Changes and Approvals
 
 The initial POC intentionally changes behavior by introducing an automatic
-in-memory fast path for eligible exact literal, plain-regex-literal, and fuzzy
-fixed-string queries.
+in-memory fast path for eligible exact literal, seeded regex, plain-regex-
+literal, and fuzzy fixed-string queries.
 
 The following changes are approved for POC mode:
 
@@ -200,8 +200,9 @@ The following changes are approved for POC mode:
 4. Narrow fuzzy memory support for eligible fixed-string, case-sensitive,
    non-word, single-line UTF-8 queries with partitionable exact seeds.
 5. Common exact literal support for plain regex patterns without metacharacters,
-   plus ugrep-compatible ASCII case folding for fixed-string smart and
-   insensitive searches.
+   conservative case-sensitive seeded regex support for regex patterns with
+   metacharacters, plus ugrep-compatible ASCII case folding for fixed-string
+   smart and insensitive searches.
 
 The following changes are not approved by this document:
 
@@ -232,7 +233,18 @@ The initial implemented eligible query subset is:
       ugrep-compatible ASCII case folding.
    7. Plain regex literals use memory for ASCII smart or insensitive matching
       and fall back when Unicode regex case folding would be required.
-2. Fuzzy literal memory queries:
+2. Seeded regex memory queries:
+   1. `fixed_strings=false`, `case=sensitive`, `word_regexp=false`, and `fuzzy`
+      absent.
+   2. The pattern compiles with the configured Rust byte-regex verifier.
+   3. The pattern is line-oriented and does not require matching `\n` or `\r`.
+   4. The selected scope is proven valid UTF-8 text and non-binary.
+   5. The query planner can prove at least one required literal byte substring
+      of length at least three for every possible match path.
+   6. Concatenation seeds are intersected, alternation seeds are unioned only
+      when every branch has a required seed, and Phase Two regex verification is
+      authoritative for all candidate lines.
+3. Fuzzy literal memory queries:
    1. `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and `fuzzy`
       present.
    2. `fuzzy=N` is the existing ugrep-compatible integer `-Z<N>` bounded edit
@@ -248,14 +260,15 @@ The in-memory backend MUST fall back for:
 2. `word_regexp=true`, including word-regexp fuzzy queries.
 3. Unsupported `case=insensitive` and `case=smart` variants, including all
    fuzzy case-insensitive and fuzzy smart-case queries.
-4. Regex queries with metacharacters. Full regex memory support is a future
-   expansion for this POC.
+4. Regex queries with metacharacters when the planner cannot prove required
+   seeds, the verifier cannot compile the pattern, or dialect parity is
+   unsupported.
 5. Plain regex literals requiring Unicode smart-case or insensitive regex
    folding.
 6. Queries with no proven required literal byte substring of length at least
    three.
 7. Multiline fixed-string or multiline fuzzy queries.
-8. Invalid UTF-8 or binary fuzzy scope.
+8. Invalid UTF-8 or binary fuzzy or seeded-regex scope.
 9. Fuzzy patterns that are too short or unseedable under the `N + 1` seed rule.
 10. Requests whose file-selection semantics cannot be matched exactly.
 11. Any fuzzy query whose parity with ugrep is unproven.
@@ -266,20 +279,24 @@ tests against the existing `ugrep` backend.
 ## 10. Regex Dialect, Exact Verification, and Fuzzy Verification
 
 The initial in-memory backend SHALL use byte-level literal verification for
-exact literal Phase Two. Regex queries with metacharacters MUST delegate to
-`ugrep`; plain regex literals MAY use the same exact-literal verifier when case
-semantics can be preserved.
+exact literal Phase Two. Eligible seeded regex queries SHALL use a bounded byte
+regex verifier over candidate lines. Regex queries with metacharacters MUST
+delegate to `ugrep` unless the planner proves required seeds and the configured
+verifier can preserve the supported subset's semantics. Plain regex literals MAY
+use the same exact-literal verifier when case semantics can be preserved.
 
-Future regex memory support MUST use Rust `regex::bytes` or another explicitly
+Seeded regex memory support MUST use Rust `regex::bytes` or another explicitly
 specified verifier and configure regex compilation with:
 
 1. A size limit.
-2. Unicode mode disabled unless parity tests prove Unicode behavior matches the
-   delegated backend for the eligible subset.
-3. Multi-line behavior matching the existing line-oriented search contract for
+2. Unicode mode enabled only for selected scopes proven to be valid UTF-8 text.
+3. Case-insensitive Unicode regex matching disabled until parity tests prove
+   behavior matches the delegated backend for the eligible subset.
+4. Multi-line behavior matching the existing line-oriented search contract for
    the eligible subset.
 
-If a non-literal regex query is received, the backend MUST delegate to `ugrep`.
+If a non-literal regex query is received without a proven required literal seed
+or supported verifier plan, the backend MUST delegate to `ugrep`.
 
 Phase Two is authoritative. A result MUST NOT be returned unless Phase Two
 verifies the requested match against content observed by the query snapshot.
@@ -294,7 +311,8 @@ Phase One MUST be conservative. Every possible matching document for an eligible
 query MUST remain in the candidate set passed to Phase Two.
 
 The initial extractor SHALL operate over exact byte literals, plain regex
-literals, ASCII-folded eligible literals, and fuzzy fixed-string seed segments:
+literals, seeded regex HIR literals, ASCII-folded eligible literals, and fuzzy
+fixed-string seed segments:
 
 1. For exact `fixed_strings=true` queries and eligible plain regex literals, the
    required literal is the pattern bytes.
@@ -305,16 +323,17 @@ literals, ASCII-folded eligible literals, and fuzzy fixed-string seed segments:
    and union the candidate sets from all seeds.
 4. Each fuzzy seed segment MUST have a UTF-8 encoding of at least three bytes.
    If any seed is shorter, the query is ineligible and MUST fall back.
-5. Regex queries with metacharacters are ineligible in the first POC
-   implementation.
+5. Regex queries with metacharacters are eligible only when the planner can
+   prove required literal seeds for every possible match path.
 6. Case-insensitive fixed-string queries use ASCII-folded trigrams and
    ASCII-insensitive Phase Two verification.
-7. Future regex support MUST parse with `regex-syntax` or an equivalent parser
+7. Regex seed extraction MUST parse with `regex-syntax` or an equivalent parser
    that exposes a syntax tree.
-8. Future regex support MUST NOT treat literal byte substrings under optional
+8. Regex seed extraction MUST NOT treat literal byte substrings under optional
    repetition (`?`, `*`, `{0,n}`) as required.
-9. Future regex support MUST make alternation ineligible unless it can prove a
-   common required byte substring across every branch.
+9. Regex seed extraction MUST make alternation ineligible unless it can prove at
+   least one required byte substring for every branch and union those branch
+   candidate sets.
 10. Character classes, anchors, boundaries, groups without required literals, and
    wildcard constructs MUST NOT contribute required trigrams.
 11. Unicode regex case-insensitive literals MUST make the query ineligible until
@@ -557,8 +576,10 @@ The POC MUST enforce configurable limits. Initial defaults:
 4. `TOOLS_SEARCH_MAX_CANDIDATES`: 20,000.
 5. `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS`: 300,000 ms for startup warm-cache
    build.
-6. Existing `timeout_ms`: per-query wall-clock deadline.
-7. Existing `max_results`: output event cap.
+6. `TOOLS_SEARCH_REGEX_SIZE_LIMIT_BYTES`: 10 MiB per compiled seeded-regex
+   verifier.
+7. Existing `timeout_ms`: per-query wall-clock deadline.
+8. Existing `max_results`: output event cap.
 
 If index build limits are exceeded, the query MUST fall back to `ugrep`.
 
@@ -616,16 +637,18 @@ The POC MUST include tests for both compatibility and index correctness.
 Unit tests SHALL cover:
 
 1. Fixed-string trigram extraction.
-2. Regex queries are ineligible and fall back to ugrep.
-3. Ineligible option combinations.
-4. Candidate intersection ordering.
-5. Line-offset rendering and context de-duplication.
-6. Freshness checks for deleted and modified files.
-7. Structured error payloads for non-fallback memory errors.
-8. Fuzzy seed partitioning into `distance + 1` searchable seed segments.
-9. Fuzzy verifier insertion, deletion, and substitution behavior.
-10. Fuzzy seed no-false-negative fixtures.
-11. Invalid UTF-8 fuzzy scope fallback.
+2. Unseeded or unsupported regex queries fall back to ugrep.
+3. Seeded regex candidate planning intersects concatenation seeds and unions
+   fully seeded alternation branches without false negatives.
+4. Ineligible option combinations.
+5. Candidate intersection ordering.
+6. Line-offset rendering and context de-duplication.
+7. Freshness checks for deleted and modified files.
+8. Structured error payloads for non-fallback memory errors.
+9. Fuzzy seed partitioning into `distance + 1` searchable seed segments.
+10. Fuzzy verifier insertion, deletion, and substitution behavior.
+11. Fuzzy seed no-false-negative fixtures.
+12. Invalid UTF-8 fuzzy scope fallback.
 
 Integration tests SHALL cover:
 
@@ -634,13 +657,14 @@ Integration tests SHALL cover:
 3. Eligible fixed-string fuzzy searches use the in-memory backend.
 4. Unsupported fuzzy searches fall back to ugrep with fuzzy-specific fallback
    diagnostics.
-5. Unsupported regex falls back to ugrep.
-6. Fuzzy memory results match ugrep `-Z<N>` parity fixtures for exact,
+5. Eligible seeded regex searches use the in-memory backend.
+6. Unsupported or unseeded regex falls back to ugrep.
+7. Fuzzy memory results match ugrep `-Z<N>` parity fixtures for exact,
    insertion, deletion, substitution, no-match, and context cases.
-7. `max_results` truncation remains success-shaped for exact and fuzzy memory
-   searches.
-8. Timeout returns `isError=true` and `timed_out=true`.
-9. Hidden, ignore, symlink, and glob behavior match the baseline for eligible
+8. `max_results` truncation remains success-shaped for exact, seeded regex, and
+   fuzzy memory searches.
+9. Timeout returns `isError=true` and `timed_out=true`.
+10. Hidden, ignore, symlink, and glob behavior match the baseline for eligible
    fixtures.
 
 Parity tests SHOULD compare memory-backed output against the `ugrep` backend on

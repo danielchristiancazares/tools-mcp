@@ -3,6 +3,11 @@
 use super::ripgrep::SearchRequest;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
+use regex::bytes::{Regex, RegexBuilder};
+use regex_syntax::{
+    ParserBuilder as RegexParserBuilder,
+    hir::{Hir, HirKind},
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -21,6 +26,7 @@ const DEFAULT_MAX_CANDIDATES: usize = 20_000;
 const DEFAULT_MAX_FUZZY_PATTERN_CHARS: usize = 512;
 const DEFAULT_MAX_FUZZY_VERIFIED_LINES: usize = 200_000;
 const DEFAULT_MAX_FUZZY_LINE_CHARS: usize = 16_384;
+const DEFAULT_REGEX_SIZE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_WARM_CACHE_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Clone, Debug)]
@@ -91,6 +97,7 @@ struct Limits {
     max_fuzzy_pattern_chars: usize,
     max_fuzzy_verified_lines: usize,
     max_fuzzy_line_chars: usize,
+    regex_size_limit_bytes: usize,
 }
 
 impl Limits {
@@ -115,6 +122,10 @@ impl Limits {
                 "TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS",
                 DEFAULT_MAX_FUZZY_LINE_CHARS,
             ),
+            regex_size_limit_bytes: env_usize(
+                "TOOLS_SEARCH_REGEX_SIZE_LIMIT_BYTES",
+                DEFAULT_REGEX_SIZE_LIMIT_BYTES,
+            ),
         }
     }
 }
@@ -123,6 +134,7 @@ impl Limits {
 struct FileStamp {
     len: u64,
     modified: Option<SystemTime>,
+    change_marker: Option<MetadataChangeMarker>,
     hash: [u8; 32],
 }
 
@@ -222,6 +234,10 @@ enum QueryPlan {
         literal: Vec<u8>,
         case: LiteralCase,
     },
+    Regex {
+        matcher: Regex,
+        candidates: CandidateExpr,
+    },
     Fuzzy {
         pattern_chars: Vec<char>,
         distance: usize,
@@ -231,15 +247,22 @@ enum QueryPlan {
 
 impl QueryPlan {
     fn requires_utf8_scope(&self) -> bool {
-        matches!(self, Self::Fuzzy { .. })
+        matches!(self, Self::Regex { .. } | Self::Fuzzy { .. })
     }
 
     fn fuzzy_seed_count(&self) -> usize {
         match self {
-            Self::Exact { .. } => 0,
+            Self::Exact { .. } | Self::Regex { .. } => 0,
             Self::Fuzzy { seeds, .. } => seeds.len(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CandidateExpr {
+    Seed(Vec<u8>),
+    And(Vec<CandidateExpr>),
+    Or(Vec<CandidateExpr>),
 }
 
 impl IndexKey {
@@ -255,6 +278,12 @@ impl IndexKey {
 }
 
 static INDEX_CACHE: OnceLock<Mutex<IndexCache>> = OnceLock::new();
+
+#[cfg(unix)]
+type MetadataChangeMarker = (i64, i64);
+
+#[cfg(not(unix))]
+type MetadataChangeMarker = ();
 
 fn index_cache() -> &'static Mutex<IndexCache> {
     INDEX_CACHE.get_or_init(|| Mutex::new(IndexCache::default()))
@@ -339,8 +368,8 @@ pub(super) fn start_search_cache_warmer() {
 pub(super) async fn handle_memory_search(
     req: &SearchRequest,
 ) -> Result<ToolCallOutcome, MemoryError> {
-    let plan = eligible_query_plan(req)?;
     let limits = Limits::from_env();
+    let plan = eligible_query_plan_with_limits(req, &limits)?;
     validate_plan_limits(&plan, &limits)?;
     let deadline = Instant::now() + Duration::from_millis(req.timeout_ms());
     let cached = get_or_build_snapshot(req, &limits, deadline, plan.requires_utf8_scope())?;
@@ -550,7 +579,16 @@ fn search_index_warm_timeout_ms() -> u64 {
     .clamp(100, 300_000)
 }
 
+#[cfg(test)]
 fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
+    let limits = Limits::from_env();
+    eligible_query_plan_with_limits(req, &limits)
+}
+
+fn eligible_query_plan_with_limits(
+    req: &SearchRequest,
+    limits: &Limits,
+) -> Result<QueryPlan, MemoryError> {
     if let Some(distance) = req.fuzzy {
         return eligible_fuzzy_plan(req, distance);
     }
@@ -571,11 +609,7 @@ fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
     }
     let fixed_strings = req.fixed_strings.unwrap_or(false);
     if !fixed_strings && !is_plain_regex_literal(&req.pattern) {
-        return Err(MemoryError::new(
-            "unsupported_regex_dialect",
-            "unsupported_regex_backend",
-            "memory search regex support is limited to plain literal patterns in this POC",
-        ));
+        return eligible_regex_plan(req, limits);
     }
     let case = literal_case_for_request(req, fixed_strings)?;
 
@@ -598,6 +632,189 @@ fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
         literal: literal.to_vec(),
         case,
     })
+}
+
+fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan, MemoryError> {
+    ensure_regex_case_sensitive(req)?;
+    ensure_supported_common_regex_syntax(&req.pattern)?;
+
+    if req.pattern.contains('\n') || req.pattern.contains('\r') {
+        return Err(MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_multiline_regex",
+            "memory regex search does not support multiline regex patterns",
+        ));
+    }
+
+    let hir = RegexParserBuilder::new()
+        .utf8(true)
+        .unicode(true)
+        .build()
+        .parse(&req.pattern)
+        .map_err(|err| {
+            MemoryError::new(
+                "unsupported_regex_dialect",
+                "unsupported_regex_backend",
+                format!("memory regex search could not parse the pattern: {err}"),
+            )
+        })?;
+    let candidates = required_candidate_expr(&hir).ok_or_else(|| {
+        MemoryError::new(
+            "unsupported_regex_dialect",
+            "query_without_required_trigram",
+            "memory regex search requires a proven literal substring of at least three bytes",
+        )
+    })?;
+
+    let mut builder = RegexBuilder::new(&req.pattern);
+    builder
+        .unicode(true)
+        .case_insensitive(false)
+        .multi_line(false)
+        .dot_matches_new_line(false)
+        .size_limit(limits.regex_size_limit_bytes);
+    let matcher = builder.build().map_err(|err| {
+        MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_regex_backend",
+            format!("memory regex verifier could not compile the pattern: {err}"),
+        )
+    })?;
+
+    Ok(QueryPlan::Regex {
+        matcher,
+        candidates,
+    })
+}
+
+fn ensure_regex_case_sensitive(req: &SearchRequest) -> Result<(), MemoryError> {
+    match req.case_mode().as_str() {
+        "sensitive" | "case-sensitive" | "case_sensitive" => Ok(()),
+        "insensitive" | "ignore" | "ignore-case" | "ignore_case" => Err(MemoryError::new(
+            "unsupported_search_option",
+            "unsupported_regex_case_insensitive",
+            "memory regex search does not support case-insensitive regex matching",
+        )),
+        _ => {
+            if contains_uppercase_letter(&req.pattern) {
+                Ok(())
+            } else {
+                Err(MemoryError::new(
+                    "unsupported_search_option",
+                    "unsupported_regex_smart_case_insensitive",
+                    "memory regex search falls back for smart-case regexes that would be case-insensitive",
+                ))
+            }
+        }
+    }
+}
+
+fn ensure_supported_common_regex_syntax(pattern: &str) -> Result<(), MemoryError> {
+    if pattern.contains("(?") {
+        return Err(MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_regex_backend",
+            "memory regex search does not support inline flags, look-around, or special group syntax",
+        ));
+    }
+    if has_unsupported_regex_escape(pattern) {
+        return Err(MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_regex_backend",
+            "memory regex search does not support regex escapes outside the conservative ugrep-compatible subset",
+        ));
+    }
+    if has_lazy_quantifier_suffix(pattern) {
+        return Err(MemoryError::new(
+            "unsupported_regex_dialect",
+            "unsupported_regex_backend",
+            "memory regex search does not support lazy quantifier syntax",
+        ));
+    }
+    Ok(())
+}
+
+fn has_unsupported_regex_escape(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        let Some(&escaped) = bytes.get(index + 1) else {
+            return true;
+        };
+        if !is_supported_escaped_regex_byte(escaped) {
+            return true;
+        }
+        index += 2;
+    }
+    false
+}
+
+fn has_lazy_quantifier_suffix(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut previous_quantifier = false;
+
+    for &byte in bytes {
+        if escaped {
+            escaped = false;
+            previous_quantifier = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            previous_quantifier = false;
+            continue;
+        }
+        if in_class {
+            if byte == b']' {
+                in_class = false;
+            }
+            previous_quantifier = false;
+            continue;
+        }
+
+        match byte {
+            b'[' => {
+                in_class = true;
+                previous_quantifier = false;
+            }
+            b'?' if previous_quantifier => return true,
+            b'*' | b'+' | b'?' | b'}' => {
+                previous_quantifier = true;
+            }
+            _ => {
+                previous_quantifier = false;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_supported_escaped_regex_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'\\'
+            | b'.'
+            | b'^'
+            | b'$'
+            | b'|'
+            | b'?'
+            | b'*'
+            | b'+'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'-'
+    )
 }
 
 fn literal_case_for_request(
@@ -728,7 +945,7 @@ fn build_index(
     let mut indexed_bytes = 0_u64;
     let mut all_content_utf8 = true;
 
-    for path in discover_files(req)? {
+    for path in discover_files(req, Some(deadline))? {
         check_deadline(deadline)?;
         let metadata = fs::metadata(&path).map_err(|err| {
             MemoryError::new(
@@ -857,7 +1074,10 @@ fn build_index(
     })
 }
 
-fn discover_files(req: &SearchRequest) -> Result<Vec<PathBuf>, MemoryError> {
+fn discover_files(
+    req: &SearchRequest,
+    deadline: Option<Instant>,
+) -> Result<Vec<PathBuf>, MemoryError> {
     let root = Path::new(req.root());
     let include_hidden = req.hidden.unwrap_or(false);
     let no_ignore = req.no_ignore.unwrap_or(false);
@@ -873,6 +1093,9 @@ fn discover_files(req: &SearchRequest) -> Result<Vec<PathBuf>, MemoryError> {
 
     let mut files = Vec::new();
     for entry in builder.build() {
+        if let Some(deadline) = deadline {
+            check_deadline(deadline)?;
+        }
         let entry = entry.map_err(|err| {
             MemoryError::new(
                 "search_index_incomplete",
@@ -1012,6 +1235,9 @@ fn candidates_for_plan(
         QueryPlan::Exact { literal, case } => {
             candidates_for_literal(snapshot, literal, *case, max_candidates)
         }
+        QueryPlan::Regex { candidates, .. } => {
+            candidates_for_candidate_expr(snapshot, candidates, max_candidates)
+        }
         QueryPlan::Fuzzy { seeds, .. } => {
             let mut candidate_set = BTreeSet::new();
             for seed in seeds {
@@ -1039,6 +1265,62 @@ fn candidates_for_plan(
             Ok(candidates)
         }
     }
+}
+
+fn candidates_for_candidate_expr(
+    snapshot: &IndexSnapshot,
+    expr: &CandidateExpr,
+    max_candidates: usize,
+) -> Result<Vec<usize>, MemoryError> {
+    let mut candidates = match expr {
+        CandidateExpr::Seed(seed) => {
+            candidates_for_literal(snapshot, seed, LiteralCase::Sensitive, usize::MAX)?
+        }
+        CandidateExpr::And(children) => {
+            let mut child_sets = Vec::with_capacity(children.len());
+            for child in children {
+                child_sets.push(candidates_for_candidate_expr(snapshot, child, usize::MAX)?);
+            }
+            intersect_candidate_sets(child_sets)
+        }
+        CandidateExpr::Or(children) => {
+            let mut candidate_set = BTreeSet::new();
+            for child in children {
+                candidate_set.extend(candidates_for_candidate_expr(snapshot, child, usize::MAX)?);
+            }
+            candidate_set.into_iter().collect()
+        }
+    };
+
+    if candidates.len() > max_candidates {
+        return Err(MemoryError::new(
+            "resource_limit_exceeded",
+            "max_candidates_exceeded",
+            "memory search candidate limit exceeded",
+        ));
+    }
+    candidates.sort_by(|left, right| {
+        snapshot.documents[*left]
+            .rendered_path
+            .cmp(&snapshot.documents[*right].rendered_path)
+    });
+    Ok(candidates)
+}
+
+fn intersect_candidate_sets(mut child_sets: Vec<Vec<usize>>) -> Vec<usize> {
+    if child_sets.is_empty() {
+        return Vec::new();
+    }
+    child_sets.sort_by_key(Vec::len);
+    let mut result: BTreeSet<usize> = child_sets.remove(0).into_iter().collect();
+    for child in child_sets {
+        let child: BTreeSet<usize> = child.into_iter().collect();
+        result.retain(|doc_id| child.contains(doc_id));
+        if result.is_empty() {
+            break;
+        }
+    }
+    result.into_iter().collect()
 }
 
 fn candidates_for_literal(
@@ -1137,7 +1419,7 @@ fn check_snapshot_fresh(
     snapshot: &IndexSnapshot,
     deadline: Instant,
 ) -> Result<(), MemoryError> {
-    let current_paths = discover_files(req)?;
+    let current_paths = discover_files(req, Some(deadline))?;
     let expected_paths: BTreeSet<PathBuf> =
         snapshot.documents.iter().map(|d| d.path.clone()).collect();
     let observed_paths: BTreeSet<PathBuf> = current_paths.into_iter().collect();
@@ -1161,6 +1443,10 @@ fn check_snapshot_fresh(
                 ),
             )
         })?;
+        if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
+            continue;
+        }
+
         let content = fs::read(&doc.path).map_err(|err| {
             MemoryError::new(
                 "file_changed_during_verification",
@@ -1168,7 +1454,7 @@ fn check_snapshot_fresh(
                 format!("failed to re-read {}: {err}", doc.path.display()),
             )
         })?;
-        if file_stamp_from_parts(&metadata, &content) != doc.stamp {
+        if !file_stamp_content_matches(&doc.stamp, &file_stamp_from_parts(&metadata, &content)) {
             return Err(MemoryError::new(
                 "file_changed_during_verification",
                 "file_changed_during_verification",
@@ -1207,6 +1493,76 @@ fn is_plain_regex_literal(pattern: &str) -> bool {
 
 fn contains_uppercase_letter(pattern: &str) -> bool {
     pattern.chars().any(char::is_uppercase)
+}
+
+fn required_candidate_expr(hir: &Hir) -> Option<CandidateExpr> {
+    match hir.kind() {
+        HirKind::Empty | HirKind::Class(_) | HirKind::Look(_) => None,
+        HirKind::Literal(literal) => candidate_seed(literal.0.as_ref()),
+        HirKind::Capture(capture) => required_candidate_expr(capture.sub.as_ref()),
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0 {
+                None
+            } else {
+                required_candidate_expr(repetition.sub.as_ref())
+            }
+        }
+        HirKind::Concat(parts) => candidate_and(parts.iter().filter_map(required_candidate_expr)),
+        HirKind::Alternation(parts) => {
+            let mut alternatives = Vec::with_capacity(parts.len());
+            for part in parts {
+                alternatives.push(required_candidate_expr(part)?);
+            }
+            candidate_or(alternatives)
+        }
+    }
+}
+
+fn candidate_seed(bytes: &[u8]) -> Option<CandidateExpr> {
+    if bytes.len() >= 3 && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+        Some(CandidateExpr::Seed(bytes.to_vec()))
+    } else {
+        None
+    }
+}
+
+fn candidate_and<I>(exprs: I) -> Option<CandidateExpr>
+where
+    I: IntoIterator<Item = CandidateExpr>,
+{
+    let mut combined = Vec::new();
+    for expr in exprs {
+        match expr {
+            CandidateExpr::And(children) => combined.extend(children),
+            expr => combined.push(expr),
+        }
+    }
+    candidate_expr_from_many(combined, CandidateExpr::And)
+}
+
+fn candidate_or<I>(exprs: I) -> Option<CandidateExpr>
+where
+    I: IntoIterator<Item = CandidateExpr>,
+{
+    let mut combined = Vec::new();
+    for expr in exprs {
+        match expr {
+            CandidateExpr::Or(children) => combined.extend(children),
+            expr => combined.push(expr),
+        }
+    }
+    candidate_expr_from_many(combined, CandidateExpr::Or)
+}
+
+fn candidate_expr_from_many(
+    mut exprs: Vec<CandidateExpr>,
+    wrap: impl FnOnce(Vec<CandidateExpr>) -> CandidateExpr,
+) -> Option<CandidateExpr> {
+    match exprs.len() {
+        0 => None,
+        1 => exprs.pop(),
+        _ => Some(wrap(exprs)),
+    }
 }
 
 fn unique_trigrams(bytes: &[u8]) -> HashSet<[u8; 3]> {
@@ -1260,6 +1616,7 @@ fn matching_line_indexes(
                     contains_subslice_ascii_case_insensitive(line, literal)
                 }
             },
+            QueryPlan::Regex { matcher, .. } => matcher.is_match(line),
             QueryPlan::Fuzzy {
                 pattern_chars,
                 distance,
@@ -1493,8 +1850,34 @@ fn file_stamp_from_parts(metadata: &fs::Metadata, content: &[u8]) -> FileStamp {
     FileStamp {
         len: metadata.len(),
         modified: metadata.modified().ok(),
+        change_marker: metadata_change_marker(metadata),
         hash: hasher.finalize().into(),
     }
+}
+
+fn file_metadata_matches_without_hash(stamp: &FileStamp, metadata: &fs::Metadata) -> bool {
+    stamp.len == metadata.len()
+        && stamp.modified == metadata.modified().ok()
+        && stamp.change_marker.is_some()
+        && stamp.change_marker == metadata_change_marker(metadata)
+}
+
+fn file_stamp_content_matches(expected: &FileStamp, actual: &FileStamp) -> bool {
+    expected.len == actual.len
+        && expected.modified == actual.modified
+        && expected.hash == actual.hash
+}
+
+#[cfg(unix)]
+fn metadata_change_marker(metadata: &fs::Metadata) -> Option<MetadataChangeMarker> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some((metadata.ctime(), metadata.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn metadata_change_marker(_metadata: &fs::Metadata) -> Option<MetadataChangeMarker> {
+    None
 }
 
 fn render_path(root: &str, path: &Path) -> String {
@@ -1557,6 +1940,7 @@ mod tests {
             stamp: FileStamp {
                 len: 0,
                 modified: None,
+                change_marker: None,
                 hash: [0; 32],
             },
             content: b"alpha\nneedle one\nmiddle\nneedle two\nomega\n".to_vec(),
@@ -1607,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn regex_queries_are_ineligible_for_memory_poc() {
+    fn seeded_regex_queries_are_memory_eligible() {
         let req = SearchRequest {
             pattern: "nee.*dle".to_string(),
             path: Some(".".to_string()),
@@ -1623,9 +2007,146 @@ mod tests {
             timeout_ms: None,
             fuzzy: None,
         };
-        let error = eligible_query_plan(&req).expect_err("regex should be ineligible");
+        let plan = eligible_query_plan(&req).expect("seeded regex should be eligible");
+        match plan {
+            QueryPlan::Regex { candidates, .. } => {
+                assert_eq!(
+                    candidates,
+                    CandidateExpr::And(vec![
+                        CandidateExpr::Seed(b"nee".to_vec()),
+                        CandidateExpr::Seed(b"dle".to_vec())
+                    ])
+                );
+            }
+            QueryPlan::Exact { .. } | QueryPlan::Fuzzy { .. } => {
+                panic!("expected regex plan")
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_regex_alternation_unions_fully_seeded_branches() {
+        let req = SearchRequest {
+            pattern: "needle|haystack".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let plan = eligible_query_plan(&req).expect("seeded alternation should be eligible");
+        match plan {
+            QueryPlan::Regex { candidates, .. } => {
+                assert_eq!(
+                    candidates,
+                    CandidateExpr::Or(vec![
+                        CandidateExpr::Seed(b"needle".to_vec()),
+                        CandidateExpr::Seed(b"haystack".to_vec())
+                    ])
+                );
+            }
+            QueryPlan::Exact { .. } | QueryPlan::Fuzzy { .. } => {
+                panic!("expected regex plan")
+            }
+        }
+    }
+
+    #[test]
+    fn unseeded_regex_queries_fall_back() {
+        let req = SearchRequest {
+            pattern: "^[0-9]+$".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("unseeded regex should fall back");
+        assert_eq!(error.error_type, "unsupported_regex_dialect");
+        assert_eq!(error.fallback_reason, "query_without_required_trigram");
+    }
+
+    #[test]
+    fn regex_escapes_outside_common_subset_fall_back() {
+        let req = SearchRequest {
+            pattern: "needle\\d+".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("unsupported escape should fall back");
         assert_eq!(error.error_type, "unsupported_regex_dialect");
         assert_eq!(error.fallback_reason, "unsupported_regex_backend");
+    }
+
+    #[test]
+    fn regex_lazy_quantifier_syntax_falls_back() {
+        let req = SearchRequest {
+            pattern: "needle.*?haystack".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("lazy quantifier should fall back");
+        assert_eq!(error.error_type, "unsupported_regex_dialect");
+        assert_eq!(error.fallback_reason, "unsupported_regex_backend");
+    }
+
+    #[test]
+    fn smart_case_lowercase_regex_falls_back() {
+        let req = SearchRequest {
+            pattern: "needle.*haystack".to_string(),
+            path: Some(".".to_string()),
+            case: None,
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("smart lowercase regex should fall back");
+        assert_eq!(error.error_type, "unsupported_search_option");
+        assert_eq!(
+            error.fallback_reason,
+            "unsupported_regex_smart_case_insensitive"
+        );
     }
 
     #[test]
@@ -1651,7 +2172,7 @@ mod tests {
                 assert_eq!(literal, b"needle");
                 assert_eq!(case, LiteralCase::AsciiInsensitive);
             }
-            QueryPlan::Fuzzy { .. } => panic!("expected exact plan"),
+            QueryPlan::Regex { .. } | QueryPlan::Fuzzy { .. } => panic!("expected exact plan"),
         }
     }
 
@@ -1679,7 +2200,7 @@ mod tests {
                 assert_eq!(literal, b"Needle");
                 assert_eq!(case, LiteralCase::Sensitive);
             }
-            QueryPlan::Fuzzy { .. } => panic!("expected exact plan"),
+            QueryPlan::Regex { .. } | QueryPlan::Fuzzy { .. } => panic!("expected exact plan"),
         }
     }
 
@@ -1713,6 +2234,68 @@ mod tests {
         )
         .expect("verify");
         assert_eq!(events.iter().filter(|event| event.is_match).count(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seeded_regex_candidates_and_verification_eliminate_false_positives() {
+        let root = workspace_test_dir("seeded_regex_candidates_and_verification");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("match.txt"), "prefix nee123dle suffix\n").expect("write match");
+        fs::write(root.join("false-positive.txt"), "nee here\nseparate dle\n")
+            .expect("write false positive");
+        fs::write(root.join("miss.txt"), "nee only\n").expect("write miss");
+
+        let mut req = memory_req(&root);
+        req.pattern = "nee.*dle".to_string();
+        req.fixed_strings = Some(false);
+
+        let plan = eligible_query_plan(&req).expect("seeded regex plan");
+        let limits = test_limits();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let snapshot = build_index(&req, &limits, deadline, true, 1).expect("index");
+        let candidates =
+            candidates_for_plan(&snapshot, &plan, limits.max_candidates).expect("candidates");
+        let candidate_names: BTreeSet<String> = candidates
+            .iter()
+            .map(|doc_id| {
+                snapshot.documents[*doc_id]
+                    .path
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert!(candidate_names.contains("match.txt"));
+        assert!(candidate_names.contains("false-positive.txt"));
+        assert!(!candidate_names.contains("miss.txt"));
+
+        let (events, _, _, _) = verify_and_render(
+            &snapshot,
+            &candidates,
+            &plan,
+            &req,
+            &limits,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("verify");
+        let matched_names: BTreeSet<String> = events
+            .iter()
+            .filter(|event| event.is_match)
+            .map(|event| {
+                Path::new(&event.path)
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(matched_names, BTreeSet::from(["match.txt".to_string()]));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1898,7 +2481,7 @@ mod tests {
         let mut req = memory_req(&root);
         req.glob = Some(vec!["*.rs".to_string()]);
 
-        let files = discover_files(&req).expect("discover files");
+        let files = discover_files(&req, None).expect("discover files");
 
         assert!(files.contains(&root.join("src").join("lib.rs")));
         assert!(!files.contains(&root.join("notes.md")));
@@ -1917,7 +2500,7 @@ mod tests {
         let mut req = memory_req(&root);
         req.glob = Some(vec!["".to_string(), "  ".to_string(), "\t".to_string()]);
 
-        let files = discover_files(&req).expect("discover files");
+        let files = discover_files(&req, None).expect("discover files");
 
         assert_eq!(files.len(), 2);
         assert!(files.contains(&root.join("lib.rs")));
@@ -1935,7 +2518,7 @@ mod tests {
         let mut req = memory_req(&root);
         req.glob = Some(vec!["[".to_string()]);
 
-        let err = discover_files(&req).expect_err("invalid glob should fall back");
+        let err = discover_files(&req, None).expect_err("invalid glob should fall back");
 
         assert_eq!(err.error_type, "unsupported_search_option");
         assert_eq!(err.fallback_reason, "invalid_glob");
@@ -1988,6 +2571,25 @@ mod tests {
         let err = check_snapshot_fresh(&req, &snapshot, Instant::now() + Duration::from_secs(30))
             .expect_err("freshness should fail");
         assert_eq!(err.error_type, "file_changed_during_verification");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unchanged_metadata_fast_path_skips_hash_verification() {
+        let root = workspace_test_dir("unchanged_metadata_fast_path_skips_hash_verification");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        let file_path = root.join("sample.txt");
+        fs::write(&file_path, "needle\n").expect("write initial file");
+
+        let metadata = fs::metadata(&file_path).expect("metadata");
+        let content = fs::read(&file_path).expect("read");
+        let stamp = file_stamp_from_parts(&metadata, &content);
+        let metadata = fs::metadata(&file_path).expect("metadata again");
+
+        assert!(file_metadata_matches_without_hash(&stamp, &metadata));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2135,6 +2737,7 @@ mod tests {
             max_fuzzy_pattern_chars: DEFAULT_MAX_FUZZY_PATTERN_CHARS,
             max_fuzzy_verified_lines: DEFAULT_MAX_FUZZY_VERIFIED_LINES,
             max_fuzzy_line_chars: DEFAULT_MAX_FUZZY_LINE_CHARS,
+            regex_size_limit_bytes: DEFAULT_REGEX_SIZE_LIMIT_BYTES,
         }
     }
 

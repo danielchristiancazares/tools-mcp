@@ -28,13 +28,13 @@
 - **Web Content Fetching**: Retrieve and process web pages with SSRF protection and robots.txt compliance
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
 - **Git Integration**: Execute git commands (status, diff, restore, add, commit)
-- **Code Search**: Fast in-memory search for eligible literal-looking, fixed-string, and fuzzy fixed-string queries with ugrep fallback for regex and unsupported search modes
+- **Code Search**: Fast in-memory search for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries with ugrep fallback for unsupported regex and search modes
 - **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
 
 ### Highlights
 
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
-- **Search** - Fast local search with an automatic in-memory path for eligible literal-looking, fixed-string, and fuzzy fixed-string queries, plus ugrep fallback for regex and unsupported modes.
+- **Search** - Fast local search with an automatic in-memory path for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries, plus ugrep fallback for unsupported regex and search modes.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
 - **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
@@ -57,7 +57,7 @@
 
 - Rust toolchain 1.94 or newer (edition 2024).
 - Cargo in PATH (for running the MCP binary).
-- `ugrep` in PATH (required for `Search` regex, unsupported fuzzy modes, and fallback behavior).
+- `ugrep` in PATH (required for `Search` unsupported regex, unsupported fuzzy modes, and fallback behavior).
 - Git in PATH (required for all `Git*` tools).
 - **WebFetch browser support** (optional)
   - Chrome or Chromium installed and discoverable on PATH to enable headless rendering of JavaScript-heavy sites. Without it, WebFetch still works in HTTP-only mode.
@@ -465,15 +465,16 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> ToolCallOutcom
 
 **Location**: `tools-mcp-local/src/tools/search.rs`
 
-Provides file content search using an automatic in-memory fast path for eligible literal-looking, fixed-string, and fuzzy fixed-string queries, with ugrep fallback for regex and unsupported cases.
+Provides file content search using an automatic in-memory fast path for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries, with ugrep fallback for unsupported regex and search modes.
 
 ```rust
 /// Searches files using regex or fuzzy patterns
 ///
 /// # Backend Selection
-/// - Uses the in-memory POC for eligible literal-looking, fixed-string, and fuzzy fixed-string queries
-/// - Falls back to ugrep for regex and unsupported cases
+/// - Uses the in-memory POC for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries
+/// - Falls back to ugrep for unsupported regex and unsupported cases
 /// - Fuzzy parameter present (1-4): memory-backed only for eligible fixed-string searches; otherwise falls back to ugrep -Z<N>
+/// - Regex metacharacter patterns are memory-backed only when they are case-sensitive, line-oriented, compile with the Rust byte regex verifier, and have a proven required literal seed of at least three bytes
 ///
 /// # Parameters
 /// - pattern: String (required) - Search pattern (regex by default)
@@ -1170,6 +1171,7 @@ pub struct FetchChunk {
 | TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS | No | Maximum fuzzy fixed-string pattern length verified by the in-memory Search POC (default: 512 Unicode scalar values) |
 | TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES | No | Maximum candidate lines verified by the in-memory fuzzy Search POC (default: 200,000) |
 | TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS | No | Maximum line length verified by the in-memory fuzzy Search POC (default: 16,384 Unicode scalar values) |
+| TOOLS_SEARCH_REGEX_SIZE_LIMIT_BYTES | No | Maximum compiled regex verifier size for eligible in-memory seeded regex searches (default: 10 MiB) |
 | WEBFETCH_ENABLE_BROWSER_UNSAFE | No | Set to "true" to enable headless browser rendering in WebFetch (disabled by default) |
 
 ### Cache Locations
@@ -1272,6 +1274,8 @@ All tool handlers validate:
 |-------|---------|---------|
 | glob | 0.3 | Glob pattern matching |
 | ignore | 0.4 | .gitignore-aware walking |
+| regex | 1.12 | Byte regex verification for eligible in-memory Search regex queries |
+| regex-syntax | 0.8 | Regex HIR parsing and required literal seed analysis for Search |
 | sha2 | 0.10 | SHA-256 hashing |
 | hex | 0.4 | Hex encoding |
 | uuid | 1.0 | UUID generation |

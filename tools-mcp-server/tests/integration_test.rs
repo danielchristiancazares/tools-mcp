@@ -392,6 +392,101 @@ fn test_search_literal_default_options_uses_memory_backend() {
 }
 
 #[test]
+fn test_search_seeded_regex_uses_memory_backend() {
+    let dir = workspace_tempdir("search-regex-memory");
+    std::fs::write(
+        dir.path().join("match.txt"),
+        "intro\ncandidate needle middle haystack suffix\n",
+    )
+    .expect("write regex match fixture");
+    std::fs::write(
+        dir.path().join("false-positive.txt"),
+        "needle on one line\nhaystack on another\n",
+    )
+    .expect("write regex false positive fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 413,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "needle.*haystack",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "sensitive",
+                "fixed_strings": false,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call regex Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 413);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "memory");
+    assert_eq!(response["result"]["count"], 1);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert!(
+        text.contains("match.txt"),
+        "expected regex match, got: {text}"
+    );
+    assert!(
+        !text.contains("false-positive.txt"),
+        "regex Phase Two should remove cross-line false positives, got: {text}"
+    );
+}
+
+#[test]
+fn test_search_unseeded_regex_falls_back_to_ugrep() {
+    let ugrep_bin = ugrep_bin();
+    if !command_available(ugrep_bin) {
+        eprintln!("Skipping unseeded regex fallback test: {ugrep_bin} not found on PATH");
+        return;
+    }
+
+    let dir = workspace_tempdir("search-regex-fallback");
+    std::fs::write(dir.path().join("numbers.txt"), "12345\nabcde\n")
+        .expect("write regex fallback fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 414,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "^[0-9]+$",
+                "path": dir.path().to_string_lossy().to_string(),
+                "case": "sensitive",
+                "fixed_strings": false,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call regex fallback Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 414);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "ugrep");
+    assert_eq!(
+        response["result"]["fallback_reason"],
+        "query_without_required_trigram"
+    );
+    assert_eq!(response["result"]["count"], 1);
+}
+
+#[test]
 fn test_search_fuzzy_fixed_string_uses_memory_backend() {
     let dir = workspace_tempdir("search-fuzzy-memory");
     std::fs::write(
