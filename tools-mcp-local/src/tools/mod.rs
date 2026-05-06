@@ -24,3 +24,7 @@ pub fn register_tools(registry: &mut ToolRegistry) {
     registry.register::<pwsh::PwshTool>();
     registry.register::<search::SearchTool>();
 }
+
+pub fn start_search_cache_warmer() {
+    handlers::start_search_cache_warmer();
+}

@@ -35,6 +35,8 @@ async fn main() -> Result<()> {
     let reader = BufReader::new(stdin);
     let mut reader = reader;
 
+    tools_mcp_local::start_search_cache_warmer();
+
     let registry = build_tool_registry();
     let tools = registry.list();
 

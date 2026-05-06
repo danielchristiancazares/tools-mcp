@@ -28,13 +28,13 @@
 - **Web Content Fetching**: Retrieve and process web pages with SSRF protection and robots.txt compliance
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
 - **Git Integration**: Execute git commands (status, diff, restore, add, commit)
-- **Code Search**: Fast in-memory search for eligible fixed-string and fuzzy fixed-string queries with ugrep fallback for regex and unsupported search modes
+- **Code Search**: Fast in-memory search for eligible literal-looking, fixed-string, and fuzzy fixed-string queries with ugrep fallback for regex and unsupported search modes
 - **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
 
 ### Highlights
 
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
-- **Search** - Fast local search with an automatic in-memory path for eligible fixed-string and fuzzy fixed-string queries, plus ugrep fallback for regex and unsupported modes.
+- **Search** - Fast local search with an automatic in-memory path for eligible literal-looking, fixed-string, and fuzzy fixed-string queries, plus ugrep fallback for regex and unsupported modes.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
 - **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
@@ -465,13 +465,13 @@ pub async fn handle_git_commit(id: Option<Value>, args: Value) -> ToolCallOutcom
 
 **Location**: `tools-mcp-local/src/tools/search.rs`
 
-Provides file content search using an automatic in-memory fast path for eligible fixed-string and fuzzy fixed-string queries, with ugrep fallback for regex and unsupported cases.
+Provides file content search using an automatic in-memory fast path for eligible literal-looking, fixed-string, and fuzzy fixed-string queries, with ugrep fallback for regex and unsupported cases.
 
 ```rust
 /// Searches files using regex or fuzzy patterns
 ///
 /// # Backend Selection
-/// - Uses the in-memory POC for eligible fixed-string and fuzzy fixed-string queries
+/// - Uses the in-memory POC for eligible literal-looking, fixed-string, and fuzzy fixed-string queries
 /// - Falls back to ugrep for regex and unsupported cases
 /// - Fuzzy parameter present (1-4): memory-backed only for eligible fixed-string searches; otherwise falls back to ugrep -Z<N>
 ///
@@ -641,7 +641,7 @@ Fetch and normalize external web content with caching and JS-aware rendering.
 
 ### Search
 
-Fast local search that automatically uses the in-memory POC for a conservative fixed-string subset, including eligible fuzzy fixed-string searches, and delegates regex and unsupported cases to ugrep.
+Fast local search that automatically uses the in-memory POC for common literal searches, including literal-looking default patterns and eligible fuzzy fixed-string searches, and delegates regex and unsupported cases to ugrep.
 
 - **Tool name**: `Search`
 - **Required**:
@@ -665,18 +665,19 @@ Fast local search that automatically uses the in-memory POC for a conservative f
 - **Notes**:
   - Requires `ugrep` to be installed and discoverable on PATH on the machine running the MCP server for regex, unsupported fuzzy modes, and fallback behavior.
   - Backend selection is automatic; there is no environment flag or MCP request parameter for choosing the backend.
-  - Eligible fixed-string requests, including the narrow fuzzy fixed-string subset below, use the in-memory POC. Unsupported or ambiguous requests fall back to ugrep.
-  - The initial in-memory eligible subset is intentionally narrow:
-    - Exact literals: `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and no `fuzzy`.
+  - When the MCP server starts inside a Git worktree, it starts a best-effort background warm-cache thread for the repository root using the default file-selection shape (`hidden=false`, `follow=false`, `no_ignore=false`, no globs). This warmup does not block stdin/stdout startup and logs only to stderr.
+  - Eligible literal requests, including the narrow fuzzy fixed-string subset below, use the in-memory POC. Unsupported or ambiguous requests fall back to ugrep.
+  - The in-memory eligible subset is conservative:
+    - Exact literals: `word_regexp=false`, no `fuzzy`, at least three bytes, no newlines, and either `fixed_strings=true` or a plain regex pattern with no regex metacharacters.
+    - Exact literal case handling: `case=sensitive` is byte-exact; `case=insensitive` and lowercase `case=smart` use ugrep-compatible ASCII case folding for fixed strings. Plain regex literals use memory for ASCII case-insensitive matching and fall back for Unicode regex case folding.
     - Fuzzy literals: `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and `fuzzy` set to `1` through `4`, when the pattern has no newline and can be partitioned into `fuzzy + 1` contiguous UTF-8 seed segments of at least three bytes each.
-    - Exact fixed strings must contain at least three bytes and must not contain newlines.
-    - Regex patterns are delegated to ugrep in this POC; they are not memory-backed yet.
+    - Regex patterns with metacharacters are delegated to ugrep in this POC; they are not memory-backed yet.
     - Glob include filters can remain memory-backed for eligible fixed-string searches when file-selection semantics can be preserved; otherwise the request falls back to ugrep.
     - File-selection semantics (`path`, `glob`, `hidden`, `follow`, `no_ignore`, binary handling, and size limits) must be preserved exactly; otherwise the request falls back to ugrep.
-  - The in-memory POC falls back for regex fuzzy searches, word-regexp searches, case-insensitive searches, smart-case searches unless parity is proven, unsupported regex features such as look-around or backreferences, patterns without a required three-byte literal, fuzzy patterns that cannot produce the required seeds, incomplete index coverage, stale verification, or exceeded index limits.
-  - Additional response fields are additive and do not replace existing fields. Memory-backed responses include `backend: "memory"` and may include diagnostics such as `index_generation`, `indexed_files`, `indexed_bytes`, `candidate_count`, `fuzzy_seed_count`, `fuzzy_verified_lines`, `phase_one_ms`, and `phase_two_ms`. Fallback responses may include `backend: "ugrep"` and `fallback_reason`.
-  - Resource limits are configurable with `TOOLS_SEARCH_INDEX_MAX_FILE_BYTES` (default 1 MiB), `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES` (default 256 MiB per file-selection key), `TOOLS_SEARCH_INDEX_MAX_FILES` (default 50,000), `TOOLS_SEARCH_MAX_CANDIDATES` (default 20,000), and the fuzzy verifier limits `TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS` (default 512), `TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES` (default 200,000), and `TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS` (default 16,384). Existing `timeout_ms` and `max_results` still apply.
-  - Limitations: this POC is not semantic search, does not provide ranking or embeddings, does not persist an on-disk index, does not require file-system watchers, does not accelerate `Read`, and is not a full ugrep replacement or final Hauberk design.
+  - The in-memory POC falls back for regex fuzzy searches, word-regexp searches, symlink-following searches, regex patterns with metacharacters, Unicode regex case-folding cases, patterns without a required three-byte literal, fuzzy patterns that cannot produce the required seeds, incomplete index coverage, stale verification, or exceeded index limits.
+  - Additional response fields are additive and do not replace existing fields. Memory-backed responses include `backend: "memory"` and may include diagnostics such as `index_cache`, `index_generation`, `indexed_files`, `indexed_bytes`, `candidate_count`, `fuzzy_seed_count`, `fuzzy_verified_lines`, `phase_one_ms`, and `phase_two_ms`. Fallback responses may include `backend: "ugrep"` and `fallback_reason`.
+  - Resource limits are configurable with `TOOLS_SEARCH_INDEX_MAX_FILE_BYTES` (default 1 MiB), `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES` (default 256 MiB per file-selection key), `TOOLS_SEARCH_INDEX_MAX_FILES` (default 50,000), `TOOLS_SEARCH_MAX_CANDIDATES` (default 20,000), `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS` (default 300,000), and the fuzzy verifier limits `TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS` (default 512), `TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES` (default 200,000), and `TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS` (default 16,384). Existing `timeout_ms` and `max_results` still apply.
+  - Limitations: this POC is not semantic search, does not provide ranking or embeddings, does not persist an on-disk index across server processes, does not require file-system watchers, does not accelerate `Read`, and is not a full ugrep replacement or final Hauberk design.
 
 ### Read
 

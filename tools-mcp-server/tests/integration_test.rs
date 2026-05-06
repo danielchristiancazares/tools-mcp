@@ -317,13 +317,7 @@ fn test_read_file_shows_line_numbers_when_enabled() {
 }
 
 #[test]
-fn test_search_tool_call_if_ugrep_installed() {
-    let ugrep_bin = ugrep_bin();
-    if !command_available(ugrep_bin) {
-        eprintln!("Skipping Search test: {ugrep_bin} not found on PATH");
-        return;
-    }
-
+fn test_search_fixed_string_default_smart_uses_memory_backend() {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 41,
@@ -347,8 +341,54 @@ fn test_search_tool_call_if_ugrep_installed() {
     assert_eq!(response["result"]["isError"], false);
     assert_eq!(response["result"]["pattern"], "handle_read_file");
     assert_eq!(response["result"]["path"], READ_HANDLER_PATH);
+    assert_eq!(response["result"]["backend"], "memory");
+    assert!(matches!(
+        response["result"]["index_cache"].as_str(),
+        Some("hit" | "miss")
+    ));
     assert!(response["result"]["count"].as_u64().unwrap_or(0) >= 1);
     assert!(response["result"]["matches"].is_array());
+}
+
+#[test]
+fn test_search_literal_default_options_uses_memory_backend() {
+    let dir = workspace_tempdir("search-literal-default-memory");
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        "intro\ncandidate COMMONNEEDLE suffix\nunrelated line\n",
+    )
+    .expect("write literal fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 409,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "commonneedle",
+                "path": dir.path().to_string_lossy().to_string(),
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call default literal Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 409);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["backend"], "memory");
+    assert_eq!(response["result"]["count"], 1);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert!(
+        text.contains("COMMONNEEDLE"),
+        "expected smart-case literal match, got: {text}"
+    );
 }
 
 #[test]

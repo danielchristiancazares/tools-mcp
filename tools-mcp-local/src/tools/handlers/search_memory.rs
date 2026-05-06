@@ -8,8 +8,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tools_mcp_core::ToolCallOutcome;
+use tracing::{debug, info, warn};
 
 const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -18,6 +21,7 @@ const DEFAULT_MAX_CANDIDATES: usize = 20_000;
 const DEFAULT_MAX_FUZZY_PATTERN_CHARS: usize = 512;
 const DEFAULT_MAX_FUZZY_VERIFIED_LINES: usize = 200_000;
 const DEFAULT_MAX_FUZZY_LINE_CHARS: usize = 16_384;
+const DEFAULT_WARM_CACHE_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Clone, Debug)]
 pub(super) struct MemoryError {
@@ -137,11 +141,58 @@ struct LineRange {
     end: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiteralCase {
+    Sensitive,
+    AsciiInsensitive,
+}
+
 #[derive(Debug)]
 struct IndexSnapshot {
     generation: u64,
     documents: Vec<Document>,
     postings: HashMap<[u8; 3], Vec<usize>>,
+    ascii_folded_postings: HashMap<[u8; 3], Vec<usize>>,
+    indexed_bytes: u64,
+    all_content_utf8: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct IndexKey {
+    root: String,
+    hidden: bool,
+    follow: bool,
+    no_ignore: bool,
+    globs: Vec<String>,
+}
+
+#[derive(Debug)]
+struct IndexCache {
+    next_generation: u64,
+    entries: HashMap<IndexKey, Arc<IndexSnapshot>>,
+}
+
+impl Default for IndexCache {
+    fn default() -> Self {
+        Self {
+            next_generation: 1,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedSnapshot {
+    key: IndexKey,
+    snapshot: Arc<IndexSnapshot>,
+    cache_status: &'static str,
+}
+
+#[derive(Debug)]
+struct WarmCacheSummary {
+    root: String,
+    generation: u64,
+    indexed_files: usize,
     indexed_bytes: u64,
 }
 
@@ -169,6 +220,7 @@ struct SearchGlobFilter {
 enum QueryPlan {
     Exact {
         literal: Vec<u8>,
+        case: LiteralCase,
     },
     Fuzzy {
         pattern_chars: Vec<char>,
@@ -190,6 +242,100 @@ impl QueryPlan {
     }
 }
 
+impl IndexKey {
+    fn from_request(req: &SearchRequest) -> Self {
+        Self {
+            root: req.root().to_string(),
+            hidden: req.hidden.unwrap_or(false),
+            follow: req.follow.unwrap_or(false),
+            no_ignore: req.no_ignore.unwrap_or(false),
+            globs: normalized_globs(req),
+        }
+    }
+}
+
+static INDEX_CACHE: OnceLock<Mutex<IndexCache>> = OnceLock::new();
+
+fn index_cache() -> &'static Mutex<IndexCache> {
+    INDEX_CACHE.get_or_init(|| Mutex::new(IndexCache::default()))
+}
+
+fn lock_index_cache() -> MutexGuard<'static, IndexCache> {
+    index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn normalized_globs(req: &SearchRequest) -> Vec<String> {
+    req.glob
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|glob| glob.trim())
+        .filter(|glob| !glob.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn reserve_index_generation() -> u64 {
+    let mut cache = lock_index_cache();
+    let generation = cache.next_generation;
+    cache.next_generation = cache.next_generation.saturating_add(1).max(1);
+    generation
+}
+
+fn cached_snapshot(key: &IndexKey) -> Option<Arc<IndexSnapshot>> {
+    lock_index_cache().entries.get(key).cloned()
+}
+
+fn publish_snapshot_if_absent(key: IndexKey, snapshot: Arc<IndexSnapshot>) -> Arc<IndexSnapshot> {
+    let mut cache = lock_index_cache();
+    cache.entries.entry(key).or_insert(snapshot).clone()
+}
+
+fn evict_snapshot_if_current(key: &IndexKey, snapshot: &Arc<IndexSnapshot>) {
+    let mut cache = lock_index_cache();
+    if cache
+        .entries
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, snapshot))
+    {
+        cache.entries.remove(key);
+    }
+}
+
+pub(super) fn start_search_cache_warmer() {
+    match std::thread::Builder::new()
+        .name("tools-search-index-warm".to_string())
+        .spawn(|| {
+            debug!("starting search index warm-cache thread");
+            match warm_cache_for_current_git_repo_blocking() {
+                Ok(Some(summary)) => {
+                    info!(
+                        root = %summary.root,
+                        generation = summary.generation,
+                        indexed_files = summary.indexed_files,
+                        indexed_bytes = summary.indexed_bytes,
+                        "warmed search index cache"
+                    );
+                }
+                Ok(None) => {
+                    debug!("search index warm-cache skipped because current directory is not inside a git worktree");
+                }
+                Err(err) => {
+                    debug!(error = %err, "search index warm-cache did not populate");
+                }
+            }
+        }) {
+        Ok(handle) => {
+            std::mem::drop(handle);
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to start search index warm-cache thread");
+        }
+    }
+}
+
 pub(super) async fn handle_memory_search(
     req: &SearchRequest,
 ) -> Result<ToolCallOutcome, MemoryError> {
@@ -197,7 +343,8 @@ pub(super) async fn handle_memory_search(
     let limits = Limits::from_env();
     validate_plan_limits(&plan, &limits)?;
     let deadline = Instant::now() + Duration::from_millis(req.timeout_ms());
-    let snapshot = build_index(req, &limits, deadline, plan.requires_utf8_scope())?;
+    let cached = get_or_build_snapshot(req, &limits, deadline, plan.requires_utf8_scope())?;
+    let snapshot = cached.snapshot;
 
     check_deadline(deadline)?;
     let phase_one_start = Instant::now();
@@ -210,7 +357,10 @@ pub(super) async fn handle_memory_search(
         verify_and_render(&snapshot, &candidates, &plan, req, &limits, deadline)?;
     let phase_two_ms = phase_two_start.elapsed().as_millis() as u64;
 
-    check_snapshot_fresh(req, &snapshot, deadline)?;
+    if let Err(err) = check_snapshot_fresh(req, &snapshot, deadline) {
+        evict_snapshot_if_current(&cached.key, &snapshot);
+        return Err(err);
+    }
 
     let text_view = rendered_lines.join("\n");
     let exit_code = if events.iter().any(|event| event.is_match) {
@@ -243,6 +393,7 @@ pub(super) async fn handle_memory_search(
         "count": matches.len(),
         "matches": matches,
         "backend": "memory",
+        "index_cache": cached.cache_status,
         "index_generation": snapshot.generation,
         "indexed_files": snapshot.documents.len(),
         "indexed_bytes": snapshot.indexed_bytes,
@@ -252,6 +403,151 @@ pub(super) async fn handle_memory_search(
         "phase_one_ms": phase_one_ms,
         "phase_two_ms": phase_two_ms,
     })))
+}
+
+fn get_or_build_snapshot(
+    req: &SearchRequest,
+    limits: &Limits,
+    deadline: Instant,
+    require_utf8_scope: bool,
+) -> Result<CachedSnapshot, MemoryError> {
+    let key = IndexKey::from_request(req);
+    if let Some(snapshot) = cached_snapshot(&key) {
+        ensure_snapshot_supports_query(&snapshot, require_utf8_scope)?;
+        return Ok(CachedSnapshot {
+            key,
+            snapshot,
+            cache_status: "hit",
+        });
+    }
+
+    let generation = reserve_index_generation();
+    let snapshot = Arc::new(build_index(
+        req,
+        limits,
+        deadline,
+        require_utf8_scope,
+        generation,
+    )?);
+    let snapshot = publish_snapshot_if_absent(key.clone(), snapshot);
+    ensure_snapshot_supports_query(&snapshot, require_utf8_scope)?;
+    Ok(CachedSnapshot {
+        key,
+        snapshot,
+        cache_status: "miss",
+    })
+}
+
+fn ensure_snapshot_supports_query(
+    snapshot: &IndexSnapshot,
+    require_utf8_scope: bool,
+) -> Result<(), MemoryError> {
+    if require_utf8_scope && !snapshot.all_content_utf8 {
+        return Err(MemoryError::new(
+            "search_index_incomplete",
+            "fuzzy_scope_not_utf8",
+            "memory fuzzy search requires valid UTF-8 text for the selected scope",
+        ));
+    }
+    Ok(())
+}
+
+fn warm_cache_for_current_git_repo_blocking() -> Result<Option<WarmCacheSummary>, String> {
+    let cwd = std::env::current_dir().map_err(|err| format!("failed to read cwd: {err}"))?;
+    let Some(repo_root) = git_worktree_root_from(&cwd) else {
+        return Ok(None);
+    };
+    let root = warm_cache_root_argument(&cwd, &repo_root);
+    warm_cache_for_root(root)
+        .map(Some)
+        .map_err(|err| err.message)
+}
+
+fn warm_cache_root_argument(cwd: &Path, repo_root: &Path) -> String {
+    if paths_refer_to_same_location(cwd, repo_root) {
+        ".".to_string()
+    } else {
+        repo_root.display().to_string()
+    }
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn warm_cache_for_root(root: String) -> Result<WarmCacheSummary, MemoryError> {
+    let req = SearchRequest {
+        pattern: "__tools_mcp_search_warm_cache__".to_string(),
+        path: Some(root.clone()),
+        case: Some("sensitive".to_string()),
+        fixed_strings: Some(true),
+        word_regexp: Some(false),
+        glob: None,
+        hidden: Some(false),
+        follow: Some(false),
+        no_ignore: Some(false),
+        context: None,
+        max_results: None,
+        timeout_ms: Some(search_index_warm_timeout_ms()),
+        fuzzy: None,
+    };
+    let limits = Limits::from_env();
+    let deadline = Instant::now() + Duration::from_millis(req.timeout_ms());
+    let key = IndexKey::from_request(&req);
+
+    if let Some(snapshot) = cached_snapshot(&key) {
+        return Ok(WarmCacheSummary {
+            root,
+            generation: snapshot.generation,
+            indexed_files: snapshot.documents.len(),
+            indexed_bytes: snapshot.indexed_bytes,
+        });
+    }
+
+    let generation = reserve_index_generation();
+    let snapshot = Arc::new(build_index(&req, &limits, deadline, false, generation)?);
+    let snapshot = publish_snapshot_if_absent(key, snapshot);
+
+    Ok(WarmCacheSummary {
+        root,
+        generation: snapshot.generation,
+        indexed_files: snapshot.documents.len(),
+        indexed_bytes: snapshot.indexed_bytes,
+    })
+}
+
+fn git_worktree_root_from(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new(git_bin())
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let root = stdout.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+fn git_bin() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "git.exe"
+    } else {
+        "git"
+    }
+}
+
+fn search_index_warm_timeout_ms() -> u64 {
+    env_u64(
+        "TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS",
+        DEFAULT_WARM_CACHE_TIMEOUT_MS,
+    )
+    .clamp(100, 300_000)
 }
 
 fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
@@ -273,30 +569,15 @@ fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
             "memory search does not support following symlinks",
         ));
     }
-    match req.case_mode().as_str() {
-        "sensitive" | "case-sensitive" | "case_sensitive" => {}
-        "insensitive" | "ignore" | "ignore-case" | "ignore_case" => {
-            return Err(MemoryError::new(
-                "unsupported_search_option",
-                "unsupported_case_insensitive",
-                "memory search only supports case=sensitive",
-            ));
-        }
-        _ => {
-            return Err(MemoryError::new(
-                "unsupported_search_option",
-                "unsupported_smart_case",
-                "memory search only supports case=sensitive",
-            ));
-        }
-    }
-    if !req.fixed_strings.unwrap_or(false) {
+    let fixed_strings = req.fixed_strings.unwrap_or(false);
+    if !fixed_strings && !is_plain_regex_literal(&req.pattern) {
         return Err(MemoryError::new(
             "unsupported_regex_dialect",
             "unsupported_regex_backend",
-            "memory search regex support is not enabled in this POC",
+            "memory search regex support is limited to plain literal patterns in this POC",
         ));
     }
+    let case = literal_case_for_request(req, fixed_strings)?;
 
     let literal = req.pattern.as_bytes();
     if literal.len() < 3 {
@@ -315,7 +596,41 @@ fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
     }
     Ok(QueryPlan::Exact {
         literal: literal.to_vec(),
+        case,
     })
+}
+
+fn literal_case_for_request(
+    req: &SearchRequest,
+    fixed_strings: bool,
+) -> Result<LiteralCase, MemoryError> {
+    match req.case_mode().as_str() {
+        "sensitive" | "case-sensitive" | "case_sensitive" => Ok(LiteralCase::Sensitive),
+        "insensitive" | "ignore" | "ignore-case" | "ignore_case" => {
+            if fixed_strings || req.pattern.is_ascii() {
+                Ok(LiteralCase::AsciiInsensitive)
+            } else {
+                Err(MemoryError::new(
+                    "unsupported_search_option",
+                    "unsupported_unicode_regex_case_insensitive",
+                    "memory regex literal search does not support Unicode case-insensitive matching",
+                ))
+            }
+        }
+        _ => {
+            if contains_uppercase_letter(&req.pattern) {
+                Ok(LiteralCase::Sensitive)
+            } else if fixed_strings || req.pattern.is_ascii() {
+                Ok(LiteralCase::AsciiInsensitive)
+            } else {
+                Err(MemoryError::new(
+                    "unsupported_search_option",
+                    "unsupported_unicode_regex_smart_case",
+                    "memory regex literal search does not support Unicode smart-case matching",
+                ))
+            }
+        }
+    }
 }
 
 fn validate_plan_limits(plan: &QueryPlan, limits: &Limits) -> Result<(), MemoryError> {
@@ -407,9 +722,11 @@ fn build_index(
     limits: &Limits,
     deadline: Instant,
     require_utf8_scope: bool,
+    generation: u64,
 ) -> Result<IndexSnapshot, MemoryError> {
     let mut documents = Vec::new();
     let mut indexed_bytes = 0_u64;
+    let mut all_content_utf8 = true;
 
     for path in discover_files(req)? {
         check_deadline(deadline)?;
@@ -480,15 +797,18 @@ fn build_index(
                 ),
             ));
         }
-        if require_utf8_scope && std::str::from_utf8(&content).is_err() {
-            return Err(MemoryError::new(
-                "search_index_incomplete",
-                "fuzzy_scope_not_utf8",
-                format!(
-                    "memory fuzzy search requires valid UTF-8 text in {}",
-                    path.display()
-                ),
-            ));
+        if std::str::from_utf8(&content).is_err() {
+            all_content_utf8 = false;
+            if require_utf8_scope {
+                return Err(MemoryError::new(
+                    "search_index_incomplete",
+                    "fuzzy_scope_not_utf8",
+                    format!(
+                        "memory fuzzy search requires valid UTF-8 text in {}",
+                        path.display()
+                    ),
+                ));
+            }
         }
 
         let stamp = file_stamp_from_parts(&metadata, &content);
@@ -505,21 +825,35 @@ fn build_index(
     documents.sort_by(|left, right| left.rendered_path.cmp(&right.rendered_path));
 
     let mut postings: HashMap<[u8; 3], Vec<usize>> = HashMap::new();
+    let mut ascii_folded_postings: HashMap<[u8; 3], Vec<usize>> = HashMap::new();
     for (doc_id, doc) in documents.iter().enumerate() {
         let trigrams = unique_trigrams(&doc.content);
         for trigram in trigrams {
             postings.entry(trigram).or_default().push(doc_id);
         }
+
+        let folded = ascii_folded_bytes(&doc.content);
+        for trigram in unique_trigrams(&folded) {
+            ascii_folded_postings
+                .entry(trigram)
+                .or_default()
+                .push(doc_id);
+        }
     }
     for docs in postings.values_mut() {
         docs.sort_unstable();
     }
+    for docs in ascii_folded_postings.values_mut() {
+        docs.sort_unstable();
+    }
 
     Ok(IndexSnapshot {
-        generation: 1,
+        generation,
         documents,
         postings,
+        ascii_folded_postings,
         indexed_bytes,
+        all_content_utf8,
     })
 }
 
@@ -675,11 +1009,15 @@ fn candidates_for_plan(
     max_candidates: usize,
 ) -> Result<Vec<usize>, MemoryError> {
     match plan {
-        QueryPlan::Exact { literal } => candidates_for_literal(snapshot, literal, max_candidates),
+        QueryPlan::Exact { literal, case } => {
+            candidates_for_literal(snapshot, literal, *case, max_candidates)
+        }
         QueryPlan::Fuzzy { seeds, .. } => {
             let mut candidate_set = BTreeSet::new();
             for seed in seeds {
-                for doc_id in candidates_for_literal(snapshot, seed, max_candidates)? {
+                for doc_id in
+                    candidates_for_literal(snapshot, seed, LiteralCase::Sensitive, max_candidates)?
+                {
                     candidate_set.insert(doc_id);
                 }
             }
@@ -706,12 +1044,21 @@ fn candidates_for_plan(
 fn candidates_for_literal(
     snapshot: &IndexSnapshot,
     literal: &[u8],
+    case: LiteralCase,
     max_candidates: usize,
 ) -> Result<Vec<usize>, MemoryError> {
-    let trigrams = literal_trigrams(literal);
+    let folded_literal;
+    let (indexed_literal, index_postings) = match case {
+        LiteralCase::Sensitive => (literal, &snapshot.postings),
+        LiteralCase::AsciiInsensitive => {
+            folded_literal = ascii_folded_bytes(literal);
+            (folded_literal.as_slice(), &snapshot.ascii_folded_postings)
+        }
+    };
+    let trigrams = literal_trigrams(indexed_literal);
     let mut posting_lists: Vec<&Vec<usize>> = Vec::with_capacity(trigrams.len());
     for trigram in trigrams {
-        let Some(postings) = snapshot.postings.get(&trigram) else {
+        let Some(postings) = index_postings.get(&trigram) else {
             return Ok(Vec::new());
         };
         posting_lists.push(postings);
@@ -845,6 +1192,23 @@ fn literal_trigrams(bytes: &[u8]) -> Vec<[u8; 3]> {
     trigrams
 }
 
+fn ascii_folded_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+fn is_plain_regex_literal(pattern: &str) -> bool {
+    !pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '\\' | '.' | '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    })
+}
+
+fn contains_uppercase_letter(pattern: &str) -> bool {
+    pattern.chars().any(char::is_uppercase)
+}
+
 fn unique_trigrams(bytes: &[u8]) -> HashSet<[u8; 3]> {
     literal_trigrams(bytes).into_iter().collect()
 }
@@ -890,7 +1254,12 @@ fn matching_line_indexes(
         check_deadline(deadline)?;
         let line = &doc.content[range.start..range.end];
         let is_match = match plan {
-            QueryPlan::Exact { literal } => contains_subslice(line, literal),
+            QueryPlan::Exact { literal, case } => match case {
+                LiteralCase::Sensitive => contains_subslice(line, literal),
+                LiteralCase::AsciiInsensitive => {
+                    contains_subslice_ascii_case_insensitive(line, literal)
+                }
+            },
             QueryPlan::Fuzzy {
                 pattern_chars,
                 distance,
@@ -1099,6 +1468,21 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn contains_subslice_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| bytes_eq_ignore_ascii_case(window, needle))
+}
+
+fn bytes_eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 fn content_contains_nul(content: &[u8]) -> bool {
     content.contains(&0)
 }
@@ -1183,6 +1567,7 @@ mod tests {
             &doc,
             &QueryPlan::Exact {
                 literal: b"needle".to_vec(),
+                case: LiteralCase::Sensitive,
             },
             &test_limits(),
             Instant::now() + Duration::from_secs(30),
@@ -1244,6 +1629,95 @@ mod tests {
     }
 
     #[test]
+    fn plain_regex_literal_with_default_smart_case_is_memory_eligible() {
+        let req = SearchRequest {
+            pattern: "needle".to_string(),
+            path: Some(".".to_string()),
+            case: None,
+            fixed_strings: None,
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let plan = eligible_query_plan(&req).expect("plain literal regex should be eligible");
+        match plan {
+            QueryPlan::Exact { literal, case } => {
+                assert_eq!(literal, b"needle");
+                assert_eq!(case, LiteralCase::AsciiInsensitive);
+            }
+            QueryPlan::Fuzzy { .. } => panic!("expected exact plan"),
+        }
+    }
+
+    #[test]
+    fn smart_case_with_uppercase_literal_stays_case_sensitive() {
+        let req = SearchRequest {
+            pattern: "Needle".to_string(),
+            path: Some(".".to_string()),
+            case: None,
+            fixed_strings: Some(true),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let plan =
+            eligible_query_plan(&req).expect("uppercase smart fixed string should be eligible");
+        match plan {
+            QueryPlan::Exact { literal, case } => {
+                assert_eq!(literal, b"Needle");
+                assert_eq!(case, LiteralCase::Sensitive);
+            }
+            QueryPlan::Fuzzy { .. } => panic!("expected exact plan"),
+        }
+    }
+
+    #[test]
+    fn ascii_case_insensitive_candidates_and_verification_find_uppercase_content() {
+        let root =
+            workspace_test_dir("ascii_case_insensitive_candidates_and_verification_find_uppercase");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("upper.txt"), "prefix NEEDLE suffix\n").expect("write uppercase");
+
+        let mut req = memory_req(&root);
+        req.pattern = "needle".to_string();
+        req.case = Some("insensitive".to_string());
+
+        let plan = eligible_query_plan(&req).expect("case-insensitive fixed string plan");
+        let limits = test_limits();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let snapshot = build_index(&req, &limits, deadline, false, 1).expect("index");
+        let candidates =
+            candidates_for_plan(&snapshot, &plan, limits.max_candidates).expect("candidates");
+        assert_eq!(candidates.len(), 1);
+
+        let (events, _, _, _) = verify_and_render(
+            &snapshot,
+            &candidates,
+            &plan,
+            &req,
+            &limits,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("verify");
+        assert_eq!(events.iter().filter(|event| event.is_match).count(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn fuzzy_seed_partitioning_requires_searchable_unicode_segments() {
         assert_eq!(
             fuzzy_seed_segments("abcdef", 1).expect("seedable ascii"),
@@ -1284,7 +1758,7 @@ mod tests {
         let plan = eligible_query_plan(&req).expect("eligible fuzzy plan");
         let limits = test_limits();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let snapshot = build_index(&req, &limits, deadline, true).expect("index");
+        let snapshot = build_index(&req, &limits, deadline, true, 1).expect("index");
         let candidates =
             candidates_for_plan(&snapshot, &plan, limits.max_candidates).expect("candidates");
         let candidate_names: BTreeSet<String> = candidates
@@ -1379,6 +1853,7 @@ mod tests {
             &test_limits(),
             Instant::now() + Duration::from_secs(30),
             true,
+            1,
         )
         .expect_err("invalid UTF-8 scope should fall back");
         assert_eq!(err.fallback_reason, "fuzzy_scope_not_utf8");
@@ -1402,6 +1877,7 @@ mod tests {
             &test_limits(),
             Instant::now() + Duration::from_secs(30),
             false,
+            1,
         )
         .expect("index");
 
@@ -1497,6 +1973,7 @@ mod tests {
             &limits,
             Instant::now() + Duration::from_secs(30),
             false,
+            1,
         )
         .expect("index");
 
@@ -1513,6 +1990,104 @@ mod tests {
         assert_eq!(err.error_type, "file_changed_during_verification");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_index_cache_reuses_snapshot_for_same_file_selection() {
+        let root = workspace_test_dir("search_index_cache_reuses_snapshot_for_same_file_selection");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+
+        let req = memory_req(&root);
+        let limits = test_limits();
+        let first = get_or_build_snapshot(
+            &req,
+            &limits,
+            Instant::now() + Duration::from_secs(30),
+            false,
+        )
+        .expect("first snapshot");
+        let second = get_or_build_snapshot(
+            &req,
+            &limits,
+            Instant::now() + Duration::from_secs(30),
+            false,
+        )
+        .expect("second snapshot");
+
+        assert_eq!(first.cache_status, "miss");
+        assert_eq!(second.cache_status, "hit");
+        assert!(Arc::ptr_eq(&first.snapshot, &second.snapshot));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_repo_warm_cache_populates_search_index_cache() {
+        if !command_available(git_bin()) {
+            eprintln!("Skipping warm cache git test: git not found on PATH");
+            return;
+        }
+
+        let root = workspace_test_dir("git_repo_warm_cache_populates_search_index_cache");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("cached.txt"), "cachedneedle\n").expect("write fixture");
+
+        let init_status = std::process::Command::new(git_bin())
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should start");
+        assert!(init_status.success(), "git init failed");
+
+        let repo_root = git_worktree_root_from(&root).expect("git repo root");
+        let summary =
+            warm_cache_for_root(repo_root.display().to_string()).expect("warm cache should build");
+
+        let req = SearchRequest {
+            pattern: "cachedneedle".to_string(),
+            path: Some(repo_root.display().to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(true),
+            word_regexp: None,
+            glob: None,
+            hidden: Some(false),
+            follow: None,
+            no_ignore: Some(false),
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let cached = get_or_build_snapshot(
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+        )
+        .expect("query should use warmed cache");
+
+        assert_eq!(cached.cache_status, "hit");
+        assert_eq!(cached.snapshot.generation, summary.generation);
+        assert!(cached.snapshot.documents.iter().any(|doc| {
+            doc.path
+                .file_name()
+                .is_some_and(|name| name == "cached.txt")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn command_available(bin: &str) -> bool {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     fn memory_req(root: &Path) -> SearchRequest {

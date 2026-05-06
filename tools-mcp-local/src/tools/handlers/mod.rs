@@ -14,3 +14,7 @@ mod search_memory;
 
 pub use read_file::handle_read_file;
 pub use ripgrep::handle_search;
+
+pub(crate) fn start_search_cache_warmer() {
+    search_memory::start_search_cache_warmer();
+}

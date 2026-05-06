@@ -187,7 +187,8 @@ failures other than `max_results` truncation.
 ## 8. Behavior Changes and Approvals
 
 The initial POC intentionally changes behavior by introducing an automatic
-in-memory fast path for eligible exact and fuzzy fixed-string queries.
+in-memory fast path for eligible exact literal, plain-regex-literal, and fuzzy
+fixed-string queries.
 
 The following changes are approved for POC mode:
 
@@ -198,6 +199,9 @@ The following changes are approved for POC mode:
    semantics.
 4. Narrow fuzzy memory support for eligible fixed-string, case-sensitive,
    non-word, single-line UTF-8 queries with partitionable exact seeds.
+5. Common exact literal support for plain regex patterns without metacharacters,
+   plus ugrep-compatible ASCII case folding for fixed-string smart and
+   insensitive searches.
 
 The following changes are not approved by this document:
 
@@ -218,10 +222,16 @@ All other queries MUST fall back to `ugrep`.
 The initial implemented eligible query subset is:
 
 1. Exact literal memory queries:
-   1. `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and `fuzzy`
-      absent.
-   2. The fixed-string pattern contains at least three bytes.
-   3. The fixed-string pattern does not contain `\n` or `\r`.
+   1. `word_regexp=false` and `fuzzy` absent.
+   2. The pattern is either `fixed_strings=true` or a plain regex literal with
+      no regex metacharacters.
+   3. The literal contains at least three bytes.
+   4. The literal does not contain `\n` or `\r`.
+   5. `case=sensitive` is byte-exact.
+   6. Fixed-string `case=insensitive` and lowercase `case=smart` use
+      ugrep-compatible ASCII case folding.
+   7. Plain regex literals use memory for ASCII smart or insensitive matching
+      and fall back when Unicode regex case folding would be required.
 2. Fuzzy literal memory queries:
    1. `fixed_strings=true`, `case=sensitive`, `word_regexp=false`, and `fuzzy`
       present.
@@ -236,12 +246,12 @@ The in-memory backend MUST fall back for:
 
 1. Regex fuzzy queries.
 2. `word_regexp=true`, including word-regexp fuzzy queries.
-3. `case=insensitive`, including case-insensitive fuzzy queries.
-4. `case=smart`, including smart-case fuzzy queries, unless the implementation
-   exactly reproduces the current smart-case semantics and tests it against
-   `ugrep`.
-5. Regex queries without eligible fixed-string fuzzy semantics. Regex memory
-   support is a future expansion for this POC.
+3. Unsupported `case=insensitive` and `case=smart` variants, including all
+   fuzzy case-insensitive and fuzzy smart-case queries.
+4. Regex queries with metacharacters. Full regex memory support is a future
+   expansion for this POC.
+5. Plain regex literals requiring Unicode smart-case or insensitive regex
+   folding.
 6. Queries with no proven required literal byte substring of length at least
    three.
 7. Multiline fixed-string or multiline fuzzy queries.
@@ -255,8 +265,10 @@ tests against the existing `ugrep` backend.
 
 ## 10. Regex Dialect, Exact Verification, and Fuzzy Verification
 
-The initial in-memory backend SHALL use byte-level fixed-string verification for
-exact literal Phase Two. Regex queries MUST delegate to `ugrep`.
+The initial in-memory backend SHALL use byte-level literal verification for
+exact literal Phase Two. Regex queries with metacharacters MUST delegate to
+`ugrep`; plain regex literals MAY use the same exact-literal verifier when case
+semantics can be preserved.
 
 Future regex memory support MUST use Rust `regex::bytes` or another explicitly
 specified verifier and configure regex compilation with:
@@ -267,24 +279,25 @@ specified verifier and configure regex compilation with:
 3. Multi-line behavior matching the existing line-oriented search contract for
    the eligible subset.
 
-If a regex query is received, the backend MUST delegate to `ugrep`.
+If a non-literal regex query is received, the backend MUST delegate to `ugrep`.
 
 Phase Two is authoritative. A result MUST NOT be returned unless Phase Two
 verifies the requested match against content observed by the query snapshot.
-Exact literal Phase Two verifies an exact fixed-string byte match. Fuzzy Phase
-Two verifies bounded Unicode-scalar edit distance against candidate lines and is
-the authority for whether a fuzzy match exists.
+Exact literal Phase Two verifies either an exact byte match or the explicitly
+eligible ASCII case-insensitive literal match. Fuzzy Phase Two verifies bounded
+Unicode-scalar edit distance against candidate lines and is the authority for
+whether a fuzzy match exists.
 
 ## 11. Required Literal and Trigram Extraction
 
 Phase One MUST be conservative. Every possible matching document for an eligible
 query MUST remain in the candidate set passed to Phase Two.
 
-The initial extractor SHALL operate over exact fixed-string byte literals and
-fuzzy fixed-string seed segments:
+The initial extractor SHALL operate over exact byte literals, plain regex
+literals, ASCII-folded eligible literals, and fuzzy fixed-string seed segments:
 
-1. For exact `fixed_strings=true` queries, the required literal is the pattern
-   bytes.
+1. For exact `fixed_strings=true` queries and eligible plain regex literals, the
+   required literal is the pattern bytes.
 2. For fuzzy `fixed_strings=true` queries, the planner SHALL split the pattern
    into `distance + 1` non-overlapping contiguous Unicode-scalar seed segments.
 3. Every valid fuzzy match within `distance` edits has at least one untouched
@@ -292,17 +305,20 @@ fuzzy fixed-string seed segments:
    and union the candidate sets from all seeds.
 4. Each fuzzy seed segment MUST have a UTF-8 encoding of at least three bytes.
    If any seed is shorter, the query is ineligible and MUST fall back.
-5. Regex queries are ineligible in the first POC implementation.
-6. Future regex support MUST parse with `regex-syntax` or an equivalent parser
+5. Regex queries with metacharacters are ineligible in the first POC
+   implementation.
+6. Case-insensitive fixed-string queries use ASCII-folded trigrams and
+   ASCII-insensitive Phase Two verification.
+7. Future regex support MUST parse with `regex-syntax` or an equivalent parser
    that exposes a syntax tree.
-7. Future regex support MUST NOT treat literal byte substrings under optional
+8. Future regex support MUST NOT treat literal byte substrings under optional
    repetition (`?`, `*`, `{0,n}`) as required.
-8. Future regex support MUST make alternation ineligible unless it can prove a
+9. Future regex support MUST make alternation ineligible unless it can prove a
    common required byte substring across every branch.
-9. Character classes, anchors, boundaries, groups without required literals, and
+10. Character classes, anchors, boundaries, groups without required literals, and
    wildcard constructs MUST NOT contribute required trigrams.
-10. Case-insensitive literals MUST make the query ineligible until exact
-    case-folding parity is specified and tested.
+11. Unicode regex case-insensitive literals MUST make the query ineligible until
+    exact case-folding parity is specified and tested.
 
 For each required literal of length at least three, the engine SHALL generate
 all overlapping byte trigrams. The candidate set for that literal is the
@@ -370,7 +386,14 @@ The index manager SHALL expose this state machine:
 6. `Unavailable`: the index cannot be built safely; delegate or error according
    to backend mode.
 
-The POC MAY build synchronously on the first eligible query. It SHOULD avoid
+The tools-mcp server SHALL start a best-effort background warm-cache thread when
+the process starts and the current working directory is inside a Git worktree.
+The warm-cache thread SHOULD build the default repository-root file-selection key
+(`hidden=false`, `follow=false`, `no_ignore=false`, and no globs) without
+blocking stdin/stdout startup. It MUST NOT write diagnostics to stdout.
+
+The POC MAY still build synchronously on the first eligible query for cold
+roots, non-default file-selection keys, or warm-cache failures. It SHOULD avoid
 blocking unrelated roots. A query MUST obtain an immutable `Arc<IndexSnapshot>`
 before Phase One starts. The snapshot MUST NOT be mutated after publication.
 
@@ -532,8 +555,10 @@ The POC MUST enforce configurable limits. Initial defaults:
 2. `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES`: 256 MiB per file-selection key.
 3. `TOOLS_SEARCH_INDEX_MAX_FILES`: 50,000.
 4. `TOOLS_SEARCH_MAX_CANDIDATES`: 20,000.
-5. Existing `timeout_ms`: per-query wall-clock deadline.
-6. Existing `max_results`: output event cap.
+5. `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS`: 300,000 ms for startup warm-cache
+   build.
+6. Existing `timeout_ms`: per-query wall-clock deadline.
+7. Existing `max_results`: output event cap.
 
 If index build limits are exceeded, the query MUST fall back to `ugrep`.
 
@@ -561,6 +586,7 @@ Memory-backed successful responses SHOULD include lightweight diagnostics:
 ```json
 {
   "backend": "memory",
+  "index_cache": "hit",
   "index_generation": 3,
   "indexed_files": 1200,
   "indexed_bytes": 8300000,
