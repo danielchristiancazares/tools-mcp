@@ -194,6 +194,33 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         destination.to_path_buf()
     };
 
+    // Refuse to recursively delete a real directory just because the caller
+    // passed `overwrite: true` with a non-directory source. The historical
+    // overwrite path runs `remove_dir_all(final_dest)` before renaming the
+    // staged file into place, which silently wipes the entire directory
+    // subtree (including unrelated nested files). GNU `cp` rejects this
+    // even with `--force`; we do the same. The `dir → file` and `dir → dir`
+    // overwrite cases remain supported by `copy_directory_with_overwrite`
+    // (covered by existing tests) because the caller has explicitly opted
+    // into directory semantics by passing a directory source.
+    //
+    // Use `symlink_metadata` so a symlink whose target is a directory is
+    // NOT misclassified as a real directory: replacing such a symlink with
+    // a file just unlinks the symlink and leaves the target dir untouched,
+    // which is safe and remains permitted.
+    if overwrite && source.is_file()
+        && let Ok(dst_meta) = tokio::fs::symlink_metadata(&final_dest).await
+        && dst_meta.file_type().is_dir()
+    {
+        return ToolCallOutcome::err(format!(
+            "refusing to overwrite directory {} with non-directory source {}: \
+             type-mismatch replacement would recursively delete the directory; \
+             remove or rename the directory first if replacement is intended",
+            final_dest.display(),
+            source.display()
+        ));
+    }
+
     if source_metadata.file_type().is_symlink() && source.is_dir() && req.recursive.unwrap_or(false)
     {
         return ToolCallOutcome::err(format!(
@@ -341,6 +368,27 @@ async fn remove_existing_path(path: &Path) -> std::io::Result<()> {
 async fn copy_file_with_overwrite(src: &Path, dst: &Path, overwrite: bool) -> std::io::Result<u64> {
     if !overwrite || !dst.exists() {
         return tokio::fs::copy(src, dst).await;
+    }
+
+    // Defense in depth: this primitive is only meant to replace a regular
+    // file with another regular file. The historical overwrite path below
+    // calls `remove_existing_path(dst)` which dispatches to `remove_dir_all`
+    // when `dst` is a real directory, recursively wiping unrelated state.
+    // `handle_copy` already rejects this shape, but re-check here so any
+    // future caller — and any TOCTOU race that turns `dst` into a directory
+    // between the entry-point check and this point — fails closed before
+    // any mutation. `symlink_metadata` keeps the safe symlink-to-dir case
+    // working: only the symlink itself is unlinked; its target is preserved.
+    if let Ok(meta) = tokio::fs::symlink_metadata(dst).await
+        && meta.file_type().is_dir()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to overwrite directory {} with a non-directory source",
+                dst.display()
+            ),
+        ));
     }
 
     let staged = replacement_stage_path(dst);
@@ -567,6 +615,146 @@ mod tests {
         assert_eq!(result["isError"], false);
         assert!(dst.is_dir());
         assert!(dst.join("inside.txt").exists());
+    }
+
+    /// Exploit-closure regression: replicates the original PoC that turned
+    /// `Copy` with `overwrite: true` and a non-directory source on top of an
+    /// existing directory destination into an unbounded `rm -rf` of the
+    /// directory subtree. The fix must abort before any mutation, leaving
+    /// the directory and its nested contents intact.
+    #[tokio::test]
+    async fn copy_refuses_overwriting_directory_with_file() {
+        let dir = tempdir().expect("tempdir");
+        let dst = dir.path().join("victim_dir");
+        let nested = dst.join("nested");
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("create nested");
+        tokio::fs::write(nested.join("keep.txt"), "IMPORTANT_DO_NOT_DELETE")
+            .await
+            .expect("write keep.txt");
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "ATTACKER_FILE")
+            .await
+            .expect("write src");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string(),
+            "overwrite": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], true, "must refuse: {result}");
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("refusing to overwrite directory"),
+            "expected refusal diagnostic, got: {msg}"
+        );
+
+        // Filesystem must be untouched: directory still exists, nested file
+        // still exists with the original content, and the destination did
+        // not become a regular file.
+        assert!(
+            dst.is_dir(),
+            "victim directory must still exist as a directory"
+        );
+        assert!(
+            !dst.is_file(),
+            "destination must not have been replaced with a regular file"
+        );
+        assert!(
+            nested.join("keep.txt").exists(),
+            "nested file must not have been recursively deleted"
+        );
+        let kept = tokio::fs::read_to_string(nested.join("keep.txt"))
+            .await
+            .expect("read keep.txt");
+        assert_eq!(
+            kept, "IMPORTANT_DO_NOT_DELETE",
+            "nested file content must be preserved"
+        );
+    }
+
+    /// Defense-in-depth: even if a future caller bypasses the entry-point
+    /// check, the underlying primitive must refuse to recursively delete a
+    /// directory.
+    #[tokio::test]
+    async fn copy_file_with_overwrite_refuses_directory_destination() {
+        let dir = tempdir().expect("tempdir");
+        let dst = dir.path().join("real_dir");
+        let nested = dst.join("inside.txt");
+        tokio::fs::create_dir_all(&dst).await.expect("create dst");
+        tokio::fs::write(&nested, "preserved")
+            .await
+            .expect("write nested");
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "data").await.expect("write src");
+
+        let err = copy_file_with_overwrite(&src, &dst, true)
+            .await
+            .expect_err("primitive must refuse a directory destination");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("refusing to overwrite directory"),
+            "expected refusal diagnostic, got: {err}"
+        );
+        assert!(dst.is_dir(), "destination directory must be preserved");
+        assert!(nested.exists(), "nested file must be preserved");
+    }
+
+    /// Pins the safe-by-design behavior we explicitly want to keep: when
+    /// the destination is a symlink whose target is a directory, the
+    /// `Copy` operation only unlinks the symlink and replaces it with a
+    /// regular file. The directory the symlink pointed to (and any data
+    /// it contained) must be preserved, because the dangerous case is
+    /// recursive deletion of a real directory's tree, not unlinking a
+    /// single symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_overwrite_replaces_symlink_to_directory_without_destroying_target() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target_dir");
+        let target_inside = target.join("preserved.txt");
+        let link = dir.path().join("link");
+        tokio::fs::create_dir_all(&target)
+            .await
+            .expect("create target dir");
+        tokio::fs::write(&target_inside, "preserved")
+            .await
+            .expect("write target inside");
+        unix_fs::symlink(&target, &link).expect("symlink");
+
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "fresh").await.expect("write src");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": link.display().to_string(),
+            "overwrite": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], false, "must succeed: {result}");
+
+        // The symlink path is now a regular file.
+        let link_meta = tokio::fs::symlink_metadata(&link)
+            .await
+            .expect("link metadata");
+        assert!(
+            link_meta.file_type().is_file(),
+            "symlink path should now be a regular file"
+        );
+        // The directory the symlink pointed to and its contents survive.
+        assert!(target.is_dir(), "target directory must survive");
+        assert!(
+            target_inside.exists(),
+            "data behind the original symlink must survive"
+        );
     }
 
     #[tokio::test]
