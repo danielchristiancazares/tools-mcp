@@ -1262,7 +1262,6 @@ All tool handlers validate:
 | base64 | 0.22 | Base64 encoding/decoding |
 | chromiumoxide | 0.7 | Headless Chrome via CDP |
 | htmd | 0.4 | HTML to Markdown conversion |
-| readability | 0.3 | Boilerplate removal |
 | scraper | 0.24 | HTML DOM parsing |
 | robotstxt | 0.3 | robots.txt parsing |
 | tiktoken-rs | 0.9 | OpenAI tokenizer |

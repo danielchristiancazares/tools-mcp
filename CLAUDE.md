@@ -191,7 +191,6 @@ All tool responses follow the MCP content format:
 - **anyhow**: Error handling
 - **reqwest**: HTTP client for WebFetch
 - **chromiumoxide**: Headless Chrome automation via Chrome DevTools Protocol [chromiumoxide v0.7, https://docs.rs/chromiumoxide/]
-- **readability**: Boilerplate removal for HTML extraction [readability v0.3.0, https://docs.rs/readability/0.3.0/readability/]
 - **htmd**: HTML to Markdown conversion with inline links and tag filtering [htmd v0.3.2, https://docs.rs/htmd/]
 - **scraper**: DOM parsing helpers for metadata [scraper v0.24.0, https://docs.rs/scraper/0.24.0/scraper/]
 - **robotstxt**: robots.txt parsing and compliance checking [robotstxt v0.3.0]

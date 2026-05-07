@@ -24,7 +24,6 @@ hex = "0.4"
 htmd = "0.4.0"
 ignore = "0.4"
 memchr = "2"
-readability = "0.3"
 regex = "1.12"
 regex-syntax = "0.8"
 reqwest = { version = "0.12.24", features = ["json", "multipart", "rustls-tls", "gzip", "brotli", "deflate"] }
