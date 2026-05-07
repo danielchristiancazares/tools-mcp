@@ -3,6 +3,7 @@
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use tools_mcp_core::validation;
 
 use super::search_memory::handle_memory_search;
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SearchRequest {
     /// Regex (or literal if `fixed_strings=true`).
@@ -193,6 +194,33 @@ fn contains_unsupported_glob_syntax(pattern: &str) -> bool {
     pattern.starts_with('!') || pattern.contains('{') || pattern.contains('}')
 }
 
+/// Detects LF or CR bytes in a path's underlying OS string.
+///
+/// Such bytes are valid in Unix filenames but would be interpreted as
+/// record terminators by ugrep's line-oriented `--from=-` file list.
+/// Refusing these paths is required to keep the search root boundary
+/// honest: a single in-root pathname containing `\n` could otherwise
+/// inject an attacker-chosen absolute path as a separate file-list
+/// entry, causing ugrep to read files outside `req.root()`.
+#[cfg(unix)]
+fn path_has_line_separator(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\n' | b'\r'))
+}
+
+/// Non-Unix fallback: Windows/NTFS forbids LF/CR in filenames at the OS
+/// level, but defend in depth by scanning the lossy UTF-8 form, since
+/// that is exactly what would be written to ugrep's stdin.
+#[cfg(not(unix))]
+fn path_has_line_separator(path: &Path) -> bool {
+    path.to_string_lossy()
+        .bytes()
+        .any(|b| matches!(b, b'\n' | b'\r'))
+}
+
 fn resolve_globbed_files_for_ugrep(req: &SearchRequest) -> anyhow::Result<Option<Vec<PathBuf>>> {
     let include_hidden = req.hidden.unwrap_or(false);
     let Some(glob_filter) = SearchGlobFilter::from_request(req, include_hidden) else {
@@ -222,11 +250,34 @@ fn resolve_globbed_files_for_ugrep(req: &SearchRequest) -> anyhow::Result<Option
         }
         let path = entry.into_path();
         if glob_filter.is_match(root, &path) {
+            // Refuse any matched path whose bytes contain LF/CR; ugrep's
+            // line-oriented `--from=-` would otherwise treat the suffix
+            // after the embedded newline as a separate (potentially
+            // absolute and out-of-root) file to search. Use Debug-format
+            // for the diagnostic so embedded control bytes render as
+            // escapes rather than disrupting the error string.
+            if path_has_line_separator(&path) {
+                anyhow::bail!(
+                    "search aborted: matched path contains LF/CR bytes that cannot \
+                     be safely passed to ugrep --from=- (offending path: {:?})",
+                    path
+                );
+            }
             files.push(path);
         }
     }
     files.sort();
     Ok(Some(files))
+}
+
+/// Defense-in-depth filter: returns true if `parsed_path` was one of the
+/// pre-resolved paths we authorized for ugrep. When `allowed` is `None`
+/// (no glob filter / non-`--from=-` path), every result is permitted.
+fn is_path_authorized(parsed_path: &str, allowed: Option<&HashSet<String>>) -> bool {
+    match allowed {
+        Some(set) => set.contains(parsed_path),
+        None => true,
+    }
 }
 
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
@@ -352,6 +403,21 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
                 false,
             ));
         }
+
+        // Defense in depth: when we hand ugrep a pre-resolved file list via
+        // `--from=-`, the only paths it should report on are paths from that
+        // list. Build the authorized set once (using the same lossy form we
+        // serialize to ugrep stdin) so the result-parsing loop can drop any
+        // path we did not explicitly authorize. This is belt-and-suspenders
+        // against future selection-edge-case regressions in ugrep or in the
+        // resolver; the LF/CR rejection in `resolve_globbed_files_for_ugrep`
+        // is the primary control.
+        let allowed_paths: Option<HashSet<String>> = globbed_files.as_ref().map(|files| {
+            files
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        });
 
         let mut cmd = Command::new(bin);
 
@@ -491,6 +557,15 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
                         continue;
                     }
 
+                    // Defense in depth: when ugrep is invoked with `--from=-`,
+                    // discard any reported path that is not in the authorized
+                    // set we wrote to stdin. A normal run cannot reach this
+                    // branch; it only fires if a future regression or ugrep
+                    // edge case re-introduces a path-list injection primitive.
+                    if !is_path_authorized(&path, allowed_paths.as_ref()) {
+                        continue;
+                    }
+
                     let sep = if is_match { ":" } else { "-" };
                     rendered_lines.push(format!("{path}{sep}{line_no}{sep}{text}"));
 
@@ -605,7 +680,12 @@ async fn handle_search_ugrep(req: SearchRequest) -> ToolCallOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_success, parse_grep_line};
+    use super::{
+        SearchRequest, classify_success, handle_search, is_path_authorized, parse_grep_line,
+        path_has_line_separator, resolve_globbed_files_for_ugrep,
+    };
+    use serde_json::json;
+    use std::collections::HashSet;
 
     #[test]
     #[cfg(unix)]
@@ -671,5 +751,222 @@ mod tests {
         assert_eq!(line_no, 7);
         assert_eq!(text, "needle");
         assert!(is_match);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_has_line_separator_detects_lf_and_cr_via_raw_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::path::PathBuf;
+
+        let lf = PathBuf::from(OsString::from_vec(b"foo\nbar.txt".to_vec()));
+        let cr = PathBuf::from(OsString::from_vec(b"foo\rbar.txt".to_vec()));
+        let crlf = PathBuf::from(OsString::from_vec(b"foo\r\nbar.txt".to_vec()));
+        let clean = PathBuf::from("foo/bar.txt");
+
+        assert!(path_has_line_separator(&lf));
+        assert!(path_has_line_separator(&cr));
+        assert!(path_has_line_separator(&crlf));
+        assert!(!path_has_line_separator(&clean));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_globbed_files_rejects_lf_in_matched_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Filename contains a literal LF byte; this is the exact primitive
+        // the path-list injection PoC relies on.
+        let mut filename = OsString::from("unsafe");
+        filename.push(OsString::from_vec(vec![b'\n']));
+        filename.push("name.txt");
+        std::fs::write(root.join(&filename), "needle\n").expect("write");
+
+        let req = SearchRequest {
+            path: Some(root.to_string_lossy().to_string()),
+            pattern: "needle".to_string(),
+            glob: Some(vec!["*".to_string()]),
+            ..SearchRequest::default()
+        };
+
+        let err =
+            resolve_globbed_files_for_ugrep(&req).expect_err("LF-bearing matched path must abort");
+        assert!(
+            err.to_string().contains("LF/CR"),
+            "expected LF/CR rejection diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_globbed_files_rejects_cr_in_matched_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let mut filename = OsString::from("unsafe");
+        filename.push(OsString::from_vec(vec![b'\r']));
+        filename.push("name.txt");
+        std::fs::write(root.join(&filename), "needle\n").expect("write");
+
+        let req = SearchRequest {
+            path: Some(root.to_string_lossy().to_string()),
+            pattern: "needle".to_string(),
+            glob: Some(vec!["*".to_string()]),
+            ..SearchRequest::default()
+        };
+
+        let err =
+            resolve_globbed_files_for_ugrep(&req).expect_err("CR-bearing matched path must abort");
+        assert!(
+            err.to_string().contains("LF/CR"),
+            "expected LF/CR rejection diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_globbed_files_accepts_clean_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("inside.txt"), "needle\n").expect("write");
+
+        let req = SearchRequest {
+            path: Some(root.to_string_lossy().to_string()),
+            pattern: "needle".to_string(),
+            glob: Some(vec!["*.txt".to_string()]),
+            no_ignore: Some(true),
+            ..SearchRequest::default()
+        };
+
+        let resolved = resolve_globbed_files_for_ugrep(&req)
+            .expect("clean repo must resolve")
+            .expect("glob filter present, expected Some(files)");
+        assert_eq!(resolved.len(), 1, "exactly one matching file: {resolved:?}");
+        assert_eq!(
+            resolved[0].file_name().and_then(|n| n.to_str()),
+            Some("inside.txt")
+        );
+    }
+
+    #[test]
+    fn is_path_authorized_passes_through_when_no_allowlist() {
+        // When `allowed` is None (non-`--from=-` invocation) every path is
+        // permitted; this preserves behavior on the unaffected code path.
+        assert!(is_path_authorized("/anything", None));
+        assert!(is_path_authorized("", None));
+    }
+
+    #[test]
+    fn is_path_authorized_blocks_unauthorized_paths_when_allowlist_present() {
+        let mut allowed: HashSet<String> = HashSet::new();
+        allowed.insert("/repo/inside.txt".to_string());
+
+        assert!(is_path_authorized("/repo/inside.txt", Some(&allowed)));
+        // A path that ugrep might invent or that an attacker tried to inject
+        // (e.g. via a future regression) must be filtered out.
+        assert!(!is_path_authorized("/etc/passwd", Some(&allowed)));
+        assert!(!is_path_authorized("/repo/other.txt", Some(&allowed)));
+    }
+
+    /// End-to-end exploit-closure regression test. Builds the same primitive
+    /// the original PoC used (an in-root path whose bytes contain `\n`
+    /// followed by an absolute path to a sibling outside the search root) and
+    /// invokes the real `handle_search` entry point with `glob: ["*"]`, which
+    /// is forced through the ugrep fallback by `search_memory`'s
+    /// regex-class-rejection rule (the `.` pattern can match LF). The
+    /// LF/CR rejection in `resolve_globbed_files_for_ugrep` MUST short-circuit
+    /// before ugrep is ever spawned, so we deliberately avoid faking ugrep on
+    /// PATH (which would mutate process-global env state and race other
+    /// tests). The asserts cover the three regression shapes that matter:
+    /// (1) the search aborts (`isError == true`); (2) the abort comes from
+    /// the fallback (`backend == "ugrep"`); (3) the diagnostic identifies the
+    /// LF/CR cause; (4) the outside file content never appears in the
+    /// payload, even if a future regression silently allows the path through.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    async fn search_ugrep_glob_newline_path_injection_is_blocked() {
+        use std::path::Path;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "tools_mcp_newline_fixed_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let root = base.join("repo");
+        let outside = base.join("outside_secret.txt");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(&outside, "LEAKED_SECRET_MARKER\n").expect("write outside secret");
+
+        // One in-root path whose display string contains a newline followed
+        // by the absolute path of `outside_secret.txt`. With a vulnerable
+        // implementation, line-oriented `--from=-` would split this into two
+        // entries and leak the outside file. The fix must reject the matched
+        // path before it ever reaches ugrep.
+        let outside_suffix = outside
+            .strip_prefix(Path::new("/"))
+            .expect("outside is absolute");
+        let injected_relative = format!("x\n/{}", outside_suffix.display());
+        let in_scope_path = root.join(injected_relative);
+        std::fs::create_dir_all(in_scope_path.parent().expect("parent"))
+            .expect("create injected dirs");
+        std::fs::write(&in_scope_path, "attacker-controlled in-root file\n")
+            .expect("write in-root malicious pathname");
+
+        let outcome = handle_search(
+            None,
+            json!({
+                "pattern": ".",
+                "path": root.to_string_lossy().to_string(),
+                "glob": ["*"],
+                "no_ignore": true,
+                "max_results": 10,
+                "timeout_ms": 5000
+            }),
+        )
+        .await;
+
+        let payload = outcome.0;
+        assert_eq!(
+            payload["isError"], true,
+            "newline-bearing path must abort the search: {payload}"
+        );
+        // Confirms the abort came from the fallback path (i.e. resolution
+        // happened before ugrep was spawned, not after disclosure).
+        assert_eq!(
+            payload["backend"], "ugrep",
+            "abort must originate from the ugrep fallback: {payload}"
+        );
+        let text = payload["content"][0]["text"].as_str().unwrap_or("");
+        // The diagnostic intentionally echoes the offending in-root pathname
+        // (which an attacker controls anyway) for triage. The security
+        // boundary is that outside file *contents* must never appear in the
+        // payload.
+        assert!(
+            !text.contains("LEAKED_SECRET_MARKER"),
+            "outside file content must never be disclosed: {text}"
+        );
+        assert!(
+            text.starts_with("ugrep error: search aborted"),
+            "payload should report the abort reason: {text}"
+        );
+        assert!(
+            text.contains("LF/CR"),
+            "payload should identify the LF/CR cause: {text}"
+        );
+
+        // Best-effort cleanup; failures are non-fatal because we only care
+        // about the assertions above.
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
