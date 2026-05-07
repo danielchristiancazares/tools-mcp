@@ -41,4 +41,4 @@ clean:
 # tracked *.rs under tools-mcp-*. Everything else (docs, scripts, IDE config,
 # .agents/, build artifacts) is excluded. Uncommitted changes are not included.
 zip output="tools-mcp.zip":
-    git archive --format=zip --prefix=tools-mcp/ --output={{output}} HEAD -- Cargo.toml ':(glob)tools-mcp-*/Cargo.toml' ':(glob)tools-mcp-*/**/*.rs'
+    git archive --format=zip --prefix=tools-mcp/ --output={{quote(output)}} HEAD -- Cargo.toml ':(glob)tools-mcp-*/Cargo.toml' ':(glob)tools-mcp-*/**/*.rs'
