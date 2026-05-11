@@ -10,7 +10,7 @@ use regex_syntax::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -181,13 +181,17 @@ struct IndexKey {
 struct IndexCache {
     next_generation: u64,
     entries: HashMap<IndexKey, Arc<IndexSnapshot>>,
+    insertion_order: VecDeque<IndexKey>,
 }
+
+const DEFAULT_INDEX_CACHE_MAX_ENTRIES: usize = 8;
 
 impl Default for IndexCache {
     fn default() -> Self {
         Self {
             next_generation: 1,
             entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
         }
     }
 }
@@ -318,7 +322,21 @@ fn cached_snapshot(key: &IndexKey) -> Option<Arc<IndexSnapshot>> {
 
 fn publish_snapshot_if_absent(key: IndexKey, snapshot: Arc<IndexSnapshot>) -> Arc<IndexSnapshot> {
     let mut cache = lock_index_cache();
-    cache.entries.entry(key).or_insert(snapshot).clone()
+    if let Some(cached) = cache.entries.get(&key) {
+        return cached.clone();
+    }
+
+    let snapshot = cache.entries.entry(key.clone()).or_insert(snapshot).clone();
+    cache.insertion_order.push_back(key);
+    while cache.entries.len() > DEFAULT_INDEX_CACHE_MAX_ENTRIES {
+        if let Some(evicted_key) = cache.insertion_order.pop_front() {
+            cache.entries.remove(&evicted_key);
+        } else {
+            break;
+        }
+    }
+
+    snapshot
 }
 
 fn evict_snapshot_if_current(key: &IndexKey, snapshot: &Arc<IndexSnapshot>) {
@@ -329,6 +347,9 @@ fn evict_snapshot_if_current(key: &IndexKey, snapshot: &Arc<IndexSnapshot>) {
         .is_some_and(|current| Arc::ptr_eq(current, snapshot))
     {
         cache.entries.remove(key);
+        cache
+            .insertion_order
+            .retain(|existing_key| existing_key != key);
     }
 }
 
@@ -2767,6 +2788,30 @@ mod tests {
         assert_eq!(first.cache_status, "miss");
         assert_eq!(second.cache_status, "hit");
         assert!(Arc::ptr_eq(&first.snapshot, &second.snapshot));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_index_cache_caps_total_entries() {
+        let root = workspace_test_dir("search_index_cache_caps_total_entries");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+
+        for idx in 0..=DEFAULT_INDEX_CACHE_MAX_ENTRIES {
+            let mut req = memory_req(&root);
+            req.glob = Some(vec![format!("nomatch_{idx}")]);
+            let _ = get_or_build_snapshot(
+                &req,
+                &test_limits(),
+                Instant::now() + Duration::from_secs(30),
+                false,
+            )
+            .expect("cached snapshot");
+        }
+
+        assert!(lock_index_cache().entries.len() <= DEFAULT_INDEX_CACHE_MAX_ENTRIES);
 
         let _ = fs::remove_dir_all(&root);
     }
