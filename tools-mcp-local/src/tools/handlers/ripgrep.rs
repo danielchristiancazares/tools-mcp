@@ -283,12 +283,14 @@ fn is_path_authorized(parsed_path: &str, allowed: Option<&HashSet<String>>) -> b
 /// Parse a grep-style output line: "path:line:text" (match) or "path-line-text" (context)
 /// Returns (path, `line_number`, text, `is_match`)
 fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
-    fn separator_candidates(line: &str, sep: u8) -> Vec<(String, u64, String, bool)> {
+    fn separator_candidates<'a>(
+        line: &'a str,
+        sep: u8,
+    ) -> impl Iterator<Item = (usize, u64, &'a str)> + 'a {
         let bytes = line.as_bytes();
-        let mut candidates = Vec::new();
-        for i in 0..bytes.len() {
+        (0..bytes.len()).filter_map(move |i| {
             if bytes[i] != sep {
-                continue;
+                return None;
             }
 
             // Check if followed by digits then another matching separator.
@@ -302,32 +304,49 @@ fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
                 && bytes[j] == sep
                 && let Ok(line_no) = line[i + 1..j].parse::<u64>()
             {
-                candidates.push((
-                    line[..i].to_string(),
-                    line_no,
-                    line[j + 1..].to_string(),
-                    sep == b':',
-                ));
+                return Some((i, line_no, &line[j + 1..]));
             }
-        }
-        candidates
+
+            None
+        })
     }
 
     fn parse_with_sep_from_end(line: &str, sep: u8) -> Option<(String, u64, String, bool)> {
-        separator_candidates(line, sep).into_iter().next_back()
+        separator_candidates(line, sep)
+            .last()
+            .map(|(path_end, line_no, text)| {
+                (
+                    line[..path_end].to_string(),
+                    line_no,
+                    text.to_string(),
+                    sep == b':',
+                )
+            })
     }
 
     fn parse_match_line(line: &str) -> Option<(String, u64, String, bool)> {
-        let candidates = separator_candidates(line, b':');
-        if candidates.len() > 1
-            && let Some(existing_path) = candidates
-                .iter()
-                .rev()
-                .find(|(path, _, _, _)| Path::new(path).exists())
-        {
-            return Some(existing_path.clone());
+        let mut first = None;
+        let mut existing_from_end = None;
+
+        for (path_end, line_no, text) in separator_candidates(line, b':') {
+            if first.is_none() {
+                first = Some((path_end, line_no, text));
+            }
+            if Path::new(&line[..path_end]).exists() {
+                existing_from_end = Some((path_end, line_no, text));
+            }
         }
-        candidates.into_iter().next()
+
+        existing_from_end
+            .or(first)
+            .map(|(path_end, line_no, text)| {
+                (
+                    line[..path_end].to_string(),
+                    line_no,
+                    text.to_string(),
+                    true,
+                )
+            })
     }
 
     // Parse match lines first ("path:line:text") by scanning from the start.
