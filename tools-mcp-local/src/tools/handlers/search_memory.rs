@@ -1655,7 +1655,7 @@ fn matching_line_indexes(
                         "fuzzy verifier line length limit exceeded",
                     ));
                 }
-                fuzzy_line_matches(line, pattern_chars, *distance)
+                fuzzy_line_matches(line, pattern_chars, *distance, deadline)?
             }
         };
         if is_match {
@@ -1720,9 +1720,14 @@ fn seed_byte_len(byte_offsets: &[usize], start_scalar: usize, end_scalar: usize)
     byte_offsets[end_scalar] - byte_offsets[start_scalar]
 }
 
-fn fuzzy_line_matches(line: &str, pattern_chars: &[char], distance: usize) -> bool {
+fn fuzzy_line_matches(
+    line: &str,
+    pattern_chars: &[char],
+    distance: usize,
+    deadline: Instant,
+) -> Result<bool, MemoryError> {
     if pattern_chars.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let line_chars: Vec<char> = line.chars().collect();
@@ -1730,32 +1735,43 @@ fn fuzzy_line_matches(line: &str, pattern_chars: &[char], distance: usize) -> bo
     let max_len = pattern_chars.len().saturating_add(distance);
 
     for start in 0..=line_chars.len() {
+        check_deadline(deadline)?;
         for len in min_len..=max_len {
+            check_deadline(deadline)?;
             let end = start.saturating_add(len);
             if end > line_chars.len() {
                 break;
             }
-            if bounded_edit_distance(pattern_chars, &line_chars[start..end], distance).is_some() {
-                return true;
+            if bounded_edit_distance(pattern_chars, &line_chars[start..end], distance, deadline)?
+                .is_some()
+            {
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
-fn bounded_edit_distance(left: &[char], right: &[char], max_distance: usize) -> Option<usize> {
+fn bounded_edit_distance(
+    left: &[char],
+    right: &[char],
+    max_distance: usize,
+    deadline: Instant,
+) -> Result<Option<usize>, MemoryError> {
     if left.len().abs_diff(right.len()) > max_distance {
-        return None;
+        return Ok(None);
     }
 
     let mut previous: Vec<usize> = (0..=right.len()).collect();
     let mut current = vec![0; right.len() + 1];
 
     for (left_index, left_char) in left.iter().enumerate() {
+        check_deadline(deadline)?;
         current[0] = left_index + 1;
         let mut row_min = current[0];
 
         for (right_index, right_char) in right.iter().enumerate() {
+            check_deadline(deadline)?;
             let deletion = previous[right_index + 1] + 1;
             let insertion = current[right_index] + 1;
             let substitution = previous[right_index] + usize::from(left_char != right_char);
@@ -1765,12 +1781,12 @@ fn bounded_edit_distance(left: &[char], right: &[char], max_distance: usize) -> 
         }
 
         if row_min > max_distance {
-            return None;
+            return Ok(None);
         }
         std::mem::swap(&mut previous, &mut current);
     }
 
-    (previous[right.len()] <= max_distance).then_some(previous[right.len()])
+    Ok((previous[right.len()] <= max_distance).then_some(previous[right.len()]))
 }
 
 fn render_line_indexes(
@@ -2462,11 +2478,18 @@ mod tests {
     #[test]
     fn fuzzy_verifier_accepts_insertion_deletion_and_substitution() {
         let pattern: Vec<char> = "abcdef".chars().collect();
+        let deadline = Instant::now() + Duration::from_secs(30);
 
-        assert!(fuzzy_line_matches("prefix abcXdef suffix", &pattern, 1));
-        assert!(fuzzy_line_matches("prefix abdef suffix", &pattern, 1));
-        assert!(fuzzy_line_matches("prefix abcxef suffix", &pattern, 1));
-        assert!(!fuzzy_line_matches("prefix abXYef suffix", &pattern, 1));
+        assert!(
+            fuzzy_line_matches("prefix abcXdef suffix", &pattern, 1, deadline).expect("match")
+        );
+        assert!(fuzzy_line_matches("prefix abdef suffix", &pattern, 1, deadline).expect("match"));
+        assert!(
+            fuzzy_line_matches("prefix abcxef suffix", &pattern, 1, deadline).expect("match")
+        );
+        assert!(
+            !fuzzy_line_matches("prefix abXYef suffix", &pattern, 1, deadline).expect("no match")
+        );
     }
 
     #[test]
