@@ -37,7 +37,7 @@
 - **Search** - Fast local search with an automatic in-memory path for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries, plus ugrep fallback for unsupported regex and search modes.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
-- **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
+- **Pwsh** - Optional (disabled by default) PowerShell command runner via pwsh with timeout and stdout/stderr capture.
 - **GitStatus / GitDiff / GitRestore** - Local Git status/diff/restore helpers with timeout and output truncation.
 - **Ping** - Lightweight health check for MCP clients.
 - JSON-RPC 2.0 transport over stdin/stdout with optional `Content-Length` framing for Codex-compatible MCP clients.
@@ -718,7 +718,7 @@ Edit files by replacing a snippet, preserving original newline bytes and whitesp
 
 ### Pwsh
 
-Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
+Run PowerShell commands via pwsh with timeout and stdout/stderr capture. This tool is **disabled by default** and only registers when `MCP_ENABLE_PWSH_TOOL=true`.
 
 - **Tool name**: `Pwsh`
 - **Required**:

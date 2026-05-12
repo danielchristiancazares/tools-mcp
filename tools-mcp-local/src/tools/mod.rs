@@ -9,7 +9,10 @@ mod read;
 mod search;
 mod write;
 
+use std::env;
+
 use tools_mcp_core::ToolRegistry;
+use tracing::warn;
 
 pub fn register_tools(registry: &mut ToolRegistry) {
     registry.register::<read::ReadTool>();
@@ -21,7 +24,15 @@ pub fn register_tools(registry: &mut ToolRegistry) {
     registry.register::<fileops::CopyTool>();
     registry.register::<fileops::ListDirTool>();
     registry.register::<outline::OutlineTool>();
-    registry.register::<pwsh::PwshTool>();
+
+    if env::var("MCP_ENABLE_PWSH_TOOL").ok().as_deref() == Some("true") {
+        registry.register::<pwsh::PwshTool>();
+    } else {
+        warn!(
+            "Pwsh tool is disabled by default; set MCP_ENABLE_PWSH_TOOL=true to enable host shell execution"
+        );
+    }
+
     registry.register::<search::SearchTool>();
 }
 
