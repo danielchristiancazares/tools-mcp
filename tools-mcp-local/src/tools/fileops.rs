@@ -181,10 +181,9 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 
     let overwrite = req.overwrite.unwrap_or(false);
 
-    // Existing directories act as container targets in the default cp-like mode.
-    // When overwrite=true, treat the provided destination path literally so the
-    // replacement semantics apply to that path instead of creating a nested copy.
-    let final_dest = if destination.is_dir() && !overwrite {
+    // Existing directories always act as container targets in cp-like mode.
+    // overwrite applies to the resolved child path, not the directory itself.
+    let final_dest = if destination.is_dir() {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
@@ -565,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_overwrite_replaces_existing_directory_contents() {
+    async fn copy_overwrite_into_existing_directory_keeps_container() {
         let dir = tempdir().expect("tempdir");
         let src = dir.path().join("src");
         let dst = dir.path().join("dst");
@@ -588,8 +587,8 @@ mod tests {
         let resp = handle_copy(Some(json!(1)), args).await;
         let result = resp.0;
         assert_eq!(result["isError"], false);
-        assert!(dst.join("fresh.txt").exists());
-        assert!(!dst.join("stale.txt").exists());
+        assert!(dst.join("src").join("fresh.txt").exists());
+        assert!(dst.join("stale.txt").exists());
     }
 
     #[tokio::test]
