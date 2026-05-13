@@ -135,7 +135,7 @@ pub(crate) async fn run_git(
         "-c".into(),
         "core.fsmonitor=".into(),
         "-c".into(),
-        "core.hooksPath=/dev/null".into(),
+        format!("core.hooksPath={}", if cfg!(target_os = "windows") { "NUL" } else { "/dev/null" }).into(),
         "-c".into(),
         "filter.lfs.process=".into(),
         "-c".into(),
