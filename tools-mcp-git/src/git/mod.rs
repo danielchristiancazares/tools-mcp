@@ -134,6 +134,14 @@ pub(crate) async fn run_git(
         "diff.external=".into(),
         "-c".into(),
         "core.fsmonitor=".into(),
+        "-c".into(),
+        "core.hooksPath=/dev/null".into(),
+        "-c".into(),
+        "filter.lfs.process=".into(),
+        "-c".into(),
+        "filter.lfs.smudge=".into(),
+        "-c".into(),
+        "filter.lfs.clean=".into(),
     ];
     args.extend(subcommand_args);
 
@@ -158,7 +166,16 @@ pub(crate) async fn run_git(
         },
     );
     cmd.env("GIT_EXTERNAL_DIFF", "");
+    cmd.env("GIT_ATTR_NOSYSTEM", "1");
     cmd.env_remove("GIT_CONFIG_COUNT");
+    cmd.env_remove("GIT_CONFIG_KEY_0");
+    cmd.env_remove("GIT_CONFIG_VALUE_0");
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    cmd.env_remove("GIT_COMMON_DIR");
+    cmd.env_remove("GIT_INDEX_FILE");
+    cmd.env_remove("GIT_OBJECT_DIRECTORY");
+    cmd.env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
 
     if let Some(dir) = &working_dir {
         cmd.current_dir(dir);
