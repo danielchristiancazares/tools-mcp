@@ -41,8 +41,15 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("source not found: {}", source.display()));
     }
 
-    // If destination is a directory, move into it with same filename
-    let final_dest = if destination.is_dir() {
+    // Existing *real* directories act as container targets in mv-like mode.
+    // Use symlink_metadata so symlink destinations are treated as the
+    // destination path itself instead of being followed into targets.
+    let destination_is_real_dir = tokio::fs::symlink_metadata(destination)
+        .await
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false);
+
+    let final_dest = if destination_is_real_dir {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
@@ -207,7 +214,8 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     // NOT misclassified as a real directory: replacing such a symlink with
     // a file just unlinks the symlink and leaves the target dir untouched,
     // which is safe and remains permitted.
-    if overwrite && source.is_file()
+    if overwrite
+        && source.is_file()
         && let Ok(dst_meta) = tokio::fs::symlink_metadata(&final_dest).await
         && dst_meta.file_type().is_dir()
     {
@@ -749,6 +757,50 @@ mod tests {
             "symlink path should now be a regular file"
         );
         // The directory the symlink pointed to and its contents survive.
+        assert!(target.is_dir(), "target directory must survive");
+        assert!(
+            target_inside.exists(),
+            "data behind the original symlink must survive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_overwrite_replaces_symlink_to_directory_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target_dir");
+        let target_inside = target.join("preserved.txt");
+        let link = dir.path().join("link");
+        tokio::fs::create_dir_all(&target)
+            .await
+            .expect("create target dir");
+        tokio::fs::write(&target_inside, "preserved")
+            .await
+            .expect("write target inside");
+        unix_fs::symlink(&target, &link).expect("symlink");
+
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "fresh").await.expect("write src");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": link.display().to_string(),
+            "overwrite": true
+        });
+
+        let resp = handle_move(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], false, "must succeed: {result}");
+
+        let link_meta = tokio::fs::symlink_metadata(&link)
+            .await
+            .expect("link metadata");
+        assert!(
+            link_meta.file_type().is_file(),
+            "symlink path should now be a regular file"
+        );
         assert!(target.is_dir(), "target directory must survive");
         assert!(
             target_inside.exists(),
