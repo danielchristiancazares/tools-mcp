@@ -181,9 +181,15 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 
     let overwrite = req.overwrite.unwrap_or(false);
 
-    // Existing directories always act as container targets in cp-like mode.
-    // overwrite applies to the resolved child path, not the directory itself.
-    let final_dest = if destination.is_dir() {
+    // Existing *real* directories always act as container targets in cp-like
+    // mode. Use symlink_metadata so destination symlinks are treated as the
+    // destination path itself instead of being followed into their targets.
+    let destination_is_real_dir = tokio::fs::symlink_metadata(destination)
+        .await
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false);
+
+    let final_dest = if destination_is_real_dir {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
@@ -207,7 +213,8 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     // NOT misclassified as a real directory: replacing such a symlink with
     // a file just unlinks the symlink and leaves the target dir untouched,
     // which is safe and remains permitted.
-    if overwrite && source.is_file()
+    if overwrite
+        && source.is_file()
         && let Ok(dst_meta) = tokio::fs::symlink_metadata(&final_dest).await
         && dst_meta.file_type().is_dir()
     {
