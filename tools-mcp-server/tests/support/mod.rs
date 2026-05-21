@@ -55,7 +55,17 @@ pub fn read_server_response<R: BufRead>(
 }
 
 pub fn send_mcp_message(message: &Value) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut child = spawn_server().spawn()?;
+    send_mcp_message_with_command(message, spawn_server())
+}
+
+/// Variant of [`send_mcp_message`] that lets the caller customize the spawned
+/// server process (e.g. set environment variables that gate optional tools).
+#[allow(dead_code)]
+pub fn send_mcp_message_with_command(
+    message: &Value,
+    mut command: Command,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let msg_str = message.to_string();

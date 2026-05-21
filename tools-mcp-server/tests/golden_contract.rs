@@ -5,7 +5,7 @@ mod support;
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use support::{send_mcp_message, workspace_root};
+use support::{send_mcp_message, send_mcp_message_with_command, spawn_server, workspace_root};
 
 fn documented_tool_names() -> BTreeSet<String> {
     let readme =
@@ -236,13 +236,19 @@ fn golden_tools_list_returns_tools_array() {
 
 #[test]
 fn golden_readme_tool_inventory_matches_tools_list() {
+    // The README enumerates every documented tool, including ones that are
+    // gated behind opt-in env vars (e.g. Pwsh requires MCP_ENABLE_PWSH_TOOL).
+    // Enable those gates here so the README inventory and the live
+    // `tools/list` set are comparable.
     let request = json!({
         "jsonrpc": "2.0",
         "id": 9010,
         "method": "mcp/tools/list",
         "params": {}
     });
-    let response = send_mcp_message(&request).expect("tools list");
+    let mut command = spawn_server();
+    command.env("MCP_ENABLE_PWSH_TOOL", "true");
+    let response = send_mcp_message_with_command(&request, command).expect("tools list");
     let actual: BTreeSet<String> = response["result"]["tools"]
         .as_array()
         .expect("tools array")
