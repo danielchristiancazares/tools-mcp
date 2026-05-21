@@ -18,9 +18,11 @@ mod edit;
 mod matching;
 mod model;
 
+use crate::path_policy;
 use serde::Deserialize;
 use serde_json::Value;
 use tools_mcp_core::ToolCallOutcome;
+use tools_mcp_core::validation;
 
 use edit::{ApplySnippetEditRequest, SnippetStatusKind, apply_snippet_edit_impl};
 use matching::MatchHint;
@@ -47,14 +49,23 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         Err(o) => return o,
     };
 
+    if let Err(o) = validation::validate_non_empty(&req.path, "path", None) {
+        return o;
+    }
+
     if req.old_snippet.is_empty() {
         return ToolCallOutcome::err(
             "old_snippet cannot be empty. Remediation: use Read to copy the exact snippet from the file (use LF newlines), then retry Edit.",
         );
     }
 
+    let path = match path_policy::resolve_existing_file(&req.path, "path") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
+
     let internal_req = ApplySnippetEditRequest {
-        path: req.path,
+        path: path.display().to_string(),
         old_snippet: req.old_snippet,
         new_snippet: req.new_snippet,
         match_hint: req.match_hint,
@@ -76,6 +87,7 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 #[cfg(test)]
 mod tests {
     use super::handle_edit;
+    use crate::path_policy::tempdir_in_workspace;
     use serde_json::json;
 
     fn edit_payload(outcome: tools_mcp_core::ToolCallOutcome) -> serde_json::Value {
@@ -87,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_edit_rejects_stale_file_hash_without_modifying_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir_in_workspace("edit-stale-");
         let path = dir.path().join("stale-public.txt");
         std::fs::write(&path, "alpha\nbeta\n").expect("write");
 
@@ -113,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_edit_forwards_region_id_to_success_payload() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir_in_workspace("edit-region-");
         let path = dir.path().join("region-public.txt");
         std::fs::write(&path, "alpha\nbeta\n").expect("write");
 
@@ -133,6 +145,52 @@ mod tests {
         assert_eq!(payload["region_id"], "region-123");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
+            "alpha\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_edit_rejects_parent_traversal_outside_workspace() {
+        let outcome = handle_edit(
+            None,
+            json!({
+                "path": "../outside-edit-policy.txt",
+                "old_snippet": "alpha",
+                "new_snippet": "beta",
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], true);
+        let msg = outcome.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("server working directory"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_edit_canonicalizes_symlinked_file_before_writing() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir_in_workspace("edit-symlink-file-");
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&target, "alpha\nbeta\n").expect("write target");
+        unix_fs::symlink(&target, &link).expect("symlink target");
+
+        let outcome = handle_edit(
+            None,
+            json!({
+                "path": link,
+                "old_snippet": "beta",
+                "new_snippet": "BETA",
+            }),
+        )
+        .await;
+        let payload = edit_payload(outcome);
+
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
             "alpha\nBETA\n"
         );
     }

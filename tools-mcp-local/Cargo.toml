@@ -10,15 +10,22 @@ doctest = false
 anyhow.workspace = true
 glob.workspace = true
 ignore.workspace = true
+memchr.workspace = true
 regex.workspace = true
 regex-syntax.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tree-sitter.workspace = true
 tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
 tools-mcp-core = { path = "../tools-mcp-core" }
 
 [dev-dependencies]

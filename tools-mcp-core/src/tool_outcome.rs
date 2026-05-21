@@ -10,6 +10,21 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone)]
 pub struct ToolCallOutcome(pub Value);
 
+#[derive(Debug, Clone)]
+pub enum DispatchOutcome {
+    Respond(ToolCallOutcome),
+    Cancelled,
+}
+
+impl DispatchOutcome {
+    pub fn into_rpc_response(self, id: Option<Value>) -> Option<crate::RpcResponse> {
+        match self {
+            Self::Respond(outcome) => Some(outcome.into_rpc_response(id)),
+            Self::Cancelled => None,
+        }
+    }
+}
+
 impl ToolCallOutcome {
     /// Wraps a successful MCP tool `result` payload (`content`, `isError: false`, etc.).
     pub fn ok(result: Value) -> Self {
@@ -44,7 +59,7 @@ impl ToolCallOutcome {
     /// Deserialize tool arguments; on failure returns a tool-level error (same strings as
     /// [`crate::response::RpcResponse::parse`]).
     pub fn parse_args<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, Self> {
-        serde_json::from_value::<T>(args.clone()).map_err(|e| {
+        T::deserialize(args).map_err(|e| {
             let msg = e.to_string();
             let hint = if msg.contains("unknown field") {
                 " Unknown fields are not allowed; check argument names against the tool schema."
@@ -100,5 +115,34 @@ impl ToolCallOutcome {
             "content": [{"type": "text", "text": json_text}],
             "isError": is_error
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DispatchOutcome, ToolCallOutcome};
+    use serde_json::json;
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct ParseArgs {
+        count: usize,
+    }
+
+    #[test]
+    fn parse_args_deserializes_arguments_without_consuming_source_value() {
+        let args = json!({"count": 3});
+        let parsed: ParseArgs = ToolCallOutcome::parse_args(&args).expect("args parse");
+
+        assert_eq!(parsed, ParseArgs { count: 3 });
+        assert_eq!(args, json!({"count": 3}));
+    }
+
+    #[test]
+    fn cancelled_dispatch_outcome_suppresses_rpc_response() {
+        assert!(
+            DispatchOutcome::Cancelled
+                .into_rpc_response(Some(json!(1)))
+                .is_none()
+        );
     }
 }

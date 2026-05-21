@@ -238,7 +238,7 @@ impl RpcResponse {
         id: Option<Value>,
         args: &Value,
     ) -> Result<T, Box<RpcResponse>> {
-        serde_json::from_value::<T>(args.clone()).map_err(|e| {
+        T::deserialize(args).map_err(|e| {
             let msg = e.to_string();
             // Serde's error strings are informative but not always prescriptive.
             // Add short remediation hints for the most common failure modes.
@@ -289,6 +289,13 @@ impl RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::RpcResponse;
+    use serde_json::json;
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParseArgs {
+        value: String,
+    }
 
     #[test]
     fn protocol_error_serializes_unknown_id_as_null() {
@@ -297,5 +304,30 @@ mod tests {
 
         assert!(json.as_object().expect("object").contains_key("id"));
         assert!(json["id"].is_null());
+    }
+
+    #[test]
+    fn parse_deserializes_arguments_without_consuming_source_value() {
+        let args = json!({"value": "ok"});
+        let parsed: ParseArgs = RpcResponse::parse(Some(json!(1)), &args).expect("args parse");
+
+        assert_eq!(
+            parsed,
+            ParseArgs {
+                value: "ok".to_string()
+            }
+        );
+        assert_eq!(args, json!({"value": "ok"}));
+    }
+
+    #[test]
+    fn parse_preserves_unknown_field_hint() {
+        let args = json!({"value": "ok", "extra": true});
+        let err = RpcResponse::parse::<ParseArgs>(Some(json!(1)), &args).unwrap_err();
+        let result = err.result.expect("tool error result");
+        let message = result["content"][0]["text"].as_str().expect("message text");
+
+        assert!(message.contains("invalid arguments: unknown field"));
+        assert!(message.contains("Unknown fields are not allowed"));
     }
 }

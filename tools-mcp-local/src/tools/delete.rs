@@ -1,6 +1,6 @@
+use crate::path_policy;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::define_mcp_tool;
 use tools_mcp_core::validation;
@@ -21,7 +21,10 @@ async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return o;
     }
 
-    let path = Path::new(&req.path);
+    let path = match path_policy::resolve_mutation_path(&req.path, "path") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
 
     // Reject symlinks to prevent TOCTOU races and deletion of files outside the workspace.
     if path.is_symlink() {
@@ -42,7 +45,7 @@ async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         ));
     }
 
-    if let Err(err) = tokio::fs::remove_file(path).await {
+    if let Err(err) = tokio::fs::remove_file(&path).await {
         return ToolCallOutcome::err(format!("failed to delete {}: {err}", path.display()));
     }
 
@@ -74,10 +77,10 @@ define_mcp_tool! {
 mod tests {
     #[tokio::test]
     async fn delete_rejects_symlinks() {
+        use crate::path_policy::tempdir_in_workspace;
         use std::fs;
-        use tempfile::tempdir;
 
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir_in_workspace("delete-symlink-");
         let target = dir.path().join("target.txt");
         let link = dir.path().join("link");
 
@@ -105,10 +108,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_still_deletes_regular_files() {
+        use crate::path_policy::tempdir_in_workspace;
         use std::fs;
-        use tempfile::tempdir;
 
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir_in_workspace("delete-regular-");
         let path = dir.path().join("regular.txt");
         fs::write(&path, "content").expect("write file");
 
@@ -121,5 +124,18 @@ mod tests {
 
         assert!(!is_error, "deleting a regular file should succeed");
         assert!(!path.exists(), "file should be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_parent_traversal_outside_workspace() {
+        let args = serde_json::json!({
+            "path": "../outside-delete-policy.txt",
+        });
+
+        let outcome = super::handle_delete(None, args).await;
+
+        assert_eq!(outcome.0["isError"], true);
+        let msg = outcome.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("outside the server working directory"));
     }
 }

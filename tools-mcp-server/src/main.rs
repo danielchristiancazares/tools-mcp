@@ -1,23 +1,77 @@
 //! MCP server binary: stdin/stdout JSON-RPC loop plus feature-crate composition.
 
 use anyhow::Result;
-use tokio::io::{self, BufReader};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::io::{self, BufReader, Stdout};
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tools_mcp_core::{
     RpcResponse, read_mcp_message, should_skip_headers, write_mcp_payload_with_mode,
     write_mcp_response_with_mode,
 };
 use tracing::{error, info};
 
-use crate::composition::build_tool_registry;
+use crate::composition::{InflightRegistry, JsonRpcId, build_tool_registry};
 use crate::mcp_server::{
-    ParseRpcRequestError, RpcMessage, dispatch_jsonrpc_batch, dispatch_jsonrpc_request,
-    parse_rpc_message,
+    ParseRpcRequestError, RpcBatchItem, RpcMessage, RpcRequest, StaticProtocolPayloads,
+    dispatch_jsonrpc_batch, dispatch_jsonrpc_request, parse_rpc_message,
 };
 
 mod composition;
 mod gemini_gate;
 mod mcp_server;
 mod ping;
+
+type SharedWriter = Arc<Mutex<Stdout>>;
+
+enum ServerControl {
+    GracefulShutdown,
+    AbortPendingTasks,
+}
+
+async fn write_response(
+    writer: &SharedWriter,
+    response: &RpcResponse,
+    skip_headers: bool,
+) -> Result<()> {
+    let mut writer = writer.lock().await;
+    write_mcp_response_with_mode(&mut *writer, response, skip_headers).await
+}
+
+async fn write_payload<T: serde::Serialize + ?Sized>(
+    writer: &SharedWriter,
+    payload: &T,
+    skip_headers: bool,
+) -> Result<()> {
+    let mut writer = writer.lock().await;
+    write_mcp_payload_with_mode(&mut *writer, payload, skip_headers).await
+}
+
+fn is_tool_call_method(method: &str) -> bool {
+    matches!(
+        method,
+        "mcp/tools/call" | "tools/call" | "server/tools/call"
+    )
+}
+
+fn is_shutdown_method(method: &str) -> bool {
+    matches!(method, "mcp/shutdown" | "shutdown" | "server/shutdown")
+}
+
+fn request_requests_shutdown(req: &RpcRequest) -> bool {
+    !req.is_notification && is_shutdown_method(&req.method)
+}
+
+fn batch_requests_shutdown(items: &[RpcBatchItem]) -> bool {
+    items.iter().any(|item| match item {
+        RpcBatchItem::Request(req) => request_requests_shutdown(req),
+        RpcBatchItem::Response | RpcBatchItem::InvalidRequest { .. } => false,
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,43 +85,69 @@ async fn main() -> Result<()> {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut writer = stdout;
-    let reader = BufReader::new(stdin);
-    let mut reader = reader;
+    let writer: SharedWriter = Arc::new(Mutex::new(stdout));
+    let mut reader = BufReader::new(stdin);
 
     tools_mcp_local::start_search_cache_warmer();
 
-    let registry = build_tool_registry();
+    let registry = Arc::new(build_tool_registry());
     let tools = registry.list();
+    let static_payloads = Arc::new(StaticProtocolPayloads::new(&tools)?);
+    let inflight = InflightRegistry::default();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ServerControl>();
+    let mut tasks = JoinSet::new();
+    let mut abort_pending_tasks = false;
+    let abort_requested = Arc::new(AtomicBool::new(false));
 
-    loop {
-        let message = match read_mcp_message(&mut reader).await {
-            Ok(Some(v)) => v,
-            Ok(None) => break,
-            Err(read_err) => {
-                error!("failed to read MCP message: {}", read_err.error);
-                let parse_error = RpcResponse::protocol_error(None, -32700, "Parse error");
-                let skip_headers = if read_err.response_has_headers {
-                    false
-                } else {
-                    should_skip_headers()
-                };
-                if let Err(write_err) =
-                    write_mcp_response_with_mode(&mut writer, &parse_error, skip_headers).await
-                {
-                    error!("failed to write parse error response: {}", write_err);
-                    break;
+    'read_loop: loop {
+        while let Some(join_result) = tasks.try_join_next() {
+            if let Err(join_err) = join_result
+                && !join_err.is_cancelled()
+            {
+                error!("dispatch task failed: {}", join_err);
+            }
+        }
+
+        let message = tokio::select! {
+            biased;
+            Some(control) = control_rx.recv() => {
+                match control {
+                    ServerControl::GracefulShutdown => {
+                        info!("shutdown requested");
+                    }
+                    ServerControl::AbortPendingTasks => {
+                        abort_pending_tasks = true;
+                    }
                 }
-                if read_err.should_continue {
-                    continue;
+                break 'read_loop;
+            }
+            read_result = read_mcp_message(&mut reader) => {
+                match read_result {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break 'read_loop,
+                    Err(read_err) => {
+                        error!("failed to read MCP message: {}", read_err.error);
+                        let parse_error = RpcResponse::protocol_error(None, -32700, "Parse error");
+                        let skip_headers = if read_err.response_has_headers {
+                            false
+                        } else {
+                            should_skip_headers()
+                        };
+                        if let Err(write_err) = write_response(&writer, &parse_error, skip_headers).await {
+                            error!("failed to write parse error response: {}", write_err);
+                            abort_pending_tasks = true;
+                            break 'read_loop;
+                        }
+                        if read_err.should_continue {
+                            continue 'read_loop;
+                        }
+                        abort_pending_tasks = true;
+                        break 'read_loop;
+                    }
                 }
-                break;
             }
         };
         let line = message.body;
-        if line.trim().is_empty() {
-            continue;
-        }
 
         let message_kind = match parse_rpc_message(&line) {
             Ok(RpcMessage::Request(r)) => {
@@ -90,10 +170,9 @@ async fn main() -> Result<()> {
                 } else {
                     should_skip_headers()
                 };
-                if let Err(write_err) =
-                    write_mcp_response_with_mode(&mut writer, &response, skip_headers).await
-                {
+                if let Err(write_err) = write_response(&writer, &response, skip_headers).await {
                     error!("failed to write parse error response: {}", write_err);
+                    abort_pending_tasks = true;
                     break;
                 }
                 continue;
@@ -106,10 +185,9 @@ async fn main() -> Result<()> {
                 } else {
                     should_skip_headers()
                 };
-                if let Err(write_err) =
-                    write_mcp_response_with_mode(&mut writer, &response, skip_headers).await
-                {
+                if let Err(write_err) = write_response(&writer, &response, skip_headers).await {
                     error!("failed to write invalid request response: {}", write_err);
+                    abort_pending_tasks = true;
                     break;
                 }
                 continue;
@@ -122,45 +200,126 @@ async fn main() -> Result<()> {
             should_skip_headers()
         };
 
-        let should_exit = match message_kind {
+        match message_kind {
+            RpcMessage::Request(req) if req.is_notification => {
+                let _ = dispatch_jsonrpc_request(
+                    req,
+                    registry.as_ref(),
+                    static_payloads.as_ref(),
+                    &inflight,
+                    None,
+                )
+                .await;
+            }
             RpcMessage::Request(req) => {
-                let Some((resp, should_exit)) =
-                    dispatch_jsonrpc_request(req, &registry, &tools).await
-                else {
-                    continue;
-                };
+                let should_stop_reading = request_requests_shutdown(&req);
+                let registry = Arc::clone(&registry);
+                let static_payloads = Arc::clone(&static_payloads);
+                let writer = Arc::clone(&writer);
+                let inflight = inflight.clone();
+                let control_tx = control_tx.clone();
+                let abort_requested = Arc::clone(&abort_requested);
+                let cancellation_token =
+                    is_tool_call_method(&req.method).then(CancellationToken::new);
+                let inflight_guard = cancellation_token.as_ref().and_then(|token| {
+                    req.id
+                        .as_ref()
+                        .and_then(JsonRpcId::from_value)
+                        .map(|request_id| {
+                            inflight.register(request_id.clone(), token.clone());
+                            inflight.drop_on_completion(request_id)
+                        })
+                });
 
-                info!("Sending response for request id: {:?}", resp.id);
-                if let Err(e) = write_mcp_response_with_mode(&mut writer, &resp, skip_headers).await
-                {
-                    error!("failed to write MCP response: {}", e);
-                    break;
+                tasks.spawn(async move {
+                    let _guard = inflight_guard;
+                    let Some((resp, should_exit)) = dispatch_jsonrpc_request(
+                        req,
+                        registry.as_ref(),
+                        static_payloads.as_ref(),
+                        &inflight,
+                        cancellation_token,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+
+                    info!("Sending response for request id: {:?}", resp.id);
+                    if let Err(write_err) = write_response(&writer, &resp, skip_headers).await {
+                        error!("failed to write MCP response: {}", write_err);
+                        abort_requested.store(true, Ordering::SeqCst);
+                        let _ = control_tx.send(ServerControl::AbortPendingTasks);
+                        return;
+                    }
+                    info!("Response sent successfully");
+
+                    if should_exit {
+                        let _ = control_tx.send(ServerControl::GracefulShutdown);
+                    }
+                });
+
+                if should_stop_reading {
+                    info!("shutdown accepted");
+                    break 'read_loop;
                 }
-                should_exit
             }
             RpcMessage::Batch(items) => {
-                let Some((responses, should_exit)) =
-                    dispatch_jsonrpc_batch(items, &registry, &tools).await
-                else {
-                    continue;
-                };
+                let should_stop_reading = batch_requests_shutdown(&items);
+                let registry = Arc::clone(&registry);
+                let static_payloads = Arc::clone(&static_payloads);
+                let writer = Arc::clone(&writer);
+                let inflight = inflight.clone();
+                let control_tx = control_tx.clone();
+                let abort_requested = Arc::clone(&abort_requested);
 
-                info!("Sending batch response with {} item(s)", responses.len());
-                if let Err(e) =
-                    write_mcp_payload_with_mode(&mut writer, &responses, skip_headers).await
-                {
-                    error!("failed to write MCP batch response: {}", e);
-                    break;
+                tasks.spawn(async move {
+                    let Some((responses, should_exit)) = dispatch_jsonrpc_batch(
+                        items,
+                        registry.as_ref(),
+                        static_payloads.as_ref(),
+                        &inflight,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+
+                    info!("Sending batch response with {} item(s)", responses.len());
+                    if let Err(write_err) = write_payload(&writer, &responses, skip_headers).await {
+                        error!("failed to write MCP batch response: {}", write_err);
+                        abort_requested.store(true, Ordering::SeqCst);
+                        let _ = control_tx.send(ServerControl::AbortPendingTasks);
+                        return;
+                    }
+                    info!("Response sent successfully");
+
+                    if should_exit {
+                        let _ = control_tx.send(ServerControl::GracefulShutdown);
+                    }
+                });
+
+                if should_stop_reading {
+                    info!("shutdown accepted");
+                    break 'read_loop;
                 }
-                should_exit
             }
             RpcMessage::Response => continue,
-        };
-        info!("Response sent successfully");
+        }
+    }
 
-        if should_exit {
-            info!("shutdown requested");
-            break;
+    if abort_pending_tasks || abort_requested.load(Ordering::SeqCst) {
+        tasks.abort_all();
+    }
+
+    while let Some(join_result) = tasks.join_next().await {
+        if abort_requested.load(Ordering::SeqCst) {
+            tasks.abort_all();
+        }
+        if let Err(join_err) = join_result
+            && !join_err.is_cancelled()
+        {
+            error!("dispatch task failed: {}", join_err);
         }
     }
 

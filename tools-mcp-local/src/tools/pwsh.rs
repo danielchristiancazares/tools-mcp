@@ -1,3 +1,7 @@
+use crate::path_policy;
+use std::ffi::OsStr;
+use std::io;
+use std::path::Path;
 use std::process::Stdio;
 
 use serde::Deserialize;
@@ -23,6 +27,27 @@ struct PwshRequest {
     timeout_ms: Option<u64>,
 }
 
+fn default_pwsh_exe() -> &'static OsStr {
+    if cfg!(target_os = "windows") {
+        OsStr::new("pwsh.exe")
+    } else {
+        OsStr::new("pwsh")
+    }
+}
+
+fn build_pwsh_command(program: &OsStr, command: &str, work_dir: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(["-NoLogo", "-Command", command]);
+    cmd.current_dir(work_dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd
+}
+
+fn spawn_pwsh(req: &PwshRequest, work_dir: &Path) -> Result<tokio::process::Child, io::Error> {
+    let mut cmd = build_pwsh_command(default_pwsh_exe(), &req.command, work_dir);
+    cmd.spawn()
+}
+
 async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     let req = match ToolCallOutcome::parse_args::<PwshRequest>(&args) {
         Ok(r) => r,
@@ -30,6 +55,15 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     };
 
     let work_dir = req.working_dir.as_deref().unwrap_or(".");
+    if let Some(working_dir) = req.working_dir.as_deref()
+        && let Err(o) = validation::validate_non_empty(working_dir, "working_dir", None)
+    {
+        return o;
+    }
+    let work_dir = match path_policy::resolve_existing_directory(work_dir, "working_dir") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
     let timeout_ms = validation::clamp_timeout(
         req.timeout_ms,
         DEFAULT_PWSH_TIMEOUT_MS,
@@ -37,19 +71,9 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         MAX_PWSH_TIMEOUT_MS,
     );
 
-    info!("Pwsh tool: executing command in {}", work_dir);
+    info!("Pwsh tool: executing command in {}", work_dir.display());
 
-    let pwsh_exe = if cfg!(target_os = "windows") {
-        "pwsh.exe"
-    } else {
-        "pwsh"
-    };
-    let mut cmd = Command::new(pwsh_exe);
-    cmd.args(["-NoLogo", "-Command", &req.command]);
-    cmd.current_dir(work_dir);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let child = match cmd.spawn() {
+    let child = match spawn_pwsh(&req, &work_dir) {
         Ok(c) => c,
         Err(e) => {
             error!("Pwsh tool: failed to spawn pwsh: {}", e);
@@ -94,6 +118,28 @@ async fn execute_pwsh(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         "stderr": result.stderr,
     });
     ToolCallOutcome::ok_json_content(&payload, !result.success)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_pwsh;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn pwsh_rejects_parent_traversal_working_dir_before_spawn() {
+        let outcome = execute_pwsh(
+            None,
+            json!({
+                "command": "Write-Output should-not-run",
+                "working_dir": ".."
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], true);
+        let msg = outcome.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("outside the server working directory"));
+    }
 }
 
 define_mcp_tool! {

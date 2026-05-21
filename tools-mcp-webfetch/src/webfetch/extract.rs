@@ -64,6 +64,9 @@ use std::sync::OnceLock;
 ///
 /// Building the converter allocates handler tables and options; reuse it across requests.
 static HTML_TO_MARKDOWN: OnceLock<HtmlToMarkdown> = OnceLock::new();
+static TITLE_SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+static LANGUAGE_SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+static BODY_SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
 
 fn get_converter() -> &'static HtmlToMarkdown {
     HTML_TO_MARKDOWN.get_or_init(|| {
@@ -71,6 +74,24 @@ fn get_converter() -> &'static HtmlToMarkdown {
             .skip_tags(vec!["script", "style", "nav", "footer", "header"])
             .build()
     })
+}
+
+fn title_selector() -> Option<&'static Selector> {
+    TITLE_SELECTOR
+        .get_or_init(|| Selector::parse("title").ok())
+        .as_ref()
+}
+
+fn language_selector() -> Option<&'static Selector> {
+    LANGUAGE_SELECTOR
+        .get_or_init(|| Selector::parse("meta[http-equiv=\"content-language\"]").ok())
+        .as_ref()
+}
+
+fn body_selector() -> Option<&'static Selector> {
+    BODY_SELECTOR
+        .get_or_init(|| Selector::parse("body").ok())
+        .as_ref()
 }
 
 /// Extracted document with metadata and Markdown content.
@@ -130,8 +151,8 @@ fn looks_like_html(content_type: Option<&str>, bytes: &[u8]) -> bool {
 /// Concatenates all text nodes within the title element and trims whitespace.
 /// Returns `None` if no title tag exists or if it's empty.
 fn extract_title(document: &Html) -> Option<String> {
-    let selector = Selector::parse("title").ok()?;
-    let node = document.select(&selector).next()?;
+    let selector = title_selector()?;
+    let node = document.select(selector).next()?;
     let mut title = String::new();
     for t in node.text() {
         let t = t.trim();
@@ -163,9 +184,9 @@ fn extract_language(document: &Html) -> Option<String> {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             // Fall back to meta http-equiv tag
-            let selector = Selector::parse("meta[http-equiv=\"content-language\"]").ok()?;
+            let selector = language_selector()?;
             document
-                .select(&selector)
+                .select(selector)
                 .filter_map(|node| node.value().attr("content"))
                 .map(|s| s.trim().to_string())
                 .find(|lang| !lang.is_empty())
@@ -248,8 +269,8 @@ fn extract_from_html(bytes: &[u8], _source_url: &str) -> ExtractedDocument {
     let language = extract_language(&document);
 
     // Extract just the <body> content to avoid head/script/style noise
-    let body_html: Cow<'_, str> = if let Ok(body_selector) = Selector::parse("body") {
-        document.select(&body_selector).next().map_or_else(
+    let body_html: Cow<'_, str> = if let Some(body_selector) = body_selector() {
+        document.select(body_selector).next().map_or_else(
             || Cow::Borrowed(html_source.as_ref()),
             |body| Cow::Owned(body.inner_html()),
         )

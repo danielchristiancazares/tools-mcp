@@ -13,6 +13,7 @@
 //! at the correct byte ranges in the original encoding.
 
 use anyhow::{Context, Result, anyhow};
+use memchr::memchr2;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -140,15 +141,13 @@ impl CanonicalData {
     }
 
     pub(super) fn line_index_for_offset(&self, canonical_offset: usize) -> Option<usize> {
-        for (idx, view) in self.line_views.iter().enumerate() {
-            if canonical_offset < view.canonical_full_end {
-                return Some(idx);
-            }
-        }
         if self.line_views.is_empty() {
             None
         } else {
-            Some(self.line_views.len() - 1)
+            let idx = self
+                .line_views
+                .partition_point(|view| canonical_offset >= view.canonical_full_end);
+            Some(idx.min(self.line_views.len() - 1))
         }
     }
 }
@@ -258,9 +257,7 @@ fn split_lines(bytes: &[u8]) -> (Vec<LineSlice>, NewlineStats) {
 
     while idx < bytes.len() {
         let content_start = idx;
-        while idx < bytes.len() && bytes[idx] != b'\n' && bytes[idx] != b'\r' {
-            idx += 1;
-        }
+        idx += memchr2(b'\n', b'\r', &bytes[idx..]).unwrap_or(bytes.len() - idx);
         let content_end = idx;
         let mut newline_kind = NewlineKind::None;
         if idx < bytes.len() {
@@ -399,5 +396,20 @@ mod tests {
         assert_eq!(canonical.byte_offset(newline_start), Some(5));
         let newline_end = canonical.line_views[0].canonical_full_end;
         assert_eq!(canonical.byte_offset(newline_end), Some(7));
+    }
+
+    #[test]
+    fn line_index_lookup_uses_canonical_full_line_boundaries() {
+        let data = b"a\nbb\r\nccc";
+        let (lines, _) = split_lines(data);
+        let canonical = CanonicalData::from_bytes(data, &lines).expect("canonical data");
+
+        assert_eq!(canonical.line_index_for_offset(0), Some(0));
+        assert_eq!(canonical.line_index_for_offset(1), Some(0));
+        assert_eq!(canonical.line_index_for_offset(2), Some(1));
+        assert_eq!(canonical.line_index_for_offset(4), Some(1));
+        assert_eq!(canonical.line_index_for_offset(5), Some(2));
+        assert_eq!(canonical.line_index_for_offset(8), Some(2));
+        assert_eq!(canonical.line_index_for_offset(usize::MAX), Some(2));
     }
 }

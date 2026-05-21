@@ -15,6 +15,10 @@
 /// assert_eq!(strip_ansi_codes(colored), "Error: file not found");
 /// ```
 pub fn strip_ansi_codes(s: &str) -> String {
+    if !s.as_bytes().contains(&b'\x1b') {
+        return s.to_owned();
+    }
+
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 

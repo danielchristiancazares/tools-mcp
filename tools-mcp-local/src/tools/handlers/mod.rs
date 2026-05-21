@@ -10,7 +10,11 @@
 
 mod read_file;
 mod ripgrep;
+mod search_contract;
+mod search_file_selection;
 mod search_memory;
+#[cfg(test)]
+mod search_parity;
 
 pub use read_file::handle_read_file;
 pub use ripgrep::handle_search;

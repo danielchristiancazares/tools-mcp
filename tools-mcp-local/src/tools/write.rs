@@ -1,6 +1,6 @@
+use crate::path_policy;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::define_mcp_tool;
@@ -23,7 +23,10 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return o;
     }
 
-    let path = Path::new(&req.path);
+    let path = match path_policy::resolve_mutation_path(&req.path, "path") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
 
     // Create parent directories if needed
     if let Some(parent) = path.parent()
@@ -42,7 +45,7 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
+        .open(&path)
         .await
     {
         Ok(f) => f,
@@ -68,6 +71,53 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             ("bytes", json!(bytes.len())),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_write;
+    use crate::path_policy::tempdir_in_workspace;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn write_rejects_parent_traversal_outside_workspace() {
+        let outcome = handle_write(
+            None,
+            json!({
+                "path": "../outside-write-policy.txt",
+                "content": "blocked"
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], true);
+        let msg = outcome.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("outside the server working directory"));
+    }
+
+    #[tokio::test]
+    async fn write_preserves_in_workspace_create_behavior() {
+        let dir = tempdir_in_workspace("write-in-scope-");
+        let path = dir.path().join("nested").join("created.txt");
+
+        let outcome = handle_write(
+            None,
+            json!({
+                "path": path.display().to_string(),
+                "content": "created"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.0["isError"], false,
+            "write should succeed: {outcome:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "created"
+        );
+    }
 }
 
 define_mcp_tool! {

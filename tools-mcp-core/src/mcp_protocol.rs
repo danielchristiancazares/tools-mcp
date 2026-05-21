@@ -24,6 +24,7 @@
 //! The reader auto-detects the format based on whether input starts with `{`.
 
 use anyhow::{Context, Result};
+use std::io::Write as _;
 use std::sync::OnceLock;
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -37,6 +38,13 @@ static SKIP_HEADERS: OnceLock<bool> = OnceLock::new();
 /// This limit applies to both Content-Length framed messages and raw JSON lines.
 /// It protects against memory exhaustion from malicious Content-Length headers.
 pub const MAX_MCP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum allowed size for the header/preamble section before a framed body.
+///
+/// This is intentionally much smaller than the message body cap because MCP only
+/// requires a small `Content-Length` header. It prevents unbounded header
+/// preambles from consuming transport time before a body is read.
+pub const MAX_MCP_HEADER_BYTES: usize = 64 * 1024;
 
 /// Determines whether to skip Content-Length headers in responses.
 ///
@@ -87,6 +95,7 @@ pub struct McpReadError {
 /// - Consumes trailing newlines after the message body
 /// - Ignores empty lines before headers (for robustness)
 /// - Case-insensitive header name matching
+/// - Rejects duplicate `Content-Length` headers and oversized header sections
 pub async fn read_mcp_message<R>(
     reader: &mut R,
 ) -> std::result::Result<Option<McpMessage>, McpReadError>
@@ -98,6 +107,7 @@ where
     let mut content_length: Option<usize> = None;
     let mut saw_headers = false;
     let mut saw_non_empty_non_json_line = false;
+    let mut header_section_bytes = 0usize;
 
     // Parse headers or detect raw JSON
     loop {
@@ -130,6 +140,32 @@ where
         let line = String::from_utf8_lossy(&line_bytes).into_owned();
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
 
+        // Auto-detect raw JSON mode (line starts with { or [)
+        let trimmed_start = trimmed.trim_start();
+        if content_length.is_none()
+            && !saw_non_empty_non_json_line
+            && (trimmed_start.starts_with('{') || trimmed_start.starts_with('['))
+        {
+            return Ok(Some(McpMessage {
+                body: trimmed.to_owned(),
+                has_headers: false,
+            }));
+        }
+
+        header_section_bytes = header_section_bytes.saturating_add(bytes_read);
+        if header_section_bytes > MAX_MCP_HEADER_BYTES {
+            return Err(McpReadError {
+                error: io::Error::new(
+                    ErrorKind::InvalidData,
+                    "MCP header section exceeds maximum allowed size",
+                ),
+                response_has_headers: saw_headers
+                    || saw_non_empty_non_json_line
+                    || !trimmed.is_empty(),
+                should_continue: false,
+            });
+        }
+
         // Empty line signals end of headers. If we've seen header-like lines but no
         // Content-Length yet, this is a malformed framed message.
         if trimmed.is_empty() {
@@ -146,22 +182,20 @@ where
             continue; // Skip leading blank lines
         }
 
-        // Auto-detect raw JSON mode (line starts with { or [)
-        let trimmed_start = trimmed.trim_start();
-        if content_length.is_none()
-            && !saw_non_empty_non_json_line
-            && (trimmed_start.starts_with('{') || trimmed_start.starts_with('['))
-        {
-            return Ok(Some(McpMessage {
-                body: trimmed.to_owned(),
-                has_headers: false,
-            }));
-        }
-
         // Parse Content-Length header (case-insensitive)
         if let Some((name, value)) = trimmed.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
         {
+            if content_length.is_some() {
+                return Err(McpReadError {
+                    error: io::Error::new(
+                        ErrorKind::InvalidData,
+                        "duplicate Content-Length header",
+                    ),
+                    response_has_headers: true,
+                    should_continue: false,
+                });
+            }
             let len = value.trim().parse::<usize>().map_err(|_| McpReadError {
                 error: io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header"),
                 response_has_headers: true,
@@ -316,9 +350,15 @@ where
 
     // Write Content-Length header unless in raw JSON mode
     if !skip_headers {
-        let header = format!("Content-Length: {payload_len}\r\n\r\n");
+        let mut header = [0u8; 64];
+        let header_len = {
+            let mut cursor = std::io::Cursor::new(&mut header[..]);
+            write!(cursor, "Content-Length: {payload_len}\r\n\r\n")
+                .context("format Content-Length header")?;
+            cursor.position() as usize
+        };
         writer
-            .write_all(header.as_bytes())
+            .write_all(&header[..header_len])
             .await
             .context("write Content-Length header")?;
     }
@@ -431,6 +471,46 @@ mod tests {
         assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.response_has_headers);
         assert!(!err.should_continue);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_errors_on_duplicate_content_length() {
+        let input = b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected duplicate Content-Length to error");
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.error.to_string().contains("duplicate Content-Length"));
+        assert!(err.response_has_headers);
+        assert!(!err.should_continue);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_rejects_oversized_header_section() {
+        let input = format!("X-Fill: {}\r\n\r\n", "a".repeat(MAX_MCP_HEADER_BYTES));
+        let mut reader = BufReader::new(input.as_bytes());
+        let err = read_mcp_message(&mut reader)
+            .await
+            .expect_err("expected oversized header section to error");
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.error
+                .to_string()
+                .contains("header section exceeds maximum allowed size")
+        );
+        assert!(err.response_has_headers);
+        assert!(!err.should_continue);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_allows_raw_json_larger_than_header_section_limit() {
+        let payload = "a".repeat(MAX_MCP_HEADER_BYTES + 16);
+        let input = format!("{{\"payload\":\"{payload}\"}}\n");
+        let mut reader = BufReader::new(input.as_bytes());
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg.body, input.trim_end_matches('\n'));
+        assert!(!msg.has_headers);
     }
 
     #[tokio::test]

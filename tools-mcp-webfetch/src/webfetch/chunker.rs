@@ -102,6 +102,12 @@ pub fn chunk_markdown(
             return Ok(());
         }
 
+        if section_obviously_fits_token_budget(trimmed, max_tokens) {
+            let token_count = encoder.encode_ordinary(trimmed).len();
+            chunks.push((heading.clone(), trimmed.to_string(), token_count));
+            return Ok(());
+        }
+
         // Tokenize once for the whole section, then slice tokens into max-sized chunks.
         let tokens = encoder.encode_ordinary(trimmed);
         if tokens.len() <= max_tokens {
@@ -145,10 +151,12 @@ pub fn chunk_markdown(
     let mut code_fence: Option<(char, usize)> = None;
 
     for line in markdown.lines() {
-        let trimmed = line.trim();
+        let control_line = markdown_control_line(line).map(str::trim_end);
 
         // Track fenced code blocks (` ``` ` / ` ~~~ `), including variable-length fences.
-        if let Some((marker, len)) = parse_fence_marker(trimmed) {
+        if let Some(trimmed) = control_line
+            && let Some((marker, len)) = parse_fence_marker(trimmed)
+        {
             match code_fence {
                 None => {
                     code_fence = Some((marker, len));
@@ -166,7 +174,7 @@ pub fn chunk_markdown(
 
         // Headings mark natural chunk boundaries, but only outside code blocks.
         let heading_text = if code_fence.is_none() {
-            parse_markdown_heading(trimmed)
+            control_line.and_then(parse_markdown_heading)
         } else {
             None
         };
@@ -188,28 +196,49 @@ pub fn chunk_markdown(
     Ok(chunks)
 }
 
-fn parse_fence_marker(trimmed_line: &str) -> Option<(char, usize)> {
-    let mut chars = trimmed_line.chars();
-    let marker = chars.next()?;
-    if marker != '`' && marker != '~' {
+fn markdown_control_line(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut spaces = 0usize;
+    while spaces < bytes.len() && bytes[spaces] == b' ' {
+        spaces += 1;
+        if spaces > 3 {
+            return None;
+        }
+    }
+
+    if bytes.get(spaces) == Some(&b'\t') {
         return None;
     }
 
-    let len = trimmed_line.chars().take_while(|&c| c == marker).count();
-    (len >= 3).then_some((marker, len))
+    Some(&line[spaces..])
+}
+
+fn parse_fence_marker(trimmed_line: &str) -> Option<(char, usize)> {
+    let marker = *trimmed_line.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+
+    let len = trimmed_line
+        .as_bytes()
+        .iter()
+        .take_while(|&&byte| byte == marker)
+        .count();
+    (len >= 3).then_some((marker as char, len))
 }
 
 fn is_closing_fence_line(trimmed_line: &str) -> bool {
     // Closing fence line may contain surrounding whitespace but no info string/content.
     // We call this only after confirming marker + minimum length.
-    let mut chars = trimmed_line.chars();
-    let Some(marker) = chars.next() else {
+    let Some(&marker) = trimmed_line.as_bytes().first() else {
         return false;
     };
-    let rest = trimmed_line
-        .chars()
-        .skip_while(|&c| c == marker)
-        .collect::<String>();
+    let marker_len = trimmed_line
+        .as_bytes()
+        .iter()
+        .take_while(|&&byte| byte == marker)
+        .count();
+    let rest = &trimmed_line[marker_len..];
     rest.trim().is_empty()
 }
 
@@ -239,6 +268,10 @@ fn parse_markdown_heading(trimmed_line: &str) -> Option<String> {
     }
 
     Some(text.to_string())
+}
+
+fn section_obviously_fits_token_budget(text: &str, max_tokens: usize) -> bool {
+    text.len() <= max_tokens
 }
 
 /// Estimates the token count for a text string.
@@ -371,6 +404,22 @@ Body line 2
     }
 
     #[test]
+    fn chunk_markdown_short_section_preserves_exact_token_count() {
+        let md = "# Title\nSmall content with [a link](https://example.com).";
+        let max_tokens = md.trim().len();
+        let chunks = chunk_markdown(md, Some(max_tokens)).expect("chunking failed");
+
+        assert_eq!(chunks.len(), 1, "short section should remain one chunk");
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
+        assert_eq!(chunks[0].1, md);
+        assert_eq!(
+            chunks[0].2,
+            estimate_tokens(md).expect("estimate short-section tokens"),
+            "short-section fast path must preserve exact token_count"
+        );
+    }
+
+    #[test]
     fn chunk_markdown_rejects_zero_max_tokens() {
         let err = chunk_markdown("hello", Some(0))
             .expect_err("zero token budget should be rejected explicitly");
@@ -409,6 +458,27 @@ Body line 2
         assert_eq!(chunks.len(), 2, "unexpected chunks: {chunks:?}");
         assert_eq!(chunks[0].0.as_deref(), Some("Title"));
         assert!(chunks[0].1.contains("#hashtag is text"));
+        assert_eq!(chunks[1].0.as_deref(), Some("Sub"));
+    }
+
+    #[test]
+    fn chunk_markdown_does_not_treat_indented_code_as_heading() {
+        let md = "# Title\n    # indented code, not a heading\nstill title\n## Sub\nbody";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        assert_eq!(chunks.len(), 2, "unexpected chunks: {chunks:?}");
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
+        assert!(chunks[0].1.contains("    # indented code"));
+        assert_eq!(chunks[1].0.as_deref(), Some("Sub"));
+    }
+
+    #[test]
+    fn chunk_markdown_allows_headings_indented_up_to_three_spaces() {
+        let md = "   # Title\nbody\n   ## Sub\nmore";
+        let chunks = chunk_markdown(md, None).unwrap();
+
+        assert_eq!(chunks.len(), 2, "unexpected chunks: {chunks:?}");
+        assert_eq!(chunks[0].0.as_deref(), Some("Title"));
         assert_eq!(chunks[1].0.as_deref(), Some("Sub"));
     }
 

@@ -468,6 +468,7 @@ mod tests {
     #[test]
     fn maybe_write_cache_persists_when_cache_enabled() {
         let cache_key = format!("test_{}_http", Uuid::new_v4());
+        let path = cache::cache_path_for(&cache_key).expect("cache path");
         let entry = cache::CachedFetch {
             content_type: Some("text/plain".to_string()),
             body: b"hello".to_vec(),
@@ -481,6 +482,8 @@ mod tests {
             cached.is_some(),
             "no_cache=false should persist cache entries"
         );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

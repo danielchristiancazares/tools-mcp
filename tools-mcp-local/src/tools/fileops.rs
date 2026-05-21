@@ -1,5 +1,7 @@
 //! File operation tools: Move, Copy, `ListDir`.
 
+use crate::path_policy;
+use crate::tools::scope_cache::{DirEntriesKey, ScopeCacheError, ScopeFileType, dir_entries_cache};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
@@ -34,8 +36,14 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return o;
     }
 
-    let source = Path::new(&req.source);
-    let destination = Path::new(&req.destination);
+    let source = match path_policy::resolve_mutation_path(&req.source, "source") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
+    let destination = match path_policy::resolve_mutation_path(&req.destination, "destination") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
 
     if !source.exists() {
         return ToolCallOutcome::err(format!("source not found: {}", source.display()));
@@ -51,10 +59,14 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     } else {
         destination.to_path_buf()
     };
+    let final_dest = match path_policy::resolve_mutation_path(&final_dest, "destination") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
 
     if source.is_dir() {
-        let source_norm = normalize_absolute_or_cwd(source);
-        let dest_norm = normalize_absolute_or_cwd(&final_dest);
+        let source_norm = canonicalize_existing_or_normalized(&source);
+        let dest_norm = canonicalize_existing_or_normalized(&final_dest);
         if dest_norm != source_norm && dest_norm.starts_with(&source_norm) {
             return ToolCallOutcome::err(format!(
                 "refusing move: destination {} is inside source {}",
@@ -79,16 +91,16 @@ async fn handle_move(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("failed to create parent directory: {err}"));
     }
 
-    if let Err(err) = tokio::fs::rename(source, &final_dest).await {
+    if let Err(err) = tokio::fs::rename(&source, &final_dest).await {
         // rename() may fail across filesystems, try copy+delete
         if source.is_file() {
-            if let Err(copy_err) = tokio::fs::copy(source, &final_dest).await {
+            if let Err(copy_err) = tokio::fs::copy(&source, &final_dest).await {
                 return ToolCallOutcome::err(format!(
                     "failed to move {}: {err}, copy fallback failed: {copy_err}",
                     source.display()
                 ));
             }
-            if let Err(del_err) = tokio::fs::remove_file(source).await {
+            if let Err(del_err) = tokio::fs::remove_file(&source).await {
                 return ToolCallOutcome::err(format!(
                     "moved file but failed to remove source: {del_err}"
                 ));
@@ -162,14 +174,20 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return o;
     }
 
-    let source = Path::new(&req.source);
-    let destination = Path::new(&req.destination);
+    let source = match path_policy::resolve_mutation_path(&req.source, "source") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
+    let destination = match path_policy::resolve_mutation_path(&req.destination, "destination") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
 
     if !source.exists() {
         return ToolCallOutcome::err(format!("source not found: {}", source.display()));
     }
 
-    let source_metadata = match tokio::fs::symlink_metadata(source).await {
+    let source_metadata = match tokio::fs::symlink_metadata(&source).await {
         Ok(metadata) => metadata,
         Err(err) => {
             return ToolCallOutcome::err(format!(
@@ -180,11 +198,25 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     };
 
     let overwrite = req.overwrite.unwrap_or(false);
+    let destination_is_real_dir = tokio::fs::symlink_metadata(&destination)
+        .await
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false);
 
-    // Existing directories act as container targets in the default cp-like mode.
-    // When overwrite=true, treat the provided destination path literally so the
-    // replacement semantics apply to that path instead of creating a nested copy.
-    let final_dest = if destination.is_dir() && !overwrite {
+    if overwrite && source_metadata.file_type().is_file() && destination_is_real_dir {
+        return ToolCallOutcome::err(format!(
+            "refusing to overwrite directory {} with non-directory source {}: \
+             type-mismatch replacement would recursively delete the directory; \
+             remove or rename the directory first if replacement is intended",
+            destination.display(),
+            source.display()
+        ));
+    }
+
+    // Existing real directories act as container targets in cp-like mode.
+    // Symlinked directories remain replaceable paths so overwrite only unlinks
+    // the symlink rather than mutating the target directory.
+    let final_dest = if destination_is_real_dir {
         if let Some(filename) = source.file_name() {
             destination.join(filename)
         } else {
@@ -193,6 +225,28 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     } else {
         destination.to_path_buf()
     };
+    let final_dest = match path_policy::resolve_mutation_path(&final_dest, "destination") {
+        Ok(path) => path,
+        Err(err) => return ToolCallOutcome::err(err.to_string()),
+    };
+
+    // Defense in depth for non-container paths: refuse to recursively delete a
+    // real directory just because the caller passed `overwrite: true` with a
+    // non-directory source. Use `symlink_metadata` so replacing a symlink to a
+    // directory only unlinks the symlink and leaves the target untouched.
+    if overwrite
+        && source.is_file()
+        && let Ok(dst_meta) = tokio::fs::symlink_metadata(&final_dest).await
+        && dst_meta.file_type().is_dir()
+    {
+        return ToolCallOutcome::err(format!(
+            "refusing to overwrite directory {} with non-directory source {}: \
+             type-mismatch replacement would recursively delete the directory; \
+             remove or rename the directory first if replacement is intended",
+            final_dest.display(),
+            source.display()
+        ));
+    }
 
     if source_metadata.file_type().is_symlink() && source.is_dir() && req.recursive.unwrap_or(false)
     {
@@ -203,8 +257,8 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     if source.is_dir() && req.recursive.unwrap_or(false) {
-        let source_norm = normalize_absolute_or_cwd(source);
-        let dest_norm = normalize_absolute_or_cwd(&final_dest);
+        let source_norm = canonicalize_existing_or_normalized(&source);
+        let dest_norm = canonicalize_existing_or_normalized(&final_dest);
         if dest_norm.starts_with(&source_norm) {
             return ToolCallOutcome::err(format!(
                 "refusing recursive copy: destination {} is inside source {} (would recurse indefinitely)",
@@ -230,7 +284,7 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
     }
 
     if source.is_file() {
-        if let Err(err) = copy_file_with_overwrite(source, &final_dest, overwrite).await {
+        if let Err(err) = copy_file_with_overwrite(&source, &final_dest, overwrite).await {
             return ToolCallOutcome::err(format!("failed to copy {}: {err}", source.display()));
         }
     } else if source.is_dir() {
@@ -240,7 +294,7 @@ async fn handle_copy(_id: Option<Value>, args: Value) -> ToolCallOutcome {
                 source.display()
             ));
         }
-        if let Err(err) = copy_directory_with_overwrite(source, &final_dest, overwrite).await {
+        if let Err(err) = copy_directory_with_overwrite(&source, &final_dest, overwrite).await {
             return ToolCallOutcome::err(format!(
                 "failed to copy directory {}: {err}",
                 source.display()
@@ -266,6 +320,15 @@ fn normalize_absolute_or_cwd(path: &Path) -> PathBuf {
             .join(path)
     };
     normalize_path(&absolute)
+}
+
+fn canonicalize_existing_or_normalized(path: &Path) -> PathBuf {
+    if path.exists()
+        && let Ok(canonical) = path.canonicalize()
+    {
+        return canonical;
+    }
+    normalize_absolute_or_cwd(path)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -341,6 +404,27 @@ async fn remove_existing_path(path: &Path) -> std::io::Result<()> {
 async fn copy_file_with_overwrite(src: &Path, dst: &Path, overwrite: bool) -> std::io::Result<u64> {
     if !overwrite || !dst.exists() {
         return tokio::fs::copy(src, dst).await;
+    }
+
+    // Defense in depth: this primitive is only meant to replace a regular
+    // file with another regular file. The historical overwrite path below
+    // calls `remove_existing_path(dst)` which dispatches to `remove_dir_all`
+    // when `dst` is a real directory, recursively wiping unrelated state.
+    // `handle_copy` already rejects this shape, but re-check here so any
+    // future caller — and any TOCTOU race that turns `dst` into a directory
+    // between the entry-point check and this point — fails closed before
+    // any mutation. `symlink_metadata` keeps the safe symlink-to-dir case
+    // working: only the symlink itself is unlinked; its target is preserved.
+    if let Ok(meta) = tokio::fs::symlink_metadata(dst).await
+        && meta.file_type().is_dir()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to overwrite directory {} with a non-directory source",
+                dst.display()
+            ),
+        ));
     }
 
     let staged = replacement_stage_path(dst);
@@ -427,7 +511,52 @@ define_mcp_tool! {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tempfile::tempdir;
+
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        Ok(crate::path_policy::tempdir_in_workspace("fileops-"))
+    }
+
+    #[tokio::test]
+    async fn move_rejects_destination_outside_workspace() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("move-source.txt");
+        tokio::fs::write(&src, "content")
+            .await
+            .expect("write source");
+
+        let resp = handle_move(
+            Some(json!(1)),
+            json!({
+                "source": src.display().to_string(),
+                "destination": "../outside-move-policy.txt"
+            }),
+        )
+        .await;
+        let result = resp.0;
+
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("outside the server working directory"));
+        assert!(src.exists(), "source file must not be moved");
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_source_outside_workspace() {
+        let dir = tempdir().expect("tempdir");
+        let resp = handle_copy(
+            Some(json!(1)),
+            json!({
+                "source": "../outside-copy-policy.txt",
+                "destination": dir.path().join("copy-destination.txt").display().to_string()
+            }),
+        )
+        .await;
+        let result = resp.0;
+
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("outside the server working directory"));
+    }
 
     #[tokio::test]
     async fn copy_rejects_recursive_copy_into_own_subdirectory() {
@@ -517,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_overwrite_replaces_existing_directory_contents() {
+    async fn copy_overwrite_into_existing_directory_keeps_container() {
         let dir = tempdir().expect("tempdir");
         let src = dir.path().join("src");
         let dst = dir.path().join("dst");
@@ -540,8 +669,8 @@ mod tests {
         let resp = handle_copy(Some(json!(1)), args).await;
         let result = resp.0;
         assert_eq!(result["isError"], false);
-        assert!(dst.join("fresh.txt").exists());
-        assert!(!dst.join("stale.txt").exists());
+        assert!(dst.join("src").join("fresh.txt").exists());
+        assert!(dst.join("stale.txt").exists());
     }
 
     #[tokio::test]
@@ -567,6 +696,146 @@ mod tests {
         assert_eq!(result["isError"], false);
         assert!(dst.is_dir());
         assert!(dst.join("inside.txt").exists());
+    }
+
+    /// Exploit-closure regression: replicates the original PoC that turned
+    /// `Copy` with `overwrite: true` and a non-directory source on top of an
+    /// existing directory destination into an unbounded `rm -rf` of the
+    /// directory subtree. The fix must abort before any mutation, leaving
+    /// the directory and its nested contents intact.
+    #[tokio::test]
+    async fn copy_refuses_overwriting_directory_with_file() {
+        let dir = tempdir().expect("tempdir");
+        let dst = dir.path().join("victim_dir");
+        let nested = dst.join("nested");
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("create nested");
+        tokio::fs::write(nested.join("keep.txt"), "IMPORTANT_DO_NOT_DELETE")
+            .await
+            .expect("write keep.txt");
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "ATTACKER_FILE")
+            .await
+            .expect("write src");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": dst.display().to_string(),
+            "overwrite": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], true, "must refuse: {result}");
+        let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("refusing to overwrite directory"),
+            "expected refusal diagnostic, got: {msg}"
+        );
+
+        // Filesystem must be untouched: directory still exists, nested file
+        // still exists with the original content, and the destination did
+        // not become a regular file.
+        assert!(
+            dst.is_dir(),
+            "victim directory must still exist as a directory"
+        );
+        assert!(
+            !dst.is_file(),
+            "destination must not have been replaced with a regular file"
+        );
+        assert!(
+            nested.join("keep.txt").exists(),
+            "nested file must not have been recursively deleted"
+        );
+        let kept = tokio::fs::read_to_string(nested.join("keep.txt"))
+            .await
+            .expect("read keep.txt");
+        assert_eq!(
+            kept, "IMPORTANT_DO_NOT_DELETE",
+            "nested file content must be preserved"
+        );
+    }
+
+    /// Defense-in-depth: even if a future caller bypasses the entry-point
+    /// check, the underlying primitive must refuse to recursively delete a
+    /// directory.
+    #[tokio::test]
+    async fn copy_file_with_overwrite_refuses_directory_destination() {
+        let dir = tempdir().expect("tempdir");
+        let dst = dir.path().join("real_dir");
+        let nested = dst.join("inside.txt");
+        tokio::fs::create_dir_all(&dst).await.expect("create dst");
+        tokio::fs::write(&nested, "preserved")
+            .await
+            .expect("write nested");
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "data").await.expect("write src");
+
+        let err = copy_file_with_overwrite(&src, &dst, true)
+            .await
+            .expect_err("primitive must refuse a directory destination");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("refusing to overwrite directory"),
+            "expected refusal diagnostic, got: {err}"
+        );
+        assert!(dst.is_dir(), "destination directory must be preserved");
+        assert!(nested.exists(), "nested file must be preserved");
+    }
+
+    /// Pins the safe-by-design behavior we explicitly want to keep: when
+    /// the destination is a symlink whose target is a directory, the
+    /// `Copy` operation only unlinks the symlink and replaces it with a
+    /// regular file. The directory the symlink pointed to (and any data
+    /// it contained) must be preserved, because the dangerous case is
+    /// recursive deletion of a real directory's tree, not unlinking a
+    /// single symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_overwrite_replaces_symlink_to_directory_without_destroying_target() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target_dir");
+        let target_inside = target.join("preserved.txt");
+        let link = dir.path().join("link");
+        tokio::fs::create_dir_all(&target)
+            .await
+            .expect("create target dir");
+        tokio::fs::write(&target_inside, "preserved")
+            .await
+            .expect("write target inside");
+        unix_fs::symlink(&target, &link).expect("symlink");
+
+        let src = dir.path().join("source.txt");
+        tokio::fs::write(&src, "fresh").await.expect("write src");
+
+        let args = json!({
+            "source": src.display().to_string(),
+            "destination": link.display().to_string(),
+            "overwrite": true
+        });
+
+        let resp = handle_copy(Some(json!(1)), args).await;
+        let result = resp.0;
+        assert_eq!(result["isError"], false, "must succeed: {result}");
+
+        // The symlink path is now a regular file.
+        let link_meta = tokio::fs::symlink_metadata(&link)
+            .await
+            .expect("link metadata");
+        assert!(
+            link_meta.file_type().is_file(),
+            "symlink path should now be a regular file"
+        );
+        // The directory the symlink pointed to and its contents survive.
+        assert!(target.is_dir(), "target directory must survive");
+        assert!(
+            target_inside.exists(),
+            "data behind the original symlink must survive"
+        );
     }
 
     #[tokio::test]
@@ -637,39 +906,47 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         ));
     }
 
-    let mut entries = match tokio::fs::read_dir(path).await {
-        Ok(e) => e,
-        Err(err) => {
+    let mut lines: Vec<String> = Vec::new();
+    let mut items: Vec<Value> = Vec::new();
+
+    // Reuse the shared per-directory snapshot so repeat `ListDir` calls on the
+    // same directory skip an async `read_dir` scan. The cache filters hidden
+    // entries when `show_hidden = false`, mirroring the prior in-line filter.
+    let key = DirEntriesKey {
+        path: path.to_path_buf(),
+        show_hidden,
+    };
+    let snapshot = match dir_entries_cache().get_or_build(&key).await {
+        Ok(snapshot) => snapshot,
+        Err(ScopeCacheError::Io(err)) => {
             return ToolCallOutcome::err(format!(
                 "failed to read directory {}: {err}. Remediation: check permissions and that the path is a directory.",
                 path.display()
             ));
         }
+        Err(ScopeCacheError::Walk(message)) => {
+            return ToolCallOutcome::err(format!(
+                "list_dir: directory walk failed: {message}. Remediation: check permissions and that the path is a directory."
+            ));
+        }
+        Err(ScopeCacheError::Timeout) => {
+            return ToolCallOutcome::err(
+                "list_dir: directory listing timed out. Remediation: retry or list a smaller directory.".to_string(),
+            );
+        }
     };
 
-    let mut items: Vec<Value> = Vec::new();
-    let mut lines: Vec<String> = Vec::new();
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        // Skip hidden files unless requested
-        if !show_hidden && name.starts_with('.') {
-            continue;
-        }
-
-        let file_type = entry.file_type().await.ok();
-        let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
-        let is_symlink = file_type
-            .as_ref()
-            .is_some_and(std::fs::FileType::is_symlink);
+    for entry in &snapshot.entries {
+        let name = entry.basename.clone();
+        let is_dir = matches!(entry.file_type, ScopeFileType::Dir);
+        let is_symlink = matches!(entry.file_type, ScopeFileType::Symlink);
 
         if long_format {
-            let metadata = entry.metadata().await.ok();
-            let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-            let modified = metadata
+            let size = entry.metadata_stamp.as_ref().map_or(0, |stamp| stamp.len);
+            let modified = entry
+                .metadata_stamp
                 .as_ref()
-                .and_then(|m| m.modified().ok())
+                .and_then(|stamp| stamp.modified)
                 .and_then(|t| {
                     t.duration_since(std::time::UNIX_EPOCH)
                         .ok()
@@ -753,4 +1030,118 @@ define_mcp_tool! {
         "additionalProperties": false
     },
     handler: handle_listdir
+}
+
+#[cfg(test)]
+mod list_dir_tests {
+    use super::{DirEntriesKey, dir_entries_cache, handle_listdir};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static LIST_DIR_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct ListDirTestDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ListDirTestDir {
+        fn new(name: &str) -> Self {
+            let base = std::env::current_dir()
+                .expect("current directory")
+                .join("target")
+                .join("list-dir-cache-tests");
+            std::fs::create_dir_all(&base).expect("create test base directory");
+            let unique = LIST_DIR_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("{name}-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ListDirTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn dir_entries_cache_returns_same_snapshot_for_repeat_list_dir_key() {
+        let dir = ListDirTestDir::new("repeat-snapshot");
+        std::fs::write(dir.path().join("alpha.txt"), "alpha").expect("write alpha");
+
+        let key = DirEntriesKey {
+            path: dir.path().to_path_buf(),
+            show_hidden: false,
+        };
+
+        let first = dir_entries_cache()
+            .get_or_build(&key)
+            .await
+            .expect("initial dir snapshot");
+        let second = dir_entries_cache()
+            .get_or_build(&key)
+            .await
+            .expect("cached dir snapshot");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated ListDir scope lookups must reuse the cached snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_listdir_lists_hidden_when_all_is_true() {
+        let dir = ListDirTestDir::new("hidden-correctness");
+        std::fs::write(dir.path().join("visible.txt"), "visible").expect("write visible");
+        std::fs::write(dir.path().join(".secret"), "shh").expect("write hidden");
+
+        let args = json!({
+            "path": dir.path().display().to_string(),
+            "all": true,
+        });
+        let resp = handle_listdir(Some(json!(1)), args).await.0;
+        assert_eq!(resp["isError"], false, "expected success: {resp}");
+
+        let entries = resp["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .map(|v| v["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            entries.iter().any(|n| n == "visible.txt"),
+            "expected visible.txt in {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|n| n == ".secret"),
+            "expected .secret in {entries:?}"
+        );
+
+        // Verify that omitting `all` filters hidden entries.
+        let resp_no_hidden = handle_listdir(
+            Some(json!(2)),
+            json!({ "path": dir.path().display().to_string() }),
+        )
+        .await
+        .0;
+        let visible_entries = resp_no_hidden["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .map(|v| v["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            visible_entries.iter().all(|n| n != ".secret"),
+            "hidden entries must be filtered when all=false: {visible_entries:?}"
+        );
+        assert!(
+            visible_entries.iter().any(|n| n == "visible.txt"),
+            "visible.txt must still appear when all=false: {visible_entries:?}"
+        );
+    }
 }

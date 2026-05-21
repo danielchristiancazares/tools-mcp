@@ -1,10 +1,10 @@
+use super::super::path_policy;
 use super::super::run_git;
 use super::super::types::build_git_response;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use tokio::fs;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::config::{
@@ -17,15 +17,21 @@ fn sanitize_path_for_filename(path: &str) -> String {
     path.replace(['/', '\\'], "__")
 }
 
-fn unique_patch_filename(base: &str, used_filenames: &mut HashSet<String>) -> String {
+fn unique_patch_filename(
+    base: &str,
+    used_filenames: &mut HashSet<String>,
+    next_suffix_by_base: &mut HashMap<String, usize>,
+) -> String {
     let first = format!("{base}.patch");
     if used_filenames.insert(first.clone()) {
         return first;
     }
 
-    for suffix in 2.. {
+    let next_suffix = next_suffix_by_base.entry(base.to_string()).or_insert(2);
+    for suffix in *next_suffix.. {
         let candidate = format!("{base}.{suffix}.patch");
         if used_filenames.insert(candidate.clone()) {
+            *next_suffix = suffix + 1;
             return candidate;
         }
     }
@@ -123,26 +129,19 @@ fn build_ref_diff_args(
 }
 
 fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
-    let tokens: Vec<&str> = stdout
-        .split('\0')
-        .filter(|token| !token.is_empty())
-        .collect();
-    let mut idx = 0usize;
+    let mut tokens = stdout.split('\0').filter(|token| !token.is_empty());
     let mut entries = Vec::new();
 
-    while idx < tokens.len() {
-        let status_token = tokens[idx];
-        idx += 1;
+    while let Some(status_token) = tokens.next() {
         let Some(status_code) = status_token.chars().next() else {
             return Err("git diff --name-status returned an empty status token".to_string());
         };
 
         match status_code {
             'A' | 'D' | 'M' | 'T' => {
-                let path = tokens.get(idx).ok_or_else(|| {
+                let path = tokens.next().ok_or_else(|| {
                     format!("git diff --name-status missing path for status {status_token}")
                 })?;
-                idx += 1;
                 let status = match status_code {
                     'A' => "added",
                     'D' => "deleted",
@@ -158,13 +157,12 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
                 });
             }
             'R' => {
-                let old_path = tokens.get(idx).ok_or_else(|| {
+                let old_path = tokens.next().ok_or_else(|| {
                     format!("git diff --name-status missing old path for status {status_token}")
                 })?;
-                let new_path = tokens.get(idx + 1).ok_or_else(|| {
+                let new_path = tokens.next().ok_or_else(|| {
                     format!("git diff --name-status missing new path for status {status_token}")
                 })?;
-                idx += 2;
                 entries.push(DiffManifestEntry {
                     path: (*new_path).to_string(),
                     status: "renamed".to_string(),
@@ -175,13 +173,12 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
                 });
             }
             'C' => {
-                let old_path = tokens.get(idx).ok_or_else(|| {
+                let old_path = tokens.next().ok_or_else(|| {
                     format!("git diff --name-status missing old path for status {status_token}")
                 })?;
-                let new_path = tokens.get(idx + 1).ok_or_else(|| {
+                let new_path = tokens.next().ok_or_else(|| {
                     format!("git diff --name-status missing new path for status {status_token}")
                 })?;
-                idx += 2;
                 entries.push(DiffManifestEntry {
                     path: (*new_path).to_string(),
                     status: "copied".to_string(),
@@ -213,56 +210,54 @@ fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<()
             )
         })
         .collect();
-    let tokens: Vec<&str> = stdout
-        .split('\0')
-        .filter(|token| !token.is_empty())
-        .collect();
-    let mut idx = 0usize;
+    let mut tokens = stdout.split('\0').filter(|token| !token.is_empty());
 
-    while idx < tokens.len() {
-        let stats = tokens[idx];
-        idx += 1;
-        let parts: Vec<&str> = stats.split('\t').collect();
-        if parts.len() < 3 {
+    while let Some(stats) = tokens.next() {
+        let mut parts = stats.splitn(3, '\t');
+        let insertions_text = parts.next().unwrap_or_default();
+        let Some(deletions_text) = parts.next() else {
             return Err(format!(
                 "git diff --numstat returned malformed record: {stats:?}"
             ));
-        }
+        };
+        let Some(raw_path) = parts.next() else {
+            return Err(format!(
+                "git diff --numstat returned malformed record: {stats:?}"
+            ));
+        };
 
-        let binary = parts[0] == "-" && parts[1] == "-";
+        let binary = insertions_text == "-" && deletions_text == "-";
         let insertions = if binary {
             0
         } else {
-            parts[0].parse::<u32>().map_err(|err| {
+            insertions_text.parse::<u32>().map_err(|err| {
                 format!(
                     "git diff --numstat invalid insertions value {:?}: {err}",
-                    parts[0]
+                    insertions_text
                 )
             })?
         };
         let deletions = if binary {
             0
         } else {
-            parts[1].parse::<u32>().map_err(|err| {
+            deletions_text.parse::<u32>().map_err(|err| {
                 format!(
                     "git diff --numstat invalid deletions value {:?}: {err}",
-                    parts[1]
+                    deletions_text
                 )
             })?
         };
 
-        let raw_path = parts[2..].join("\t");
         let (path, old_path) = if raw_path.is_empty() {
-            let old_path = tokens.get(idx).ok_or_else(|| {
+            let old_path = tokens.next().ok_or_else(|| {
                 "git diff --numstat missing old path for rename record".to_string()
             })?;
-            let new_path = tokens.get(idx + 1).ok_or_else(|| {
+            let new_path = tokens.next().ok_or_else(|| {
                 "git diff --numstat missing new path for rename record".to_string()
             })?;
-            idx += 2;
             ((*new_path).to_string(), Some((*old_path).to_string()))
         } else {
-            (raw_path, None)
+            (raw_path.to_string(), None)
         };
 
         let key = diff_manifest_key(&path, old_path.as_deref());
@@ -335,9 +330,10 @@ async fn write_patches_to_dir(
     output_dir: &str,
     paths: &[String],
     timeout_ms: u64,
-) -> Result<Value, String> {
-    let out_path = Path::new(output_dir);
-    fs::create_dir_all(out_path)
+) -> Result<(Value, String), String> {
+    let out_path = path_policy::resolve_output_dir(output_dir)?;
+    let effective_output_dir = out_path.display().to_string();
+    fs::create_dir_all(&out_path)
         .await
         .map_err(|e| format!("Failed to create output directory: {e}"))?;
 
@@ -348,6 +344,7 @@ async fn write_patches_to_dir(
     let mut total_insertions: u64 = 0;
     let mut total_deletions: u64 = 0;
     let mut used_patch_filenames = HashSet::new();
+    let mut next_patch_suffix_by_base = HashMap::new();
 
     for entry in entries {
         total_insertions += u64::from(entry.insertions);
@@ -356,6 +353,7 @@ async fn write_patches_to_dir(
         let patch_filename = unique_patch_filename(
             &sanitize_path_for_filename(&entry.path),
             &mut used_patch_filenames,
+            &mut next_patch_suffix_by_base,
         );
         let patch_path = out_path.join(&patch_filename);
 
@@ -429,7 +427,7 @@ async fn write_patches_to_dir(
         .await
         .map_err(|e| format!("Failed to write summary: {e}"))?;
 
-    Ok(json!(summary))
+    Ok((json!(summary), effective_output_dir))
 }
 
 /// Handle the `GitDiff` MCP tool request.
@@ -500,10 +498,10 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
             )
             .await
             {
-                Ok(summary) => {
+                Ok((summary, effective_output_dir)) => {
                     let files_changed = summary["summary"]["files_changed"].as_u64().unwrap_or(0);
                     let text = format!(
-                        "Diff between {from_ref} and {to_ref}: {files_changed} files changed. Patches written to {output_dir}"
+                        "Diff between {from_ref} and {to_ref}: {files_changed} files changed. Patches written to {effective_output_dir}"
                     );
                     let mut response = serde_json::Map::new();
                     response.insert(
@@ -513,7 +511,7 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
                     response.insert("isError".to_string(), json!(false));
                     response.insert("from_ref".to_string(), json!(from_ref));
                     response.insert("to_ref".to_string(), json!(to_ref));
-                    response.insert("output_dir".to_string(), json!(output_dir));
+                    response.insert("output_dir".to_string(), json!(effective_output_dir));
                     response.insert("summary".to_string(), summary["summary"].clone());
                     response.insert("files".to_string(), summary["files"].clone());
                     return ToolCallOutcome::ok(Value::Object(response));
@@ -598,7 +596,7 @@ mod tests {
         unique_patch_filename,
     };
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -627,7 +625,7 @@ mod tests {
             .expect("system clock before epoch")
             .as_nanos();
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/tools-mcp-git-tests")
+            .join("target/tools-mcp-git-tests")
             .join(format!("{name}-{}-{nanos}", std::process::id()))
     }
 
@@ -704,6 +702,17 @@ mod tests {
     }
 
     #[test]
+    fn apply_numstat_z_preserves_tabs_in_paths() {
+        let mut entries =
+            parse_name_status_z("M\0src/file\tname.txt\0").expect("tabbed path entry should parse");
+        apply_numstat_z(&mut entries, "3\t2\tsrc/file\tname.txt\0")
+            .expect("tabbed path numstat should parse");
+        assert_eq!(entries[0].insertions, 3);
+        assert_eq!(entries[0].deletions, 2);
+        assert_eq!(entries[0].path, "src/file\tname.txt");
+    }
+
+    #[test]
     fn ref_diff_args_place_modes_before_end_of_options() {
         let paths = vec!["src/lib.rs".to_string()];
         let args = build_ref_diff_args(
@@ -732,13 +741,22 @@ mod tests {
     #[test]
     fn unique_patch_filename_disambiguates_sanitized_path_collisions() {
         let mut used = HashSet::new();
+        let mut next_suffix_by_base = HashMap::new();
         assert_eq!(
-            unique_patch_filename("a__b.txt", &mut used),
+            unique_patch_filename("a__b.txt", &mut used, &mut next_suffix_by_base),
             "a__b.txt.patch"
         );
         assert_eq!(
-            unique_patch_filename("a__b.txt", &mut used),
+            unique_patch_filename("a__b.txt", &mut used, &mut next_suffix_by_base),
             "a__b.txt.2.patch"
+        );
+        assert_eq!(
+            unique_patch_filename("a__b.txt.2", &mut used, &mut next_suffix_by_base),
+            "a__b.txt.2.2.patch"
+        );
+        assert_eq!(
+            unique_patch_filename("a__b.txt", &mut used, &mut next_suffix_by_base),
+            "a__b.txt.3.patch"
         );
     }
 
@@ -820,6 +838,51 @@ mod tests {
         assert_eq!(files[0]["path"], "a.txt");
         assert!(patches.join("a.txt.patch").exists());
         assert!(!patches.join("b.txt.patch").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_diff_ref_export_reports_canonical_output_dir_for_symlinked_parent() {
+        use std::os::unix::fs as unix_fs;
+
+        if !git_available() {
+            eprintln!("Skipping GitDiff symlink output_dir test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("diff-output-symlink");
+        let repo = create_two_commit_repo(&root);
+        let patch_target = root.join("patch-target");
+        let patch_link = root.join("patch-link");
+        std::fs::create_dir_all(&patch_target).expect("create patch target");
+        unix_fs::symlink(&patch_target, &patch_link).expect("symlink patch target");
+
+        let outcome = handle_git_diff(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string(),
+                "from_ref": "HEAD~1",
+                "to_ref": "HEAD",
+                "output_dir": patch_link.join("patches").to_string_lossy().to_string(),
+                "paths": ["a.txt"]
+            }),
+        )
+        .await;
+
+        let expected = patch_target
+            .canonicalize()
+            .expect("canonical patch target")
+            .join("patches");
+        let expected_output_dir = expected.to_string_lossy().to_string();
+        assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
+        assert_eq!(
+            outcome.0["output_dir"].as_str(),
+            Some(expected_output_dir.as_str())
+        );
+        assert!(expected.join("_summary.json").exists());
+        assert!(expected.join("a.txt.patch").exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

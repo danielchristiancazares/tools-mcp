@@ -48,7 +48,7 @@ pub async fn read_to_end_limited<R>(mut reader: R, limit: usize) -> io::Result<(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut out: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::with_capacity(limit.min(16 * 1024));
     let mut truncated = false;
     let mut buf = [0u8; 16 * 1024];
 
@@ -148,4 +148,36 @@ pub async fn wait_with_limits(
         truncated_stdout,
         truncated_stderr,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_to_end_limited;
+
+    #[tokio::test]
+    async fn read_to_end_limited_captures_input_under_limit() {
+        let input = b"hello";
+        let (captured, truncated) = read_to_end_limited(&input[..], 16).await.unwrap();
+
+        assert_eq!(captured, b"hello");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn read_to_end_limited_truncates_but_keeps_prefix() {
+        let input = b"hello world";
+        let (captured, truncated) = read_to_end_limited(&input[..], 5).await.unwrap();
+
+        assert_eq!(captured, b"hello");
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_to_end_limited_zero_limit_marks_nonempty_input_truncated() {
+        let input = b"hello";
+        let (captured, truncated) = read_to_end_limited(&input[..], 0).await.unwrap();
+
+        assert!(captured.is_empty());
+        assert!(truncated);
+    }
 }

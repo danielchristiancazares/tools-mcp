@@ -2,7 +2,7 @@
 
 use crate::services::default_web_fetcher;
 use crate::webfetch::FetchRequest;
-use tools_mcp_core::{ToolCallOutcome, config::MAX_ERROR_DETAIL_CHARS, text};
+use tools_mcp_core::ToolCallOutcome;
 
 /// MCP tool handler for `WebFetch`
 pub(crate) async fn handle_webfetch(
@@ -30,6 +30,7 @@ pub(crate) async fn handle_webfetch(
             let details_full = format!("{e:#}");
             let (message, error_type, remediation) =
                 classify_webfetch_error(&details_full, force_browser);
+            let details = redacted_webfetch_error_details(error_type);
 
             ToolCallOutcome::err_with(
                 message,
@@ -37,13 +38,7 @@ pub(crate) async fn handle_webfetch(
                     ("error_type", serde_json::json!(error_type)),
                     ("url", serde_json::json!(url)),
                     ("force_browser", serde_json::json!(force_browser)),
-                    (
-                        "details",
-                        serde_json::json!(text::truncate_at_char_boundary(
-                            &details_full,
-                            MAX_ERROR_DETAIL_CHARS
-                        )),
-                    ),
+                    ("details", serde_json::json!(details)),
                     ("remediation", serde_json::json!(remediation)),
                 ],
             )
@@ -172,10 +167,42 @@ fn classify_webfetch_error(
         "WebFetch failed.".to_string(),
         "unknown",
         vec![
-            "Check the details field for the underlying error and retry.".to_string(),
+            "Check server logs for diagnostic detail if you operate this MCP server.".to_string(),
             "Try another URL or provide the text directly if available.".to_string(),
         ],
     )
+}
+
+fn redacted_webfetch_error_details(error_type: &str) -> &'static str {
+    match error_type {
+        "robots_disallowed" => {
+            "The target URL is disallowed by robots.txt. Raw network diagnostics are redacted from tool responses."
+        }
+        "robots_unavailable" => {
+            "WebFetch could not verify robots.txt and failed closed. Raw network diagnostics are redacted from tool responses."
+        }
+        "ssrf_blocked" => {
+            "The target URL was blocked by WebFetch SSRF protection before fetching. Raw network diagnostics are redacted from tool responses."
+        }
+        "browser_unavailable" => {
+            "Browser rendering is unavailable or disabled. Raw browser diagnostics are redacted from tool responses."
+        }
+        "http_404" => {
+            "The remote server reported that the resource was not found. Raw upstream diagnostics are redacted from tool responses."
+        }
+        "http_error" => {
+            "The remote server returned an unsuccessful HTTP status. Raw upstream diagnostics are redacted from tool responses."
+        }
+        "timeout" => {
+            "The fetch or render operation timed out. Raw network diagnostics are redacted from tool responses."
+        }
+        "network" => {
+            "The fetch failed due to DNS or network connectivity. Raw network diagnostics are redacted from tool responses."
+        }
+        _ => {
+            "WebFetch failed. Raw upstream, network, and browser diagnostics are redacted from tool responses."
+        }
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +218,47 @@ mod tests {
 
         assert_eq!(error_type, "robots_unavailable");
         assert!(!remediation.is_empty());
+    }
+
+    #[test]
+    fn classify_webfetch_error_unknown_points_to_logs_not_details() {
+        let (_message, error_type, remediation) =
+            classify_webfetch_error("unexpected lower-level failure", false);
+
+        assert_eq!(error_type, "unknown");
+        assert!(remediation.iter().any(|item| item.contains("server logs")));
+        assert!(
+            remediation
+                .iter()
+                .all(|item| !item.contains("details field"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_webfetch_redacts_raw_network_error_details() {
+        let outcome = handle_webfetch(
+            None,
+            serde_json::json!({
+                "url": "http://localhost:1234/private"
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], true);
+        assert_eq!(outcome.0["error_type"], "ssrf_blocked");
+        assert_eq!(outcome.0["url"], "http://localhost:1234/private");
+
+        let details = outcome.0["details"]
+            .as_str()
+            .expect("details should be a string");
+        let lower = details.to_ascii_lowercase();
+        assert!(
+            lower.contains("redacted"),
+            "details should explain that raw diagnostics are redacted: {details}"
+        );
+        assert!(
+            !lower.contains("localhost") && !details.contains("127.0.0.1"),
+            "details must not echo raw rejected hosts or resolved addresses: {details}"
+        );
     }
 }

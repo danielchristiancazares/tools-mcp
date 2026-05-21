@@ -1,12 +1,17 @@
+use super::scope_cache::{RepoScopeKey, ScopeCacheError, ScopeFileType, repo_scope_cache};
 use glob::{MatchOptions, Pattern};
-use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::config::{DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT};
 use tools_mcp_core::define_mcp_tool;
 use tools_mcp_core::validation;
+
+// Glob has no per-call timeout today; pick a generous default consistent with
+// the previous in-process `ignore::WalkBuilder` walk, which was unbounded.
+const GLOB_SCOPE_CACHE_DEADLINE: Duration = Duration::from_secs(10);
 
 const MAX_BRACE_ALTERNATIVES: usize = 64;
 const MAX_EXPANDED_PATTERNS: usize = 1024;
@@ -155,35 +160,49 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         require_literal_leading_dot: !include_hidden,
     };
 
-    // Walk directory tree respecting .gitignore
-    let walker = WalkBuilder::new(base_path)
-        .hidden(!include_hidden)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    // Reuse the shared recursive-scope snapshot for this root + flag set so
+    // repeat globs on the same scope skip an `ignore::WalkBuilder` traversal.
+    // The key flags mirror the prior in-line `WalkBuilder` defaults exactly
+    // (`hidden = include_hidden`, `follow_links = false`, `ignore = true`).
+    let key = RepoScopeKey {
+        root: base.to_path_buf(),
+        hidden: include_hidden,
+        follow: false,
+        no_ignore: false,
+    };
+    let deadline = Instant::now() + GLOB_SCOPE_CACHE_DEADLINE;
+    let snapshot = match repo_scope_cache().get_or_build(&key, deadline) {
+        Ok(snapshot) => snapshot,
+        Err(ScopeCacheError::Walk(message)) => {
+            return ToolCallOutcome::err(format!(
+                "glob walk error: {message}. Remediation: check directory permissions or try a narrower 'path'."
+            ));
+        }
+        Err(ScopeCacheError::Io(err)) => {
+            return ToolCallOutcome::err(format!(
+                "glob: I/O error: {err}. Remediation: check directory permissions or try a narrower 'path'."
+            ));
+        }
+        Err(ScopeCacheError::Timeout) => {
+            return ToolCallOutcome::err(
+                "glob: scope walk timed out. Remediation: narrow 'path' or reduce the search scope.".to_string(),
+            );
+        }
+    };
 
     let mut files: Vec<String> = Vec::new();
     let mut truncated = false;
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                return ToolCallOutcome::err(format!(
-                    "glob walk error: {err}. Remediation: check directory permissions or try a narrower 'path'."
-                ));
-            }
-        };
-        // Skip directories
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+    for entry in &snapshot.entries {
+        // Skip directories; preserve the original behavior that yields files
+        // and symlinks but never directories.
+        if matches!(entry.file_type, ScopeFileType::Dir) {
             continue;
         }
 
-        let path = entry.path();
-        let rel_path = path.strip_prefix(base).unwrap_or(path);
+        let rel_path = Path::new(entry.rendered_path.as_str());
 
-        // Check if path matches any of the expanded patterns
+        // Check if the relative path matches any of the expanded patterns.
         let matches = patterns
             .iter()
             .any(|p| p.matches_path_with(rel_path, match_options));
@@ -191,7 +210,7 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             continue;
         }
 
-        files.push(path.display().to_string());
+        files.push(entry.path.display().to_string());
 
         if files.len() >= limit {
             truncated = true;
@@ -256,7 +275,45 @@ define_mcp_tool! {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_EXPANDED_PATTERNS, expand_braces};
+    use super::{
+        MAX_EXPANDED_PATTERNS, RepoScopeKey, expand_braces, handle_glob, repo_scope_cache,
+    };
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static GLOB_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct GlobTestDir {
+        path: PathBuf,
+    }
+
+    impl GlobTestDir {
+        fn new(name: &str) -> Self {
+            let base = std::env::current_dir()
+                .expect("current directory")
+                .join("target")
+                .join("glob-cache-tests");
+            fs::create_dir_all(&base).expect("create test base directory");
+            let unique = GLOB_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for GlobTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn expands_common_brace_patterns() {
@@ -285,5 +342,71 @@ mod tests {
 
         let err = expand_braces(&pattern).expect_err("expected expansion limit failure");
         assert!(err.contains(&MAX_EXPANDED_PATTERNS.to_string()));
+    }
+
+    #[test]
+    fn scope_cache_returns_same_snapshot_for_repeat_glob_key() {
+        let dir = GlobTestDir::new("repeat-snapshot");
+        fs::write(dir.path().join("alpha.rs"), "fn alpha() {}").expect("write alpha");
+        fs::write(dir.path().join("beta.txt"), "beta").expect("write beta");
+
+        let key = RepoScopeKey {
+            root: dir.path().to_path_buf(),
+            hidden: false,
+            follow: false,
+            no_ignore: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let first = repo_scope_cache()
+            .get_or_build(&key, deadline)
+            .expect("initial snapshot");
+        let second = repo_scope_cache()
+            .get_or_build(&key, deadline)
+            .expect("cached snapshot");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated Glob scope lookups must reuse the cached snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_glob_filters_files_in_tempdir() {
+        let dir = GlobTestDir::new("filter-correctness");
+        fs::write(dir.path().join("alpha.rs"), "fn alpha() {}").expect("write alpha");
+        fs::write(dir.path().join("beta.rs"), "fn beta() {}").expect("write beta");
+        fs::write(dir.path().join("gamma.txt"), "gamma").expect("write gamma");
+
+        let args = json!({
+            "pattern": "*.rs",
+            "path": dir.path().display().to_string(),
+        });
+        let resp = handle_glob(Some(json!(1)), args).await.0;
+        assert_eq!(resp["isError"], false, "expected success: {resp}");
+
+        let files = resp["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files.len(),
+            2,
+            "expected exactly two .rs matches: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.ends_with("alpha.rs")),
+            "expected alpha.rs in {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.ends_with("beta.rs")),
+            "expected beta.rs in {files:?}"
+        );
+        assert!(
+            files.iter().all(|f| !f.ends_with("gamma.txt")),
+            "did not expect gamma.txt in {files:?}"
+        );
     }
 }

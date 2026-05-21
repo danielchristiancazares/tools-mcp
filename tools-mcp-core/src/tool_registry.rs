@@ -1,7 +1,10 @@
-use crate::tool_outcome::ToolCallOutcome;
+use crate::cancellation::CURRENT_CANCEL_TOKEN;
+use crate::tool_outcome::{DispatchOutcome, ToolCallOutcome};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use tokio_util::sync::CancellationToken;
 
 /// Trait for MCP tools. Each tool provides its definition and execution logic.
 pub trait McpTool: Send + Sync + 'static {
@@ -41,22 +44,26 @@ type ToolExecutor = Box<
 
 struct ToolEntry {
     def: ToolDef,
-    aliases: &'static [&'static str],
     executor: ToolExecutor,
 }
 
 /// Registry of all MCP tools with lookup by canonical name.
 pub struct ToolRegistry {
     tools: Vec<ToolEntry>,
+    lookup: HashMap<&'static str, usize>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            lookup: HashMap::new(),
+        }
     }
 
     /// Register a tool type.
     pub fn register<T: McpTool>(&mut self) {
+        let index = self.tools.len();
         let def = ToolDef {
             name: T::NAME.to_string(),
             description: T::DESCRIPTION.to_string(),
@@ -65,11 +72,12 @@ impl ToolRegistry {
 
         let executor: ToolExecutor = Box::new(|id, args| T::execute(id, args));
 
-        self.tools.push(ToolEntry {
-            def,
-            aliases: T::ALIASES,
-            executor,
-        });
+        self.lookup.entry(T::NAME).or_insert(index);
+        for &alias in T::ALIASES {
+            self.lookup.entry(alias).or_insert(index);
+        }
+
+        self.tools.push(ToolEntry { def, executor });
     }
 
     /// Get all tool definitions for protocol responses.
@@ -84,12 +92,29 @@ impl ToolRegistry {
         id: Option<Value>,
         args: Value,
     ) -> Option<crate::RpcResponse> {
-        let entry = self
-            .tools
-            .iter()
-            .find(|entry| entry.def.name == name || entry.aliases.contains(&name))?;
-        let outcome = (entry.executor)(id.clone(), args).await;
-        Some(outcome.into_rpc_response(id))
+        self.call_with_cancellation(name, id.clone(), args, CancellationToken::new())
+            .await
+            .and_then(|outcome| outcome.into_rpc_response(id))
+    }
+
+    /// Look up and execute a tool by name under a cancellation scope.
+    pub async fn call_with_cancellation(
+        &self,
+        name: &str,
+        id: Option<Value>,
+        args: Value,
+        token: CancellationToken,
+    ) -> Option<DispatchOutcome> {
+        let entry = self.lookup.get(name).and_then(|idx| self.tools.get(*idx))?;
+        let outcome = CURRENT_CANCEL_TOKEN
+            .scope(token.clone(), (entry.executor)(id, args))
+            .await;
+
+        if token.is_cancelled() {
+            Some(DispatchOutcome::Cancelled)
+        } else {
+            Some(DispatchOutcome::Respond(outcome))
+        }
     }
 }
 
@@ -166,12 +191,40 @@ macro_rules! define_mcp_tool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::current_cancellation_token;
     use serde_json::json;
 
     #[allow(clippy::unused_async)]
     async fn ok_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
         ToolCallOutcome::ok(json!({
             "content": [{"type": "text", "text": "ok"}],
+            "isError": false
+        }))
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn later_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
+        ToolCallOutcome::ok(json!({
+            "content": [{"type": "text", "text": "later"}],
+            "isError": false
+        }))
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn token_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
+        let has_token = current_cancellation_token().is_some();
+        ToolCallOutcome::ok(json!({
+            "content": [{"type": "text", "text": if has_token { "token" } else { "missing" }}],
+            "isError": false
+        }))
+    }
+
+    async fn wait_for_cancellation_tool(_id: Option<Value>, _args: Value) -> ToolCallOutcome {
+        let token =
+            current_cancellation_token().expect("task-local cancellation token should exist");
+        token.cancelled().await;
+        ToolCallOutcome::ok(json!({
+            "content": [{"type": "text", "text": "cancelled"}],
             "isError": false
         }))
     }
@@ -186,6 +239,30 @@ mod tests {
             "additionalProperties": false
         },
         handler: ok_tool
+    }
+
+    define_mcp_tool! {
+        TokenTool,
+        name: "Token",
+        description: "token tool for registry tests",
+        schema: {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        handler: token_tool
+    }
+
+    define_mcp_tool! {
+        WaitForCancellationTool,
+        name: "WaitForCancellation",
+        description: "waits for cancellation in registry tests",
+        schema: {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        handler: wait_for_cancellation_tool
     }
 
     #[tokio::test]
@@ -204,6 +281,46 @@ mod tests {
         let reg = ToolRegistry::new();
         let r = reg.call("nope", Some(json!(1)), json!({})).await;
         assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_scopes_current_cancellation_token() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<TokenTool>();
+
+        let token = CancellationToken::new();
+        let response = reg
+            .call_with_cancellation("Token", Some(json!(1)), json!({}), token)
+            .await
+            .expect("token tool should resolve")
+            .into_rpc_response(Some(json!(1)))
+            .expect("token tool should respond");
+
+        assert_eq!(
+            response.result.unwrap()["content"][0]["text"],
+            json!("token")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_returns_cancelled_dispatch_outcome_when_token_is_cancelled() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<WaitForCancellationTool>();
+
+        let token = CancellationToken::new();
+        let outcome_task = reg.call_with_cancellation(
+            "WaitForCancellation",
+            Some(json!(1)),
+            json!({}),
+            token.clone(),
+        );
+        tokio::pin!(outcome_task);
+
+        tokio::task::yield_now().await;
+        token.cancel();
+
+        let outcome = outcome_task.await.expect("tool should resolve");
+        assert!(matches!(outcome, DispatchOutcome::Cancelled));
     }
 
     struct AliasTool;
@@ -239,5 +356,35 @@ mod tests {
 
         let response = reg.call("alias", Some(json!(1)), json!({})).await;
         assert!(response.is_some());
+    }
+
+    define_mcp_tool! {
+        AliasNamedTool,
+        name: "alias",
+        description: "tool whose canonical name conflicts with an earlier alias",
+        schema: {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        handler: later_tool
+    }
+
+    #[tokio::test]
+    async fn registry_lookup_preserves_first_match_for_alias_conflicts() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<AliasTool>();
+        reg.register::<AliasNamedTool>();
+
+        let response = reg
+            .call("alias", Some(json!(1)), json!({}))
+            .await
+            .expect("alias should resolve");
+
+        assert_eq!(
+            response.result.unwrap()["content"][0]["text"],
+            json!("ok"),
+            "earlier aliases should keep the previous linear-search precedence"
+        );
     }
 }

@@ -1,3 +1,4 @@
+mod path_policy;
 mod smart_file_edit;
 mod tools;
 

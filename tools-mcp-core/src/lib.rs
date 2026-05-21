@@ -1,3 +1,4 @@
+pub mod cancellation;
 pub mod config;
 pub mod mcp_protocol;
 pub mod process;
@@ -12,5 +13,5 @@ pub use mcp_protocol::{
     write_mcp_response_with_mode,
 };
 pub use response::{RpcError, RpcResponse};
-pub use tool_outcome::ToolCallOutcome;
+pub use tool_outcome::{DispatchOutcome, ToolCallOutcome};
 pub use tool_registry::{McpTool, ToolDef, ToolRegistry};

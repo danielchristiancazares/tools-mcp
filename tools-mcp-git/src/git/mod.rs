@@ -46,6 +46,7 @@
 //! - `MAX_OUTPUT_BYTES`: 5,000,000 bytes
 
 mod handlers;
+mod path_policy;
 mod types;
 
 pub(crate) use handlers::{
@@ -54,13 +55,31 @@ pub(crate) use handlers::{
     handle_git_status,
 };
 
+use std::ffi::{OsStr, OsString};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time;
 use tools_mcp_core::config::{MAX_GIT_TIMEOUT_MS, MAX_OUTPUT_BYTES};
 use tools_mcp_core::process::read_to_end_limited;
 use tracing::{debug, warn};
+
+const GIT_AUTHORITY_ENV_KEYS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+];
+
+static GIT_CONFIG_SPOOFING_ENV_KEYS: OnceLock<Vec<OsString>> = OnceLock::new();
 
 /// Execute a Git command with timeout and output capture.
 ///
@@ -115,6 +134,12 @@ pub(crate) async fn run_git(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<types::GitExecResult, anyhow::Error> {
+    let resolved_working_dir =
+        path_policy::resolve_working_dir(working_dir.as_deref()).map_err(anyhow::Error::msg)?;
+    let effective_working_dir = resolved_working_dir
+        .as_ref()
+        .map(|path| path.display().to_string());
+
     let timeout_ms = timeout_ms.clamp(100, MAX_GIT_TIMEOUT_MS);
     let max_stdout_bytes = max_stdout_bytes.clamp(1, MAX_OUTPUT_BYTES);
     let max_stderr_bytes = max_stderr_bytes.clamp(1, MAX_OUTPUT_BYTES);
@@ -140,7 +165,7 @@ pub(crate) async fn run_git(
     debug!(
         git_bin = %git_bin,
         args = ?args,
-        working_dir = ?working_dir,
+        working_dir = ?effective_working_dir,
         timeout_ms,
         "running git command"
     );
@@ -158,9 +183,9 @@ pub(crate) async fn run_git(
         },
     );
     cmd.env("GIT_EXTERNAL_DIFF", "");
-    cmd.env_remove("GIT_CONFIG_COUNT");
+    remove_git_authority_env(&mut cmd);
 
-    if let Some(dir) = &working_dir {
+    if let Some(dir) = &resolved_working_dir {
         cmd.current_dir(dir);
     }
 
@@ -239,7 +264,7 @@ pub(crate) async fn run_git(
     Ok(types::GitExecResult {
         git_bin,
         args,
-        working_dir,
+        working_dir: effective_working_dir,
         exit_code,
         success: status.success() && !timed_out,
         stdout,
@@ -248,4 +273,80 @@ pub(crate) async fn run_git(
         truncated_stderr,
         timed_out,
     })
+}
+
+fn remove_git_authority_env(cmd: &mut Command) {
+    for key in GIT_AUTHORITY_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+
+    for key in git_config_spoofing_env_keys() {
+        cmd.env_remove(key);
+    }
+}
+
+fn git_config_spoofing_env_keys() -> &'static [OsString] {
+    GIT_CONFIG_SPOOFING_ENV_KEYS
+        .get_or_init(|| {
+            std::env::vars_os()
+                .map(|(key, _)| key)
+                .filter(|key| is_git_config_spoofing_env_key(key))
+                .collect()
+        })
+        .as_slice()
+}
+
+fn is_git_config_spoofing_env_key(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GIT_AUTHORITY_ENV_KEYS, is_git_config_spoofing_env_key};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn git_authority_env_denylist_includes_repository_and_helper_controls() {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+        ] {
+            assert!(GIT_AUTHORITY_ENV_KEYS.contains(&key), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn git_config_spoofing_env_key_matches_indexed_key_value_patterns() {
+        assert!(is_git_config_spoofing_env_key(OsStr::new(
+            "GIT_CONFIG_KEY_0"
+        )));
+        assert!(is_git_config_spoofing_env_key(OsStr::new(
+            "GIT_CONFIG_VALUE_0"
+        )));
+        assert!(is_git_config_spoofing_env_key(OsStr::new(
+            "GIT_CONFIG_KEY_MALICIOUS"
+        )));
+        assert!(is_git_config_spoofing_env_key(OsStr::new(
+            "GIT_CONFIG_VALUE_MALICIOUS"
+        )));
+        assert!(!is_git_config_spoofing_env_key(OsStr::new(
+            "GIT_CONFIG_COUNT"
+        )));
+        assert!(!is_git_config_spoofing_env_key(OsStr::new(
+            "GIT_CONFIG_GLOBAL"
+        )));
+        assert!(!is_git_config_spoofing_env_key(OsStr::new("PATH")));
+    }
 }
