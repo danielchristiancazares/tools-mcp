@@ -169,25 +169,23 @@ fn parse_grep_line(line: &str) -> (String, u64, String, bool) {
                     }))
         }
 
-        let candidates: Vec<_> = separator_candidates(line, b':').collect();
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let mut selected = 0;
-        for (idx, pair) in candidates.windows(2).enumerate() {
-            let current_text_start = pair[0].2;
-            let next_path_end = pair[1].0;
+        let mut candidates = separator_candidates(line, b':');
+        let mut selected = candidates.next()?;
+        let mut previous = selected;
+        for candidate in candidates {
+            let current_text_start = previous.2;
+            let next_path_end = candidate.0;
             if current_text_start <= next_path_end
                 && path_continuation_fragment(&line[current_text_start..next_path_end])
             {
-                selected = idx + 1;
+                selected = candidate;
+                previous = candidate;
             } else {
                 break;
             }
         }
 
-        let (path_end, line_no, text_start) = candidates[selected];
+        let (path_end, line_no, text_start) = selected;
         Some((
             line[..path_end].to_string(),
             line_no,

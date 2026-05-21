@@ -1,4 +1,0 @@
-interface:
-  display_name: "Doublecheck"
-  short_description: "Hostile second-pass review for hidden regressions"
-  default_prompt: "Use $doublecheck to adversarially review this plan, diff, test, commit message, or prior review and challenge any unsupported 'behavior preserved' claims before reporting only findings that survive a code-path trace."

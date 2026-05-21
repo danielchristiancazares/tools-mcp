@@ -1,4 +1,0 @@
-interface:
-  display_name: "Check IFA"
-  short_description: "Map changes to IFA artifacts and drift"
-  default_prompt: "Use $check-ifa on the staged diff and tell me which of the six ifa/*.toml artifacts need updates, plus what behavioral or authority drift stale artifacts would allow."

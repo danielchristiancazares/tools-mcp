@@ -1,4 +1,0 @@
-interface:
-  display_name: "Check Plan"
-  short_description: "Review plans for gaps and regressions"
-  default_prompt: "Use $check-plan to review @./.plans/<plan>.md against docs/IFA.md, verify preserved behavior for users and downstream consumers, and flag underspecification or regression risk."
