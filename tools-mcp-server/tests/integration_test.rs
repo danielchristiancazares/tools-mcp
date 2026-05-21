@@ -738,8 +738,11 @@ fn test_search_ugrep_fallback_preserves_slash_glob_or_semantics() {
         text.contains("README.md"),
         "expected root glob match, got: {text}"
     );
+    // Render uses the OS-native path separator (no slash-normalization).
+    // Normalize for the substring check so this passes on Windows too.
     assert!(
-        text.contains("tools-mcp-server/tests/integration_test.rs"),
+        text.replace('\\', "/")
+            .contains("tools-mcp-server/tests/integration_test.rs"),
         "expected slash glob match, got: {text}"
     );
     assert!(
