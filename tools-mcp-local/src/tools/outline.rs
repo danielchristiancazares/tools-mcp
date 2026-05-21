@@ -127,17 +127,17 @@ async fn outline_for_path(path_str: &str, include_private: bool) -> ToolCallOutc
         None => None,
     };
 
-    if let Some(ref key) = cache_key {
-        if let Some(rendered) = outline_ast_cache().get(key) {
-            let payload = json!({
-                "content": [{"type": "text", "text": rendered.as_str()}],
-                "isError": false,
-                "path": path_str,
-                "bytes": key.len as usize,
-                "outline_bytes": rendered.len(),
-            });
-            return ToolCallOutcome::ok(payload);
-        }
+    if let Some(ref key) = cache_key
+        && let Some(rendered) = outline_ast_cache().get(key)
+    {
+        let payload = json!({
+            "content": [{"type": "text", "text": rendered.as_str()}],
+            "isError": false,
+            "path": path_str,
+            "bytes": key.len as usize,
+            "outline_bytes": rendered.len(),
+        });
+        return ToolCallOutcome::ok(payload);
     }
 
     let output = match render_outline(path, &source, include_private) {
@@ -317,7 +317,7 @@ fn extract_outline_via_tags_query(tree: &Tree, source: &str, query: &Query) -> S
         let mut name = None;
 
         for capture in query_match.captures {
-            let capture_name: &str = &capture_names[capture.index as usize];
+            let capture_name: &str = capture_names[capture.index as usize];
             if capture_name == "name" {
                 let captured_name = node_text(capture.node, source).trim();
                 if !captured_name.is_empty() {

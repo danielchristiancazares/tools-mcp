@@ -2,7 +2,8 @@
 
 use super::search_contract::NormalizedSearchRequest;
 use crate::tools::scope_cache::{
-    RecursiveScopeSnapshot, RepoScopeKey, ScopeCacheError, ScopeFileType, repo_scope_cache,
+    IgnoreFingerprint, RecursiveScopeSnapshot, RepoScopeKey, ScopeCacheError, ScopeFileType,
+    build_ignore_fingerprint, repo_scope_cache,
 };
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
@@ -80,6 +81,7 @@ pub(super) struct FileSelector {
 pub(super) struct MemoryScopeDiscovery {
     pub(super) files: Vec<PathBuf>,
     pub(super) directories: Vec<PathBuf>,
+    pub(super) ignore_fingerprint: Option<IgnoreFingerprint>,
 }
 
 impl FileSelector {
@@ -212,7 +214,11 @@ impl FileSelector {
         files.sort();
         directories.sort();
         directories.dedup();
-        Ok(MemoryScopeDiscovery { files, directories })
+        Ok(MemoryScopeDiscovery {
+            files,
+            directories,
+            ignore_fingerprint: snapshot.ignore_fingerprint.clone(),
+        })
     }
 
     /// Fallback walker used when the search root is a file (the shared scope
@@ -273,7 +279,23 @@ impl FileSelector {
         files.sort();
         directories.sort();
         directories.dedup();
-        Ok(MemoryScopeDiscovery { files, directories })
+        let fingerprint_root = self
+            .root
+            .parent()
+            .filter(|_| self.root.is_file())
+            .unwrap_or(&self.root);
+        let ignore_fingerprint = build_ignore_fingerprint(
+            fingerprint_root,
+            directories.iter().cloned(),
+            self.no_ignore,
+            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+        )
+        .map_err(Self::scope_cache_error)?;
+        Ok(MemoryScopeDiscovery {
+            files,
+            directories,
+            ignore_fingerprint,
+        })
     }
 
     /// Retrieve the cached `RecursiveScopeSnapshot` for this selector, building it on
@@ -294,19 +316,23 @@ impl FileSelector {
             deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
         repo_scope_cache()
             .get_or_build(&key, effective_deadline)
-            .map_err(|err| match err {
-                ScopeCacheError::Timeout => FileSelectionError::timeout(),
-                ScopeCacheError::Walk(message) => FileSelectionError::new(
-                    "search_index_incomplete",
-                    "walk_error",
-                    format!("memory search walk failed: {message}"),
-                ),
-                ScopeCacheError::Io(io_err) => FileSelectionError::new(
-                    "search_index_incomplete",
-                    "walk_error",
-                    format!("memory search walk failed: {io_err}"),
-                ),
-            })
+            .map_err(Self::scope_cache_error)
+    }
+
+    fn scope_cache_error(err: ScopeCacheError) -> FileSelectionError {
+        match err {
+            ScopeCacheError::Timeout => FileSelectionError::timeout(),
+            ScopeCacheError::Walk(message) => FileSelectionError::new(
+                "search_index_incomplete",
+                "walk_error",
+                format!("memory search walk failed: {message}"),
+            ),
+            ScopeCacheError::Io(io_err) => FileSelectionError::new(
+                "search_index_incomplete",
+                "walk_error",
+                format!("memory search walk failed: {io_err}"),
+            ),
+        }
     }
 
     pub(super) fn resolve_ugrep_path_list(
@@ -537,10 +563,10 @@ fn compile_globs(
 }
 
 fn path_relative_to_root<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
-    if let Ok(relative) = path.strip_prefix(root) {
-        if !relative.as_os_str().is_empty() {
-            return Some(relative);
-        }
+    if let Ok(relative) = path.strip_prefix(root)
+        && !relative.as_os_str().is_empty()
+    {
+        return Some(relative);
     }
 
     if root.is_file() {

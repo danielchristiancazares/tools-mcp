@@ -1,10 +1,12 @@
 //! In-memory fast path for the `Search` tool.
 
 use super::search_contract::{
-    NormalizedSearchRequest, SearchCaseMode, SearchEvent, SearchRequest, build_search_payload,
-    render_search_text_capacity,
+    NormalizedSearchRequest, RenderedSearchEvent, SearchCaseMode, SearchEvent, SearchPayloadMeta,
+    SearchRequest, build_search_payload_from_rendered, render_search_events,
+    render_search_text_capacity_from_rendered,
 };
 use super::search_file_selection::{FileSelectionError, FileSelector};
+use crate::tools::scope_cache::{IgnoreFingerprint, ignore_fingerprint_change_reason};
 use memchr::{memchr, memchr_iter, memchr2};
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::{
@@ -12,7 +14,6 @@ use regex_syntax::{
     hir::{Class, Hir, HirKind},
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -40,7 +41,9 @@ const DEFAULT_WARM_CACHE_KEY_DELAY_MS: u64 = 25;
 const DEFAULT_WARM_CACHE_MAX_KEYS: usize = 6;
 const DEFAULT_WARM_CACHE_GLOBS: &str = "*.rs,*.md";
 const DEFAULT_WARM_CACHE_GIT_TIMEOUT_MS: u64 = 2_000;
-const HASH_DEADLINE_CHUNK_BYTES: usize = 64 * 1024;
+const TRIGRAM_DEADLINE_CHECK_STRIDE: usize = 1024;
+const POSTINGS_DEADLINE_CHECK_STRIDE: usize = 1024;
+const LINE_VERIFY_DEADLINE_CHECK_STRIDE: usize = 128;
 const MAX_REGEX_FINITE_LITERAL_ALTERNATIVES: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_BYTES: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_REPEAT_COUNT: usize = 8;
@@ -191,7 +194,6 @@ struct FileStamp {
     len: u64,
     modified: Option<SystemTime>,
     change_marker: Option<MetadataChangeMarker>,
-    hash: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +380,7 @@ struct IndexSnapshot {
     generation: u64,
     documents: Vec<Document>,
     scope_fingerprint: ScopeFingerprint,
+    ignore_fingerprint: Option<IgnoreFingerprint>,
     postings: PostingsIndex,
     ascii_folded_postings: PostingsIndex,
     indexed_bytes: u64,
@@ -1142,32 +1145,26 @@ enum UgrepRegexBehavior {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegexFallbackReason {
-    UnsupportedRegexCaseInsensitive,
-    UnsupportedRegexSmartCaseInsensitive,
-    UnsupportedMultilineRegex,
-    UnsupportedRegexBackend,
+    CaseInsensitive,
+    SmartCaseInsensitive,
+    Multiline,
+    Backend,
 }
 
 impl RegexFallbackReason {
     fn error_type(self) -> &'static str {
         match self {
-            Self::UnsupportedRegexCaseInsensitive | Self::UnsupportedRegexSmartCaseInsensitive => {
-                "unsupported_search_option"
-            }
-            Self::UnsupportedMultilineRegex | Self::UnsupportedRegexBackend => {
-                "unsupported_regex_dialect"
-            }
+            Self::CaseInsensitive | Self::SmartCaseInsensitive => "unsupported_search_option",
+            Self::Multiline | Self::Backend => "unsupported_regex_dialect",
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::UnsupportedRegexCaseInsensitive => "unsupported_regex_case_insensitive",
-            Self::UnsupportedRegexSmartCaseInsensitive => {
-                "unsupported_regex_smart_case_insensitive"
-            }
-            Self::UnsupportedMultilineRegex => "unsupported_multiline_regex",
-            Self::UnsupportedRegexBackend => "unsupported_regex_backend",
+            Self::CaseInsensitive => "unsupported_regex_case_insensitive",
+            Self::SmartCaseInsensitive => "unsupported_regex_smart_case_insensitive",
+            Self::Multiline => "unsupported_multiline_regex",
+            Self::Backend => "unsupported_regex_backend",
         }
     }
 }
@@ -1573,21 +1570,24 @@ pub(super) async fn handle_memory_search(
         validate_cached_snapshot_fresh(&cached.key, &snapshot, freshness_validation, deadline)?;
     let freshness_check_ms = freshness_start.elapsed().as_millis() as u64;
 
-    let text_view = render_search_text_with_deadline(&events, deadline)?;
+    let rendered_events = render_search_events(&events);
+    let text_view = render_search_text_with_deadline(&rendered_events, deadline)?;
     let exit_code = if events.iter().any(|event| event.is_match) {
         0
     } else {
         1
     };
-    let mut payload = build_search_payload(
+    let mut payload = build_search_payload_from_rendered(
         req,
-        req.root(),
-        text_view,
-        false,
-        json!(exit_code),
-        truncated,
-        false,
-        &events,
+        SearchPayloadMeta::new(
+            req.root(),
+            text_view,
+            false,
+            json!(exit_code),
+            truncated,
+            false,
+        ),
+        &rendered_events,
     );
 
     if let Some(obj) = payload.as_object_mut() {
@@ -2253,7 +2253,7 @@ fn classify_regex_dialect_for_planning_inner(
             RegexDialectFallback::new(
                 MemoryRegexVerifierBehavior::ParserRejectedPattern,
                 UgrepRegexBehavior::DelegatedBackendDialect,
-                RegexFallbackReason::UnsupportedRegexBackend,
+                RegexFallbackReason::Backend,
                 format!("memory regex search could not parse the pattern: {err}"),
             )
         })?;
@@ -2263,7 +2263,7 @@ fn classify_regex_dialect_for_planning_inner(
         return Err(RegexDialectFallback::new(
             MemoryRegexVerifierBehavior::MayConsumeLineTerminator,
             UgrepRegexBehavior::DelegatedLineBreakDialect,
-            RegexFallbackReason::UnsupportedMultilineRegex,
+            RegexFallbackReason::Multiline,
             "memory regex search does not support regex patterns that can match line breaks",
         )
         .into());
@@ -2281,7 +2281,7 @@ fn classify_regex_case(req: &NormalizedSearchRequest) -> Result<(), RegexDialect
         SearchCaseMode::Insensitive => Err(RegexDialectFallback::new(
             MemoryRegexVerifierBehavior::RequiresUnsupportedCaseFolding,
             UgrepRegexBehavior::CaseInsensitiveLineOriented,
-            RegexFallbackReason::UnsupportedRegexCaseInsensitive,
+            RegexFallbackReason::CaseInsensitive,
             "memory regex search does not support case-insensitive regex matching",
         )),
         SearchCaseMode::Smart => {
@@ -2291,7 +2291,7 @@ fn classify_regex_case(req: &NormalizedSearchRequest) -> Result<(), RegexDialect
                 Err(RegexDialectFallback::new(
                     MemoryRegexVerifierBehavior::RequiresUnsupportedSmartCaseFolding,
                     UgrepRegexBehavior::SmartCaseInsensitiveLineOriented,
-                    RegexFallbackReason::UnsupportedRegexSmartCaseInsensitive,
+                    RegexFallbackReason::SmartCaseInsensitive,
                     "memory regex search falls back for smart-case regexes that would be case-insensitive",
                 ))
             }
@@ -2304,7 +2304,7 @@ fn classify_regex_surface_syntax(pattern: &str) -> Result<(), RegexDialectFallba
         return Err(RegexDialectFallback::new(
             MemoryRegexVerifierBehavior::UnsupportedInlineConstruct,
             UgrepRegexBehavior::DelegatedBackendDialect,
-            RegexFallbackReason::UnsupportedRegexBackend,
+            RegexFallbackReason::Backend,
             "memory regex search does not support inline flags, look-around, or special group syntax",
         ));
     }
@@ -2312,7 +2312,7 @@ fn classify_regex_surface_syntax(pattern: &str) -> Result<(), RegexDialectFallba
         return Err(RegexDialectFallback::new(
             MemoryRegexVerifierBehavior::MayConsumeLineTerminator,
             UgrepRegexBehavior::DelegatedLineBreakDialect,
-            RegexFallbackReason::UnsupportedMultilineRegex,
+            RegexFallbackReason::Multiline,
             "memory regex search does not support multiline regex patterns",
         ));
     }
@@ -2320,7 +2320,7 @@ fn classify_regex_surface_syntax(pattern: &str) -> Result<(), RegexDialectFallba
         return Err(RegexDialectFallback::new(
             MemoryRegexVerifierBehavior::MayConsumeLineTerminator,
             UgrepRegexBehavior::DelegatedLineBreakDialect,
-            RegexFallbackReason::UnsupportedMultilineRegex,
+            RegexFallbackReason::Multiline,
             "memory regex search does not support regex patterns that match line breaks",
         ));
     }
@@ -2342,7 +2342,7 @@ fn build_classified_regex_matcher(
         RegexDialectFallback::new(
             MemoryRegexVerifierBehavior::VerifierRejectedPattern,
             UgrepRegexBehavior::DelegatedBackendDialect,
-            RegexFallbackReason::UnsupportedRegexBackend,
+            RegexFallbackReason::Backend,
             format!("memory regex verifier could not compile the pattern: {err}"),
         )
     })
@@ -2572,8 +2572,9 @@ fn build_index_with_selector(
     let discovered_scope = selector
         .discover_memory_scope(Some(deadline))
         .map_err(MemoryError::from)?;
+    let ignore_fingerprint = discovered_scope.ignore_fingerprint;
     let scope_fingerprint =
-        ScopeFingerprint::from_directories(discovered_scope.directories.into_iter(), deadline)?;
+        ScopeFingerprint::from_directories(discovered_scope.directories, deadline)?;
 
     for path in discovered_scope.files {
         check_cancellation(cancel)?;
@@ -2663,7 +2664,7 @@ fn build_index_with_selector(
         }
 
         check_deadline(deadline)?;
-        let stamp = file_stamp_from_parts_with_deadline(&metadata, &content, deadline)?;
+        let stamp = file_stamp_from_parts_with_deadline(&metadata, deadline)?;
         let rendered_path = selector.render_path(&path);
         let lines = line_ranges_with_deadline(&content, deadline)?;
         check_deadline(deadline)?;
@@ -2685,21 +2686,13 @@ fn build_index_with_selector(
         check_cancellation(cancel)?;
         check_deadline(deadline)?;
         let doc_id = DocId::from_index(doc_index)?;
-        let trigrams = unique_trigrams_with_deadline(&doc.content, deadline)?;
-        for trigram in trigrams {
-            check_deadline(deadline)?;
-            postings.entry(trigram).or_default().push(doc_id);
-        }
-
-        check_deadline(deadline)?;
-        let folded = ascii_folded_bytes_with_deadline(&doc.content, deadline)?;
-        for trigram in unique_trigrams_with_deadline(&folded, deadline)? {
-            check_deadline(deadline)?;
-            ascii_folded_postings
-                .entry(trigram)
-                .or_default()
-                .push(doc_id);
-        }
+        index_document_trigrams_with_deadline(
+            doc_id,
+            &doc.content,
+            &mut postings,
+            &mut ascii_folded_postings,
+            deadline,
+        )?;
     }
     let postings = PostingsIndex::from_raw(postings, deadline)?;
     let ascii_folded_postings = PostingsIndex::from_raw(ascii_folded_postings, deadline)?;
@@ -2709,6 +2702,7 @@ fn build_index_with_selector(
         generation,
         documents,
         scope_fingerprint,
+        ignore_fingerprint,
         postings,
         ascii_folded_postings,
         indexed_bytes,
@@ -3586,14 +3580,24 @@ fn verify_and_render(
                 "memory search candidate referenced a missing indexed document",
             ));
         };
-        let matched_lines = matching_line_indexes(
+        let remaining_event_budget = max_results.saturating_sub(events.len());
+        if remaining_event_budget == 0 {
+            truncated = true;
+            break 'docs;
+        }
+        let matched = matching_line_indexes_with_budget(
             doc,
             plan,
             fuzzy_seed_selection,
             limits,
             deadline,
             &mut verification_stats,
+            Some(LineMatchBudget {
+                context,
+                event_budget: remaining_event_budget,
+            }),
         )?;
+        let matched_lines = matched.lines;
         if matched_lines.is_empty() {
             continue;
         }
@@ -3612,6 +3616,10 @@ fn verify_and_render(
             result_doc_ids.insert(doc_id);
         }
         if doc_truncated {
+            truncated = true;
+            break 'docs;
+        }
+        if matched.stopped_after_budget {
             truncated = true;
             break 'docs;
         }
@@ -3688,13 +3696,28 @@ impl<'a> SnapshotValidation<'a> {
     ) -> Result<FreshnessValidationResult, MemoryError> {
         let required_full_scope_reason = if force_full_scope {
             Some("validation_interval")
-        } else if !self.req.no_ignore() {
-            Some("ignore_rules_enabled")
+        } else if !self.req.no_ignore() && force_full_scope_on_ignore_enabled() {
+            Some("ignore_rules_forced_full_scope")
         } else {
             None
         };
 
         if let Some(reason) = required_full_scope_reason {
+            let stats = check_snapshot_fresh(self.req, snapshot, deadline)?;
+            return Ok(FreshnessValidationResult::verified_full_scope(
+                stats,
+                Some(reason),
+            ));
+        }
+
+        if !self.req.no_ignore()
+            && let Some(reason) = check_ignore_fingerprint(
+                self.req,
+                snapshot,
+                snapshot.ignore_fingerprint.as_ref(),
+                deadline,
+            )?
+        {
             let stats = check_snapshot_fresh(self.req, snapshot, deadline)?;
             return Ok(FreshnessValidationResult::verified_full_scope(
                 stats,
@@ -3855,21 +3878,49 @@ fn check_scope_directory_fingerprints(
     for directory in &scope_fingerprint.directories {
         check_deadline(deadline)?;
         stats.directories_checked = stats.directories_checked.saturating_add(1);
-        if !metadata_stamp_can_validate_without_hash(&directory.stamp) {
-            return Ok(Some("directory_fingerprint_unavailable"));
-        }
-
         let metadata = match fs::metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(_) => return Ok(Some("directory_set_changed")),
         };
         check_deadline(deadline)?;
-        if !file_metadata_matches_without_hash(&directory.stamp, &metadata) {
+        if !metadata_stamp_matches(&directory.stamp, &metadata) {
             return Ok(Some("directory_set_changed"));
         }
     }
 
     Ok(None)
+}
+
+fn check_ignore_fingerprint(
+    req: &NormalizedSearchRequest,
+    snapshot: &IndexSnapshot,
+    expected: Option<&IgnoreFingerprint>,
+    deadline: Instant,
+) -> Result<Option<&'static str>, MemoryError> {
+    ignore_fingerprint_change_reason(
+        Path::new(req.root()),
+        snapshot
+            .scope_fingerprint
+            .directories
+            .iter()
+            .map(|entry| entry.path.clone()),
+        req.no_ignore(),
+        expected,
+        deadline,
+    )
+    .map_err(|err| match err {
+        crate::tools::scope_cache::ScopeCacheError::Timeout => MemoryError::timeout(),
+        crate::tools::scope_cache::ScopeCacheError::Walk(message) => MemoryError::new(
+            "search_index_incomplete",
+            "walk_error",
+            format!("memory search ignore fingerprint failed: {message}"),
+        ),
+        crate::tools::scope_cache::ScopeCacheError::Io(io_err) => MemoryError::new(
+            "search_index_incomplete",
+            "metadata_error",
+            format!("memory search ignore fingerprint failed: {io_err}"),
+        ),
+    })
 }
 
 fn check_snapshot_fresh(
@@ -3933,15 +3984,19 @@ fn literal_trigrams_with_deadline(
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<Vec<[u8; 3]>, MemoryError> {
+    check_deadline(deadline)?;
     let mut trigrams = Vec::new();
     let mut seen = HashSet::new();
-    for window in bytes.windows(3) {
-        check_deadline(deadline)?;
+    for (index, window) in bytes.windows(3).enumerate() {
+        if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         let trigram = [window[0], window[1], window[2]];
         if seen.insert(trigram) {
             trigrams.push(trigram);
         }
     }
+    check_deadline(deadline)?;
     Ok(trigrams)
 }
 
@@ -3949,12 +4004,52 @@ fn ascii_folded_bytes_with_deadline(
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<Vec<u8>, MemoryError> {
+    check_deadline(deadline)?;
     let mut folded = Vec::with_capacity(bytes.len());
-    for byte in bytes {
-        check_deadline(deadline)?;
+    for (index, byte) in bytes.iter().enumerate() {
+        if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         folded.push(byte.to_ascii_lowercase());
     }
+    check_deadline(deadline)?;
     Ok(folded)
+}
+
+fn index_document_trigrams_with_deadline(
+    doc_id: DocId,
+    content: &[u8],
+    postings: &mut HashMap<[u8; 3], Vec<DocId>>,
+    ascii_folded_postings: &mut HashMap<[u8; 3], Vec<DocId>>,
+    deadline: Instant,
+) -> Result<(), MemoryError> {
+    check_deadline(deadline)?;
+    let mut sensitive_seen = HashSet::new();
+    let mut folded_seen = HashSet::new();
+    for (index, window) in content.windows(3).enumerate() {
+        if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
+
+        let trigram = [window[0], window[1], window[2]];
+        if sensitive_seen.insert(trigram) {
+            postings.entry(trigram).or_default().push(doc_id);
+        }
+
+        let folded = [
+            window[0].to_ascii_lowercase(),
+            window[1].to_ascii_lowercase(),
+            window[2].to_ascii_lowercase(),
+        ];
+        if folded_seen.insert(folded) {
+            ascii_folded_postings
+                .entry(folded)
+                .or_default()
+                .push(doc_id);
+        }
+    }
+    check_deadline(deadline)?;
+    Ok(())
 }
 
 fn is_plain_regex_literal(pattern: &str) -> bool {
@@ -4266,15 +4361,6 @@ fn dedup_candidate_exprs(exprs: &mut Vec<CandidateExpr>) {
     *exprs = unique;
 }
 
-fn unique_trigrams_with_deadline(
-    bytes: &[u8],
-    deadline: Instant,
-) -> Result<HashSet<[u8; 3]>, MemoryError> {
-    Ok(literal_trigrams_with_deadline(bytes, deadline)?
-        .into_iter()
-        .collect())
-}
-
 fn intersect_postings(
     posting_lists: &[&Postings],
     deadline: Instant,
@@ -4294,8 +4380,12 @@ fn intersect_postings(
         let mut left = 0;
         let mut right = 0;
         let mut write = 0;
+        let mut comparisons = 0_usize;
         while left < result.len() && right < postings.len() {
-            check_deadline(deadline)?;
+            if comparisons.is_multiple_of(POSTINGS_DEADLINE_CHECK_STRIDE) {
+                check_deadline(deadline)?;
+            }
+            comparisons = comparisons.saturating_add(1);
             match result[left].cmp(&postings.doc_id_at(right)) {
                 std::cmp::Ordering::Equal => {
                     result[write] = result[left];
@@ -4312,9 +4402,11 @@ fn intersect_postings(
             break;
         }
     }
+    check_deadline(deadline)?;
     Ok(result)
 }
 
+#[cfg(test)]
 fn matching_line_indexes(
     doc: &Document,
     plan: &QueryPlan,
@@ -4323,9 +4415,45 @@ fn matching_line_indexes(
     deadline: Instant,
     verification_stats: &mut VerificationStats,
 ) -> Result<BTreeSet<usize>, MemoryError> {
+    Ok(matching_line_indexes_with_budget(
+        doc,
+        plan,
+        fuzzy_seed_selection,
+        limits,
+        deadline,
+        verification_stats,
+        None,
+    )?
+    .lines)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LineMatchBudget {
+    context: usize,
+    event_budget: usize,
+}
+
+#[derive(Debug)]
+struct MatchingLineOutcome {
+    lines: BTreeSet<usize>,
+    stopped_after_budget: bool,
+}
+
+fn matching_line_indexes_with_budget(
+    doc: &Document,
+    plan: &QueryPlan,
+    fuzzy_seed_selection: Option<&FuzzySeedSelection>,
+    limits: &Limits,
+    deadline: Instant,
+    verification_stats: &mut VerificationStats,
+    budget: Option<LineMatchBudget>,
+) -> Result<MatchingLineOutcome, MemoryError> {
     let mut matched = BTreeSet::new();
+    let mut budget_saturated_scan_until = None;
     for (line_index, range) in doc.lines.iter().enumerate() {
-        check_deadline(deadline)?;
+        if line_index.is_multiple_of(LINE_VERIFY_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         verification_stats.verified_lines = verification_stats.verified_lines.saturating_add(1);
         let line = &doc.content[range.start..range.end];
         let is_match = match plan {
@@ -4402,8 +4530,42 @@ fn matching_line_indexes(
         if is_match {
             matched.insert(line_index);
         }
+        if let Some(scan_until) = budget_saturated_scan_until
+            && line_index >= scan_until
+        {
+            return Ok(MatchingLineOutcome {
+                lines: matched,
+                stopped_after_budget: true,
+            });
+        }
+        if (is_match || budget_saturated_scan_until.is_some())
+            && let Some(budget) = budget
+            && budget.event_budget > 0
+            && !matched.is_empty()
+        {
+            let render_lines = render_line_indexes_with_deadline(
+                &matched,
+                doc.lines.len(),
+                budget.context,
+                deadline,
+            )?;
+            if render_lines.len() >= budget.event_budget {
+                let scan_until = render_lines[budget.event_budget - 1];
+                if line_index >= scan_until {
+                    return Ok(MatchingLineOutcome {
+                        lines: matched,
+                        stopped_after_budget: true,
+                    });
+                }
+                budget_saturated_scan_until = Some(scan_until);
+            }
+        }
     }
-    Ok(matched)
+    check_deadline(deadline)?;
+    Ok(MatchingLineOutcome {
+        lines: matched,
+        stopped_after_budget: false,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -4730,9 +4892,9 @@ fn fuzzy_candidate_starts(
                 continue;
             }
 
-            for start in lower..=upper {
+            for possible in possible_starts.iter_mut().take(upper + 1).skip(lower) {
                 check_deadline(deadline)?;
-                possible_starts[start] = true;
+                *possible = true;
             }
         }
     }
@@ -4758,8 +4920,12 @@ fn bounded_edit_distance(
     let limit = max_distance.saturating_add(1);
     let mut previous = vec![limit; right.len() + 1];
     let mut current = vec![limit; right.len() + 1];
-    for column in 0..=right.len().min(max_distance) {
-        previous[column] = column;
+    for (column, value) in previous
+        .iter_mut()
+        .enumerate()
+        .take(right.len().min(max_distance) + 1)
+    {
+        *value = column;
     }
 
     for (left_index, left_char) in left.iter().enumerate() {
@@ -4812,7 +4978,6 @@ fn render_line_indexes(
     )
 }
 
-#[cfg(test)]
 fn render_line_indexes_with_deadline(
     matched_lines: &BTreeSet<usize>,
     line_count: usize,
@@ -4896,10 +5061,10 @@ fn for_each_render_interval(
             }
         }
     }
-    if let Some((start, end)) = current_interval {
-        if emit(start, end)? {
-            return Ok(true);
-        }
+    if let Some((start, end)) = current_interval
+        && emit(start, end)?
+    {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -4915,7 +5080,6 @@ fn render_interval(match_line: usize, line_count: usize, context: usize) -> Opti
     Some((start, end))
 }
 
-#[cfg(test)]
 fn rendered_line_capacity(matched_line_count: usize, line_count: usize, context: usize) -> usize {
     let context_width = context.saturating_mul(2).saturating_add(1);
     matched_line_count
@@ -4969,10 +5133,10 @@ where
 }
 
 fn render_search_text_with_deadline(
-    events: &[SearchEvent],
+    events: &[RenderedSearchEvent<'_>],
     deadline: Instant,
 ) -> Result<String, MemoryError> {
-    let mut output = String::with_capacity(render_search_text_capacity(events));
+    let mut output = String::with_capacity(render_search_text_capacity_from_rendered(events));
     for (index, event) in events.iter().enumerate() {
         check_deadline(deadline)?;
         if index > 0 {
@@ -5193,8 +5357,7 @@ fn validate_result_file_content_matches(
         )
     })?;
     check_deadline(deadline)?;
-    let actual_stamp = file_stamp_from_parts_with_deadline(metadata, &content, deadline)?;
-    if !file_stamp_content_matches(&doc.stamp, &actual_stamp) {
+    if metadata.len() != content.len() as u64 || content != doc.content {
         return Err(file_changed_error(
             format!("file changed during memory search: {}", doc.path.display()),
             "file_changed_during_verification",
@@ -5208,7 +5371,6 @@ fn metadata_stamp_from_metadata(metadata: &fs::Metadata) -> FileStamp {
         len: metadata.len(),
         modified: metadata.modified().ok(),
         change_marker: metadata_change_marker(metadata),
-        hash: [0; 32],
     }
 }
 
@@ -5220,38 +5382,24 @@ fn metadata_stamp_can_validate_without_hash(stamp: &FileStamp) -> bool {
 }
 
 #[cfg(all(test, any(unix, windows)))]
-fn file_stamp_from_parts(metadata: &fs::Metadata, content: &[u8]) -> FileStamp {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
+fn file_stamp_from_parts(metadata: &fs::Metadata) -> FileStamp {
     FileStamp {
         len: metadata.len(),
         modified: metadata.modified().ok(),
         change_marker: metadata_change_marker(metadata),
-        hash: hasher.finalize().into(),
     }
 }
 
 fn file_stamp_from_parts_with_deadline(
     metadata: &fs::Metadata,
-    content: &[u8],
     deadline: Instant,
 ) -> Result<FileStamp, MemoryError> {
+    check_deadline(deadline)?;
     Ok(FileStamp {
         len: metadata.len(),
         modified: metadata.modified().ok(),
         change_marker: metadata_change_marker(metadata),
-        hash: hash_content_with_deadline(content, deadline)?,
     })
-}
-
-fn hash_content_with_deadline(content: &[u8], deadline: Instant) -> Result<[u8; 32], MemoryError> {
-    let mut hasher = Sha256::new();
-    for chunk in content.chunks(HASH_DEADLINE_CHUNK_BYTES) {
-        check_deadline(deadline)?;
-        hasher.update(chunk);
-    }
-    check_deadline(deadline)?;
-    Ok(hasher.finalize().into())
 }
 
 fn file_metadata_matches_without_hash(stamp: &FileStamp, metadata: &fs::Metadata) -> bool {
@@ -5261,8 +5409,10 @@ fn file_metadata_matches_without_hash(stamp: &FileStamp, metadata: &fs::Metadata
         && stamp.change_marker == metadata_change_marker(metadata)
 }
 
-fn file_stamp_content_matches(expected: &FileStamp, actual: &FileStamp) -> bool {
-    expected.len == actual.len && expected.hash == actual.hash
+fn metadata_stamp_matches(stamp: &FileStamp, metadata: &fs::Metadata) -> bool {
+    stamp.len == metadata.len()
+        && stamp.modified == metadata.modified().ok()
+        && stamp.change_marker == metadata_change_marker(metadata)
 }
 
 #[cfg(unix)]
@@ -5294,7 +5444,7 @@ fn metadata_change_marker(metadata: &fs::Metadata) -> Option<MetadataChangeMarke
 
     // Stable Rust exposes Windows creation, write-time, and attribute metadata,
     // but not file_index/change_time. Use the stable fields as a no-dependency
-    // identity/change marker and keep content hashes as the authoritative guard.
+    // identity/change marker and keep byte comparison as the authoritative guard.
     Some(WindowsMetadataChangeMarker {
         creation_time: metadata.creation_time(),
         last_write_time: metadata.last_write_time(),
@@ -5353,6 +5503,10 @@ fn env_bool(name: &str, default: bool) -> bool {
             _ => default,
         })
         .unwrap_or(default)
+}
+
+fn force_full_scope_on_ignore_enabled() -> bool {
+    env_bool("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", false)
 }
 
 fn warm_cache_globs_from_env() -> Vec<String> {
@@ -5543,6 +5697,42 @@ mod tests {
             literal_trigrams(b"ababa"),
             vec![[b'a', b'b', b'a'], [b'b', b'a', b'b']]
         );
+    }
+
+    #[test]
+    fn fused_trigram_extraction_matches_legacy_postings() {
+        let fixtures: &[&[u8]] = &[
+            b"",
+            b"ab",
+            b"abc",
+            b"ababa",
+            b"Needle NEEDLE needle",
+            "prefix café NEEDLE suffix".as_bytes(),
+            b"edge-start needle",
+            b"needle edge-end",
+        ];
+
+        for (index, content) in fixtures.iter().enumerate() {
+            let doc_id = DocId::from_index(index).expect("doc id");
+            let mut postings = HashMap::new();
+            let mut folded_postings = HashMap::new();
+            index_document_trigrams_with_deadline(
+                doc_id,
+                content,
+                &mut postings,
+                &mut folded_postings,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .expect("fused trigrams");
+
+            let (legacy_postings, legacy_folded_postings) =
+                legacy_document_trigrams(doc_id, content);
+            assert_eq!(postings, legacy_postings, "sensitive fixture {index}");
+            assert_eq!(
+                folded_postings, legacy_folded_postings,
+                "folded fixture {index}"
+            );
+        }
     }
 
     #[test]
@@ -5865,7 +6055,6 @@ mod tests {
                 len: 0,
                 modified: None,
                 change_marker: None,
-                hash: [0; 32],
             },
             content: b"alpha\nneedle one\nmiddle\nneedle two\nomega\n".to_vec(),
             lines: line_ranges(b"alpha\nneedle one\nmiddle\nneedle two\nomega\n"),
@@ -5901,12 +6090,12 @@ mod tests {
                     len: 0,
                     modified: None,
                     change_marker: None,
-                    hash: [0; 32],
                 },
                 content: content.to_vec(),
                 lines: line_ranges(content),
             }],
             scope_fingerprint: ScopeFingerprint::default(),
+            ignore_fingerprint: None,
             postings: PostingsIndex::default(),
             ascii_folded_postings: PostingsIndex::default(),
             indexed_bytes: content.len() as u64,
@@ -5962,6 +6151,124 @@ mod tests {
     }
 
     #[test]
+    fn streaming_verification_stops_inside_doc_when_budget_reached() {
+        let content = (0..100)
+            .map(|index| format!("needle {index}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let mut snapshot = empty_snapshot(1);
+        snapshot.documents = vec![Document {
+            path: PathBuf::from("dense.txt"),
+            rendered_path: "dense.txt".to_string(),
+            stamp: FileStamp {
+                len: content.len() as u64,
+                modified: None,
+                change_marker: None,
+            },
+            content: content.clone(),
+            lines: line_ranges(&content),
+        }];
+        let req = SearchRequest {
+            pattern: "needle".to_string(),
+            path: Some("dense.txt".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(true),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: Some(0),
+            max_results: Some(5),
+            timeout_ms: None,
+            fuzzy: None,
+        }
+        .normalize();
+
+        let (events, truncated, verification_stats, _) = verify_and_render(
+            &snapshot,
+            &doc_ids(&[0]),
+            &QueryPlan::Exact {
+                literal: b"needle".to_vec(),
+                case: LiteralCase::Sensitive,
+            },
+            None,
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("streaming verification");
+
+        assert!(truncated);
+        assert_eq!(events.len(), 5);
+        assert!(
+            verification_stats.verified_lines < snapshot.documents[0].lines.len(),
+            "verification should stop before scanning the whole dense file"
+        );
+    }
+
+    #[test]
+    fn streaming_verification_preserves_context_after_last_emitted_match() {
+        let content = b"zero\nneedle one\nneedle two\nthree\nfour\n".to_vec();
+        let mut snapshot = empty_snapshot(1);
+        snapshot.documents = vec![Document {
+            path: PathBuf::from("context.txt"),
+            rendered_path: "context.txt".to_string(),
+            stamp: FileStamp {
+                len: content.len() as u64,
+                modified: None,
+                change_marker: None,
+            },
+            content: content.clone(),
+            lines: line_ranges(&content),
+        }];
+        let req = SearchRequest {
+            pattern: "needle".to_string(),
+            path: Some("context.txt".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(true),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: Some(1),
+            max_results: Some(4),
+            timeout_ms: None,
+            fuzzy: None,
+        }
+        .normalize();
+
+        let (events, truncated, _, _) = verify_and_render(
+            &snapshot,
+            &doc_ids(&[0]),
+            &QueryPlan::Exact {
+                literal: b"needle".to_vec(),
+                case: LiteralCase::Sensitive,
+            },
+            None,
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("streaming verification");
+
+        assert!(truncated);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.is_match, event.line_number, event.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (false, 1, "zero"),
+                (true, 2, "needle one"),
+                (true, 3, "needle two"),
+                (false, 4, "three"),
+            ]
+        );
+    }
+
+    #[test]
     fn line_text_uses_lossy_utf8_rendering() {
         let doc = Document {
             path: PathBuf::from("sample.txt"),
@@ -5970,7 +6277,6 @@ mod tests {
                 len: 0,
                 modified: None,
                 change_marker: None,
-                hash: [0; 32],
             },
             content: vec![b'f', 0x80, b'o', b'\n'],
             lines: line_ranges(&[b'f', 0x80, b'o', b'\n']),
@@ -6052,17 +6358,14 @@ mod tests {
     }
 
     #[test]
-    fn expired_deadline_stops_hash_rendering_and_fuzzy_verification() {
-        let root = workspace_test_dir("expired_deadline_stops_hash_rendering_and_fuzzy");
+    fn expired_deadline_stops_rendering_and_fuzzy_verification() {
+        let root = workspace_test_dir("expired_deadline_stops_rendering_and_fuzzy");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create root");
-        let file_path = root.join("sample.txt");
-        fs::write(&file_path, "needle\n").expect("write fixture");
-        let metadata = fs::metadata(&file_path).expect("metadata");
 
         assert_timeout(
-            file_stamp_from_parts_with_deadline(&metadata, b"needle\n", Instant::now())
-                .expect_err("hashing should time out"),
+            literal_trigrams_with_deadline(b"needle", Instant::now())
+                .expect_err("trigram extraction should time out"),
         );
 
         assert_timeout(
@@ -6165,7 +6468,7 @@ mod tests {
                 Some("insensitive"),
                 MemoryRegexVerifierBehavior::RequiresUnsupportedCaseFolding,
                 UgrepRegexBehavior::CaseInsensitiveLineOriented,
-                RegexFallbackReason::UnsupportedRegexCaseInsensitive,
+                RegexFallbackReason::CaseInsensitive,
             ),
             (
                 "smart-case-insensitive",
@@ -6173,7 +6476,7 @@ mod tests {
                 None,
                 MemoryRegexVerifierBehavior::RequiresUnsupportedSmartCaseFolding,
                 UgrepRegexBehavior::SmartCaseInsensitiveLineOriented,
-                RegexFallbackReason::UnsupportedRegexSmartCaseInsensitive,
+                RegexFallbackReason::SmartCaseInsensitive,
             ),
             (
                 "inline-construct",
@@ -6181,7 +6484,7 @@ mod tests {
                 Some("sensitive"),
                 MemoryRegexVerifierBehavior::UnsupportedInlineConstruct,
                 UgrepRegexBehavior::DelegatedBackendDialect,
-                RegexFallbackReason::UnsupportedRegexBackend,
+                RegexFallbackReason::Backend,
             ),
             (
                 "line-break-escape",
@@ -6189,7 +6492,7 @@ mod tests {
                 Some("sensitive"),
                 MemoryRegexVerifierBehavior::MayConsumeLineTerminator,
                 UgrepRegexBehavior::DelegatedLineBreakDialect,
-                RegexFallbackReason::UnsupportedMultilineRegex,
+                RegexFallbackReason::Multiline,
             ),
             (
                 "literal-line-break",
@@ -6197,7 +6500,7 @@ mod tests {
                 Some("sensitive"),
                 MemoryRegexVerifierBehavior::MayConsumeLineTerminator,
                 UgrepRegexBehavior::DelegatedLineBreakDialect,
-                RegexFallbackReason::UnsupportedMultilineRegex,
+                RegexFallbackReason::Multiline,
             ),
             (
                 "parser-rejected",
@@ -6205,7 +6508,7 @@ mod tests {
                 Some("sensitive"),
                 MemoryRegexVerifierBehavior::ParserRejectedPattern,
                 UgrepRegexBehavior::DelegatedBackendDialect,
-                RegexFallbackReason::UnsupportedRegexBackend,
+                RegexFallbackReason::Backend,
             ),
         ];
 
@@ -6243,7 +6546,7 @@ mod tests {
         );
         assert_eq!(
             fallback.decision.fallback_reason,
-            Some(RegexFallbackReason::UnsupportedMultilineRegex)
+            Some(RegexFallbackReason::Multiline)
         );
 
         let mut limits = test_limits();
@@ -6260,7 +6563,7 @@ mod tests {
         );
         assert_eq!(
             fallback.decision.fallback_reason,
-            Some(RegexFallbackReason::UnsupportedRegexBackend)
+            Some(RegexFallbackReason::Backend)
         );
     }
 
@@ -7440,6 +7743,119 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn stable_ignore_rules_allow_targeted_default_ignore_validation() {
+        let root = workspace_test_dir("stable_ignore_rules_allow_targeted_default_ignore");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+        fs::write(root.join(".gitignore"), "# stable\n").expect("write gitignore");
+
+        let mut req = memory_req(&root);
+        req.hidden = Some(false);
+        req.no_ignore = Some(false);
+        let req = req.normalize();
+        let snapshot = build_index(
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+            1,
+        )
+        .expect("index");
+
+        let result = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
+            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .expect("targeted freshness");
+
+        assert_eq!(result.scope, SnapshotValidationScope::TargetedResultFiles);
+        assert_eq!(result.full_scan_reason, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mutated_gitignore_contents_trigger_ignore_full_scope_validation() {
+        let root = workspace_test_dir("mutated_gitignore_contents_trigger_full_scope");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+        fs::write(root.join(".gitignore"), "# before\n").expect("write gitignore");
+
+        let mut req = memory_req(&root);
+        req.hidden = Some(false);
+        req.no_ignore = Some(false);
+        let req = req.normalize();
+        let snapshot = build_index(
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+            1,
+        )
+        .expect("index");
+
+        fs::write(root.join(".gitignore"), "# after\n").expect("mutate gitignore");
+
+        let result = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
+            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .expect("full-scope freshness");
+
+        assert_eq!(result.scope, SnapshotValidationScope::FullScope);
+        assert_eq!(result.full_scan_reason, Some("gitignore_changed"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn force_full_scope_on_ignore_env_restores_conservative_validation() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var_os("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
+        unsafe {
+            std::env::set_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", "1");
+        }
+
+        let root = workspace_test_dir("force_full_scope_on_ignore_env");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+
+        let mut req = memory_req(&root);
+        req.hidden = Some(false);
+        req.no_ignore = Some(false);
+        let req = req.normalize();
+        let snapshot = build_index(
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+            1,
+        )
+        .expect("index");
+
+        let result = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
+            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .expect("forced full-scope freshness");
+
+        assert_eq!(result.scope, SnapshotValidationScope::FullScope);
+        assert_eq!(
+            result.full_scan_reason,
+            Some("ignore_rules_forced_full_scope")
+        );
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
+            },
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn memory_search_rejects_stale_success_after_added_matching_file() {
         let root = workspace_test_dir("memory_search_rejects_stale_success_after_added_file");
@@ -7456,27 +7872,35 @@ mod tests {
 
         fs::write(root.join("added.txt"), "needle added\n").expect("write added file");
 
-        let err = handle_memory_search(&req)
-            .await
-            .expect_err("memory backend must reject stale no-match success");
-        assert_eq!(err.error_type, "file_changed_during_verification");
-        assert_eq!(err.fallback_reason, "file_set_changed");
+        match handle_memory_search(&req).await {
+            Ok(outcome) => {
+                let payload = outcome.0;
+                assert_eq!(payload["isError"], false);
+                assert!(
+                    payload["count"].as_u64().expect("count") > 0,
+                    "cache miss or rebuild must surface the added match instead of stale no-match success"
+                );
+            }
+            Err(err) => {
+                assert_eq!(err.error_type, "file_changed_during_verification");
+                assert_eq!(err.fallback_reason, "file_set_changed");
+            }
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     #[cfg(unix)]
-    fn unchanged_metadata_fast_path_skips_hash_verification_when_marker_available() {
-        let root = workspace_test_dir("unchanged_metadata_fast_path_skips_hash_verification");
+    fn unchanged_metadata_fast_path_skips_byte_verification_when_marker_available() {
+        let root = workspace_test_dir("unchanged_metadata_fast_path_skips_byte_verification");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test dir");
         let file_path = root.join("sample.txt");
         fs::write(&file_path, "needle\n").expect("write initial file");
 
         let metadata = fs::metadata(&file_path).expect("metadata");
-        let content = fs::read(&file_path).expect("read");
-        let stamp = file_stamp_from_parts(&metadata, &content);
+        let stamp = file_stamp_from_parts(&metadata);
         let metadata = fs::metadata(&file_path).expect("metadata again");
 
         assert!(file_metadata_matches_without_hash(&stamp, &metadata));
@@ -7486,16 +7910,15 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn windows_unchanged_metadata_requires_hash_validation() {
-        let root = workspace_test_dir("windows_unchanged_metadata_requires_hash_validation");
+    fn windows_unchanged_metadata_requires_byte_validation() {
+        let root = workspace_test_dir("windows_unchanged_metadata_requires_byte_validation");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test dir");
         let file_path = root.join("sample.txt");
         fs::write(&file_path, "needle\n").expect("write initial file");
 
         let metadata = fs::metadata(&file_path).expect("metadata");
-        let content = fs::read(&file_path).expect("read");
-        let stamp = file_stamp_from_parts(&metadata, &content);
+        let stamp = file_stamp_from_parts(&metadata);
         let metadata = fs::metadata(&file_path).expect("metadata again");
 
         assert!(!metadata_stamp_can_validate_without_hash(&stamp));
@@ -7505,9 +7928,9 @@ mod tests {
     }
 
     #[test]
-    fn freshness_hash_validation_rejects_same_length_content_change() {
+    fn freshness_byte_validation_rejects_same_length_content_change() {
         let root =
-            workspace_test_dir("freshness_hash_validation_rejects_same_length_content_change");
+            workspace_test_dir("freshness_byte_validation_rejects_same_length_content_change");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test dir");
         let file_path = root.join("sample.txt");
@@ -7518,7 +7941,7 @@ mod tests {
         let mut doc = Document {
             path: file_path.clone(),
             rendered_path: file_path.display().to_string(),
-            stamp: file_stamp_from_parts(&metadata, &content),
+            stamp: file_stamp_from_parts(&metadata),
             content,
             lines: Vec::new(),
         };
@@ -7540,7 +7963,7 @@ mod tests {
             &metadata,
             Instant::now() + Duration::from_secs(30),
         )
-        .expect_err("hash mismatch should fail validation");
+        .expect_err("byte mismatch should fail validation");
         assert_eq!(err.error_type, "file_changed_during_verification");
 
         let _ = fs::remove_dir_all(&root);
@@ -7548,6 +7971,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn windows_metadata_marker_tracks_file_attribute_changes() {
         let root = workspace_test_dir("windows_metadata_marker_tracks_file_attribute_changes");
         let _ = fs::remove_dir_all(&root);
@@ -8266,7 +8690,13 @@ mod tests {
         assert_eq!(payload["count"], 3);
         assert_eq!(payload["candidate_seed_count"], 4);
         assert_eq!(payload["candidate_count"], 1);
-        assert_eq!(payload["verified_line_count"], 6);
+        assert!(
+            payload["verified_line_count"]
+                .as_u64()
+                .expect("verified lines")
+                < 6,
+            "verification should stop once the truncated prefix is known"
+        );
         assert_eq!(payload["max_results_reached"], true);
         assert_eq!(payload["freshness_check"], "verified");
         assert_eq!(payload["matches"].as_array().expect("matches").len(), 3);
@@ -8710,6 +9140,7 @@ mod tests {
             generation,
             documents: Vec::new(),
             scope_fingerprint: ScopeFingerprint::default(),
+            ignore_fingerprint: None,
             postings: PostingsIndex::default(),
             ascii_folded_postings: PostingsIndex::default(),
             indexed_bytes,
@@ -8725,7 +9156,6 @@ mod tests {
                 len: content.len() as u64,
                 modified: None,
                 change_marker: None,
-                hash: [0; 32],
             },
             content: content.to_vec(),
             lines: line_ranges(content),
@@ -8753,6 +9183,33 @@ mod tests {
     fn postings_for_test(indices: &[usize]) -> Postings {
         Postings::from_doc_ids(doc_ids(indices), Instant::now() + Duration::from_secs(30))
             .expect("test postings")
+    }
+
+    type RawPostingsForTest = HashMap<[u8; 3], Vec<DocId>>;
+
+    fn legacy_document_trigrams(
+        doc_id: DocId,
+        content: &[u8],
+    ) -> (RawPostingsForTest, RawPostingsForTest) {
+        let mut postings = HashMap::new();
+        let mut folded_postings = HashMap::new();
+        for trigram in literal_trigrams(content) {
+            postings
+                .entry(trigram)
+                .or_insert_with(Vec::new)
+                .push(doc_id);
+        }
+        let folded = content
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        for trigram in literal_trigrams(&folded) {
+            folded_postings
+                .entry(trigram)
+                .or_insert_with(Vec::new)
+                .push(doc_id);
+        }
+        (postings, folded_postings)
     }
 
     #[test]

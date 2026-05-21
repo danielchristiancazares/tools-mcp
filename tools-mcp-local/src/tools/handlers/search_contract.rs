@@ -260,13 +260,9 @@ impl SearchEvent {
     fn rendered_snippet(&self) -> SearchSnippet<'_> {
         render_search_snippet(&self.text)
     }
-
-    pub(super) fn push_rendered_line(&self, output: &mut String) {
-        RenderedSearchEvent::new(self).push_rendered_line(output);
-    }
 }
 
-struct RenderedSearchEvent<'a> {
+pub(super) struct RenderedSearchEvent<'a> {
     event: &'a SearchEvent,
     snippet: SearchSnippet<'a>,
 }
@@ -279,7 +275,7 @@ impl<'a> RenderedSearchEvent<'a> {
         }
     }
 
-    fn rendered_line_len(&self) -> usize {
+    pub(super) fn rendered_line_len(&self) -> usize {
         self.event
             .path
             .len()
@@ -288,7 +284,7 @@ impl<'a> RenderedSearchEvent<'a> {
             .saturating_add(2)
     }
 
-    fn push_rendered_line(&self, output: &mut String) {
+    pub(super) fn push_rendered_line(&self, output: &mut String) {
         let sep = if self.event.is_match { ":" } else { "-" };
         output.push_str(&self.event.path);
         output.push_str(sep);
@@ -356,6 +352,35 @@ struct SearchPayloadBuilder {
     current_events: Vec<Value>,
 }
 
+pub(super) struct SearchPayloadMeta {
+    path: String,
+    text_view: String,
+    is_error: bool,
+    exit_code: Value,
+    truncated: bool,
+    timed_out: bool,
+}
+
+impl SearchPayloadMeta {
+    pub(super) fn new(
+        path: impl Into<String>,
+        text_view: String,
+        is_error: bool,
+        exit_code: Value,
+        truncated: bool,
+        timed_out: bool,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            text_view,
+            is_error,
+            exit_code,
+            truncated,
+            timed_out,
+        }
+    }
+}
+
 impl SearchPayloadBuilder {
     fn with_event_capacity(capacity: usize) -> Self {
         Self {
@@ -373,7 +398,11 @@ impl SearchPayloadBuilder {
     }
 
     fn push(&mut self, event: &SearchEvent) {
-        let rendered = RenderedSearchEvent::new(event);
+        self.push_rendered(&RenderedSearchEvent::new(event));
+    }
+
+    fn push_rendered(&mut self, rendered: &RenderedSearchEvent<'_>) {
+        let event = rendered.event;
         if self.current_path.as_deref() != Some(event.path.as_str()) {
             self.finish_current_file();
             self.current_path = Some(event.path.clone());
@@ -416,47 +445,81 @@ fn build_search_payload_parts(events: &[SearchEvent]) -> SearchPayloadParts {
     builder.finish()
 }
 
-pub(super) fn render_search_text_capacity(events: &[SearchEvent]) -> usize {
-    events
-        .iter()
-        .fold(events.len().saturating_sub(1), |capacity, event| {
-            capacity.saturating_add(RenderedSearchEvent::new(event).rendered_line_len())
-        })
+fn build_search_payload_parts_from_rendered(
+    rendered_events: &[RenderedSearchEvent<'_>],
+) -> SearchPayloadParts {
+    let mut builder = SearchPayloadBuilder::with_event_capacity(rendered_events.len());
+    for event in rendered_events {
+        builder.push_rendered(event);
+    }
+    builder.finish()
+}
+
+pub(super) fn render_search_events(events: &[SearchEvent]) -> Vec<RenderedSearchEvent<'_>> {
+    events.iter().map(RenderedSearchEvent::new).collect()
+}
+
+pub(super) fn render_search_text_capacity_from_rendered(
+    rendered_events: &[RenderedSearchEvent<'_>],
+) -> usize {
+    rendered_events.iter().fold(
+        rendered_events.len().saturating_sub(1),
+        |capacity, event| capacity.saturating_add(event.rendered_line_len()),
+    )
 }
 
 pub(super) fn render_search_text(events: &[SearchEvent]) -> String {
-    let mut output = String::with_capacity(render_search_text_capacity(events));
-    for (index, event) in events.iter().enumerate() {
+    render_search_text_from_rendered(&render_search_events(events))
+}
+
+pub(super) fn render_search_text_from_rendered(
+    rendered_events: &[RenderedSearchEvent<'_>],
+) -> String {
+    let mut output =
+        String::with_capacity(render_search_text_capacity_from_rendered(rendered_events));
+    for (index, event) in rendered_events.iter().enumerate() {
         if index > 0 {
             output.push('\n');
         }
-        RenderedSearchEvent::new(event).push_rendered_line(&mut output);
+        event.push_rendered_line(&mut output);
     }
     output
 }
 
 pub(super) fn build_search_payload(
     req: &NormalizedSearchRequest,
-    path: impl Into<String>,
-    text_view: String,
-    is_error: bool,
-    exit_code: Value,
-    truncated: bool,
-    timed_out: bool,
+    meta: SearchPayloadMeta,
     events: &[SearchEvent],
 ) -> Value {
     let parts = build_search_payload_parts(events);
+    build_search_payload_from_parts(req, meta, parts)
+}
+
+pub(super) fn build_search_payload_from_rendered(
+    req: &NormalizedSearchRequest,
+    meta: SearchPayloadMeta,
+    rendered_events: &[RenderedSearchEvent<'_>],
+) -> Value {
+    let parts = build_search_payload_parts_from_rendered(rendered_events);
+    build_search_payload_from_parts(req, meta, parts)
+}
+
+fn build_search_payload_from_parts(
+    req: &NormalizedSearchRequest,
+    meta: SearchPayloadMeta,
+    parts: SearchPayloadParts,
+) -> Value {
     // count is an alias for event_count and may be removed in a future release.
     let count = parts.event_count;
 
     json!({
-        "content": [{"type": "text", "text": text_view}],
-        "isError": is_error,
+        "content": [{"type": "text", "text": meta.text_view}],
+        "isError": meta.is_error,
         "pattern": req.pattern().to_string(),
-        "path": path.into(),
-        "exit_code": exit_code,
-        "truncated": truncated,
-        "timed_out": timed_out,
+        "path": meta.path,
+        "exit_code": meta.exit_code,
+        "truncated": meta.truncated,
+        "timed_out": meta.timed_out,
         "match_count": parts.match_count,
         "event_count": parts.event_count,
         "count": count,
@@ -469,7 +532,8 @@ pub(super) fn build_search_payload(
 mod tests {
     use super::{
         NormalizedSearchRequest, SEARCH_SNIPPET_MAX_LINE_BYTES, SearchCaseMode, SearchEvent,
-        SearchRequest, build_search_payload, render_search_text,
+        SearchPayloadMeta, SearchRequest, build_search_payload, build_search_payload_from_rendered,
+        render_search_events, render_search_text, render_search_text_from_rendered,
     };
     use serde_json::{Value, json};
 
@@ -489,14 +553,47 @@ mod tests {
     ) -> Value {
         build_search_payload(
             req,
-            path,
-            render_search_text(events),
-            false,
-            json!(0),
-            false,
-            false,
+            SearchPayloadMeta::new(
+                path,
+                render_search_text(events),
+                false,
+                json!(0),
+                false,
+                false,
+            ),
             events,
         )
+    }
+
+    #[test]
+    fn rendered_event_payload_matches_legacy_wrappers() {
+        let req = normalized_request("src");
+        let events = vec![
+            SearchEvent::new(false, "src/main.rs".to_string(), 1, "before".to_string()),
+            SearchEvent::new(true, "src/main.rs".to_string(), 2, "needle".to_string()),
+            SearchEvent::new(true, "src/lib.rs".to_string(), 9, "needle ".repeat(80)),
+        ];
+        let rendered = render_search_events(&events);
+
+        assert_eq!(
+            render_search_text_from_rendered(&rendered),
+            render_search_text(&events)
+        );
+        assert_eq!(
+            build_search_payload_from_rendered(
+                &req,
+                SearchPayloadMeta::new(
+                    "src",
+                    render_search_text_from_rendered(&rendered),
+                    false,
+                    json!(0),
+                    false,
+                    false,
+                ),
+                &rendered,
+            ),
+            build_success_payload(&req, "src", &events)
+        );
     }
 
     #[test]

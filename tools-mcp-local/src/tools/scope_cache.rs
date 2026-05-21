@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
 use ignore::WalkBuilder;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::env;
 use std::fmt;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -50,8 +51,58 @@ pub struct RecursiveScopeSnapshot {
     pub root: PathBuf,
     pub entries: Vec<ScopeEntry>,
     pub directories: Vec<MetadataFingerprintEntry>,
+    pub ignore_fingerprint: Option<IgnoreFingerprint>,
     pub generation: u64,
     pub built_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IgnoreFingerprint {
+    entries: Vec<IgnoreFingerprintEntry>,
+}
+
+impl IgnoreFingerprint {
+    pub fn change_reason(&self, current: &Self) -> Option<&'static str> {
+        if self.entries == current.entries {
+            return None;
+        }
+
+        for entry in &self.entries {
+            match current
+                .entries
+                .iter()
+                .find(|current| current.path == entry.path)
+            {
+                Some(current) if current == entry => {}
+                Some(_) | None => return Some(entry.reason),
+            }
+        }
+
+        current
+            .entries
+            .iter()
+            .find(|entry| {
+                !self
+                    .entries
+                    .iter()
+                    .any(|expected| expected.path == entry.path)
+            })
+            .map(|entry| entry.reason)
+            .or(Some("ignore_rules_changed"))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IgnoreFingerprintEntry {
+    path: PathBuf,
+    reason: &'static str,
+    stamp: Option<IgnoreControlStamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IgnoreControlStamp {
+    metadata: MetadataStamp,
+    content_hash: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +238,22 @@ impl RepoScopeCache {
         }
 
         if !directory_fingerprints_match(&current_snapshot.directories, deadline)? {
+            self.mark_dirty(key, snapshot);
+            return self.rebuild_and_store(key, deadline);
+        }
+
+        if ignore_fingerprint_change_reason(
+            &current_snapshot.root,
+            current_snapshot
+                .directories
+                .iter()
+                .map(|entry| entry.path.clone()),
+            key.no_ignore,
+            current_snapshot.ignore_fingerprint.as_ref(),
+            deadline,
+        )?
+        .is_some()
+        {
             self.mark_dirty(key, snapshot);
             return self.rebuild_and_store(key, deadline);
         }
@@ -378,12 +445,11 @@ impl DirEntriesCache {
         &self,
         key: &DirEntriesKey,
     ) -> Result<Arc<DirEntriesSnapshot>, ScopeCacheError> {
-        if let Some((snapshot, cached_modified)) = self.cached_snapshot(key) {
-            if let Ok(current_modified) = directory_modified_async(&key.path).await
-                && current_modified == cached_modified
-            {
-                return Ok(snapshot);
-            }
+        if let Some((snapshot, cached_modified)) = self.cached_snapshot(key)
+            && let Ok(current_modified) = directory_modified_async(&key.path).await
+            && current_modified == cached_modified
+        {
+            return Ok(snapshot);
         }
 
         let (snapshot, directory_modified) = build_dir_entries_snapshot(key).await?;
@@ -630,11 +696,18 @@ fn build_recursive_scope_snapshot(
             })
         })
         .collect::<Result<Vec<_>, ScopeCacheError>>()?;
+    let ignore_fingerprint = build_ignore_fingerprint(
+        &key.root,
+        directories.iter().map(|entry| entry.path.clone()),
+        key.no_ignore,
+        deadline,
+    )?;
 
     Ok(RecursiveScopeSnapshot {
         root: key.root.clone(),
         entries,
         directories,
+        ignore_fingerprint,
         generation,
         built_at: Instant::now(),
     })
@@ -700,6 +773,104 @@ fn directory_fingerprints_match(
     Ok(true)
 }
 
+pub fn ignore_fingerprint_change_reason<I>(
+    root: &Path,
+    directories: I,
+    no_ignore: bool,
+    expected: Option<&IgnoreFingerprint>,
+    deadline: Instant,
+) -> Result<Option<&'static str>, ScopeCacheError>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let current = build_ignore_fingerprint(root, directories, no_ignore, deadline)?;
+    Ok(match (expected, current.as_ref()) {
+        (None, None) => None,
+        (Some(expected), Some(current)) => expected.change_reason(current),
+        (Some(_), None) | (None, Some(_)) => Some("ignore_rules_changed"),
+    })
+}
+
+pub fn build_ignore_fingerprint<I>(
+    root: &Path,
+    directories: I,
+    no_ignore: bool,
+    deadline: Instant,
+) -> Result<Option<IgnoreFingerprint>, ScopeCacheError>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    if no_ignore {
+        return Ok(None);
+    }
+
+    let mut controls = BTreeMap::<PathBuf, &'static str>::new();
+    for directory in directories {
+        check_deadline(deadline)?;
+        controls
+            .entry(directory.join(".ignore"))
+            .or_insert("ignore_file_changed");
+        controls
+            .entry(directory.join(".gitignore"))
+            .or_insert("gitignore_changed");
+        controls
+            .entry(directory.join(".git").join("info").join("exclude"))
+            .or_insert("git_exclude_changed");
+    }
+    if let Some(path) = ignore::gitignore::gitconfig_excludes_path() {
+        controls.entry(path).or_insert("global_ignore_changed");
+    }
+    if controls.is_empty() {
+        controls
+            .entry(root.join(".ignore"))
+            .or_insert("ignore_file_changed");
+        controls
+            .entry(root.join(".gitignore"))
+            .or_insert("gitignore_changed");
+        controls
+            .entry(root.join(".git").join("info").join("exclude"))
+            .or_insert("git_exclude_changed");
+    }
+
+    let mut entries = Vec::with_capacity(controls.len());
+    for (path, reason) in controls {
+        check_deadline(deadline)?;
+        entries.push(IgnoreFingerprintEntry {
+            stamp: ignore_control_stamp(&path, deadline)?,
+            path,
+            reason,
+        });
+    }
+
+    Ok(Some(IgnoreFingerprint { entries }))
+}
+
+fn ignore_control_stamp(
+    path: &Path,
+    deadline: Instant,
+) -> Result<Option<IgnoreControlStamp>, ScopeCacheError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            check_deadline(deadline)?;
+            let content = fs::read(path)?;
+            check_deadline(deadline)?;
+            Ok(Some(IgnoreControlStamp {
+                metadata: metadata_stamp_from_metadata(&metadata),
+                content_hash: content_hash(&content),
+            }))
+        }
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ScopeCacheError::Io(err)),
+    }
+}
+
+fn content_hash(content: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn recursive_scope_snapshot_matches(
     current: &RecursiveScopeSnapshot,
     candidate: &RecursiveScopeSnapshot,
@@ -707,6 +878,7 @@ fn recursive_scope_snapshot_matches(
     current.root == candidate.root
         && current.entries == candidate.entries
         && current.directories == candidate.directories
+        && current.ignore_fingerprint == candidate.ignore_fingerprint
 }
 
 fn metadata_stamp_from_metadata(metadata: &fs::Metadata) -> MetadataStamp {
@@ -904,6 +1076,32 @@ mod tests {
             .get_or_build(&key, deadline())
             .expect("rebuilt snapshot after directory change");
         assert!(!Arc::ptr_eq(&second, &third));
+    }
+
+    #[test]
+    fn repo_scope_cache_rebuilds_when_gitignore_contents_change() {
+        let dir = TestDir::new("repo-snapshot-gitignore-change");
+        write_file(&dir.path().join("alpha.txt"), "alpha");
+        write_file(&dir.path().join(".gitignore"), "# before\n");
+
+        let cache = RepoScopeCache::new(RepoScopeCacheLimits {
+            max_entries: 8,
+            max_files_total: 1_000,
+            full_validate_interval: 32,
+        });
+        let key = repo_key(dir.path());
+
+        let first = cache
+            .get_or_build(&key, deadline())
+            .expect("initial snapshot");
+        write_file(&dir.path().join(".gitignore"), "# after\n");
+        let second = cache
+            .get_or_build(&key, deadline())
+            .expect("rebuilt snapshot after gitignore mutation");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.entries, second.entries);
+        assert_ne!(first.ignore_fingerprint, second.ignore_fingerprint);
     }
 
     #[test]

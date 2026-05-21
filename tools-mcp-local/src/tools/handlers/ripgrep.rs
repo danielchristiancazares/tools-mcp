@@ -11,7 +11,7 @@ use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::cancellation::current_cancellation_token;
 
 use super::search_contract::{
-    NormalizedSearchRequest, SearchCaseMode, SearchEvent, build_search_payload,
+    NormalizedSearchRequest, SearchCaseMode, SearchEvent, SearchPayloadMeta, build_search_payload,
     parse_search_request, render_search_text,
 };
 use super::search_file_selection::resolve_ugrep_path_list;
@@ -525,12 +525,14 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
 
             let mut payload = build_search_payload(
                 &req,
-                root,
-                text_view,
-                !success,
-                json!(exit_code),
-                truncated,
-                timed_out,
+                SearchPayloadMeta::new(
+                    root,
+                    text_view,
+                    !success,
+                    json!(exit_code),
+                    truncated,
+                    timed_out,
+                ),
                 &events,
             );
 

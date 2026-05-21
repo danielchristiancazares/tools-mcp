@@ -678,6 +678,7 @@ Fast local search that automatically uses the in-memory POC for common literal s
   - The in-memory POC falls back for regex fuzzy searches, word-regexp searches, symlink-following searches, unseeded regexes, unsupported regex dialect constructs such as `(?...)`, multiline-capable regexes, Unicode regex case-folding cases, fuzzy patterns that cannot produce the required seeds, incomplete index coverage, stale verification, or exceeded index limits.
   - Additional response fields are additive and do not replace existing fields. Memory-backed responses include `backend: "memory"` and may include diagnostics such as `index_cache`, `index_generation`, `indexed_files`, `indexed_bytes`, `candidate_count`, `fuzzy_seed_count`, `fuzzy_verified_lines`, `phase_one_ms`, and `phase_two_ms`. Fallback responses may include `backend: "ugrep"` and `fallback_reason`.
   - Resource limits are configurable with `TOOLS_SEARCH_INDEX_MAX_FILE_BYTES` (default 1 MiB), `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES` (default 256 MiB per file-selection key), `TOOLS_SEARCH_INDEX_MAX_FILES` (default 50,000), `TOOLS_SEARCH_MAX_CANDIDATES` (default 20,000), `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS` (default 300,000), and the fuzzy verifier limits `TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS` (default 512), `TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES` (default 200,000), and `TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS` (default 16,384). Existing `timeout_ms` and `max_results` still apply.
+  - `TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE=1` is an internal safety valve for the in-memory backend. When set, default ignore-aware searches (`no_ignore=false`) use the previous conservative full-scope freshness validation instead of targeted freshness.
   - Limitations: this POC is not semantic search, does not provide ranking or embeddings, does not persist an on-disk index across server processes, does not require file-system watchers, does not accelerate `Read`, and is not a full ugrep replacement or final Hauberk design.
 
 ### Read
@@ -1172,6 +1173,7 @@ pub struct FetchChunk {
 | TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES | No | Maximum candidate lines verified by the in-memory fuzzy Search POC (default: 200,000) |
 | TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS | No | Maximum line length verified by the in-memory fuzzy Search POC (default: 16,384 Unicode scalar values) |
 | TOOLS_SEARCH_REGEX_SIZE_LIMIT_BYTES | No | Maximum compiled regex verifier size for eligible in-memory seeded regex searches (default: 10 MiB) |
+| TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE | No | Set to "true" (or 1/yes/on) to force full-scope freshness validation for in-memory searches that respect ignore files |
 | WEBFETCH_ENABLE_BROWSER_UNSAFE | No | Set to "true" to enable headless browser rendering in WebFetch (disabled by default) |
 
 ### Cache Locations
@@ -1297,6 +1299,7 @@ All tool handlers validate:
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
+| criterion | 0.8 | Search backend benchmarks |
 | tempfile | 3.10 | Temporary files for tests |
 | futures | 0.3 | Async utilities |
 
@@ -1343,6 +1346,17 @@ cargo test --workspace -- --nocapture
 # Run specific test
 cargo test --workspace test_name
 ```
+
+### Search Benchmarks
+
+The in-memory `Search` backend has Criterion benchmarks for cold index build, warm default-ignore validation, and large postings intersections:
+
+```bash
+cargo bench -p tools-mcp-local --bench search_memory -- --save-baseline before
+cargo bench -p tools-mcp-local --bench search_memory -- --baseline before
+```
+
+Run baseline and comparison on the same machine. Small deltas can be noisy, so use these benchmarks as regression and direction checks rather than absolute performance guarantees.
 
 ### Coverage (Local HTML)
 

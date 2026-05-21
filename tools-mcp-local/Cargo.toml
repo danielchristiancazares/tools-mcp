@@ -29,4 +29,9 @@ tree-sitter-typescript.workspace = true
 tools-mcp-core = { path = "../tools-mcp-core" }
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "search_memory"
+harness = false
