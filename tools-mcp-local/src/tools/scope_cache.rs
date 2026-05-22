@@ -817,6 +817,18 @@ where
             .entry(directory.join(".git").join("info").join("exclude"))
             .or_insert("git_exclude_changed");
     }
+    for ancestor in root.ancestors() {
+        check_deadline(deadline)?;
+        controls
+            .entry(ancestor.join(".ignore"))
+            .or_insert("ignore_file_changed");
+        controls
+            .entry(ancestor.join(".gitignore"))
+            .or_insert("gitignore_changed");
+        controls
+            .entry(ancestor.join(".git").join("info").join("exclude"))
+            .or_insert("git_exclude_changed");
+    }
     if let Some(path) = ignore::gitignore::gitconfig_excludes_path() {
         controls.entry(path).or_insert("global_ignore_changed");
     }
@@ -1102,6 +1114,24 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(first.entries, second.entries);
         assert_ne!(first.ignore_fingerprint, second.ignore_fingerprint);
+    }
+
+    #[test]
+    fn ignore_fingerprint_detects_ancestor_gitignore_change_for_nested_root() {
+        let dir = TestDir::new("repo-snapshot-ancestor-gitignore-change");
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(&nested).expect("create nested root");
+        write_file(&nested.join("alpha.txt"), "alpha");
+        write_file(&dir.path().join(".gitignore"), "# before\n");
+
+        let first =
+            build_ignore_fingerprint(&nested, std::iter::once(nested.clone()), false, deadline())
+                .expect("initial ignore fingerprint");
+        write_file(&dir.path().join(".gitignore"), "# after\n");
+        let second = build_ignore_fingerprint(&nested, std::iter::once(nested), false, deadline())
+            .expect("mutated ignore fingerprint");
+
+        assert_ne!(first, second);
     }
 
     #[test]
