@@ -680,7 +680,7 @@ fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan
                 format!("memory regex search could not parse the pattern: {err}"),
             )
         })?;
-    if hir_can_match_lf(&hir) {
+    if hir_can_match_line_break(&hir) {
         return Err(MemoryError::new(
             "unsupported_regex_dialect",
             "unsupported_multiline_regex",
@@ -1476,27 +1476,35 @@ fn contains_uppercase_letter(pattern: &str) -> bool {
     pattern.chars().any(char::is_uppercase)
 }
 
-fn hir_can_match_lf(hir: &Hir) -> bool {
+fn hir_can_match_line_break(hir: &Hir) -> bool {
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => false,
-        HirKind::Literal(literal) => literal.0.contains(&b'\n'),
-        HirKind::Class(class) => class_can_match_lf(class),
-        HirKind::Capture(capture) => hir_can_match_lf(capture.sub.as_ref()),
-        HirKind::Repetition(repetition) => hir_can_match_lf(repetition.sub.as_ref()),
-        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts.iter().any(hir_can_match_lf),
+        HirKind::Literal(literal) => literal.0.contains(&b'\n') || literal.0.contains(&b'\r'),
+        HirKind::Class(class) => class_can_match_line_break(class),
+        HirKind::Capture(capture) => hir_can_match_line_break(capture.sub.as_ref()),
+        HirKind::Repetition(repetition) => hir_can_match_line_break(repetition.sub.as_ref()),
+        HirKind::Concat(parts) | HirKind::Alternation(parts) => {
+            parts.iter().any(hir_can_match_line_break)
+        }
     }
 }
 
-fn class_can_match_lf(class: &Class) -> bool {
+fn class_can_match_line_break(class: &Class) -> bool {
     match class {
         Class::Unicode(class) => class
             .ranges()
             .iter()
-            .any(|range| range.start() <= '\n' && '\n' <= range.end()),
+            .any(|range| {
+                (range.start() <= '\n' && '\n' <= range.end())
+                    || (range.start() <= '\r' && '\r' <= range.end())
+            }),
         Class::Bytes(class) => class
             .ranges()
             .iter()
-            .any(|range| range.start() <= b'\n' && b'\n' <= range.end()),
+            .any(|range| {
+                (range.start() <= b'\n' && b'\n' <= range.end())
+                    || (range.start() <= b'\r' && b'\r' <= range.end())
+            }),
     }
 }
 
@@ -2215,6 +2223,28 @@ mod tests {
             fuzzy: None,
         };
         let error = eligible_query_plan(&req).expect_err("LF-capable class should fall back");
+        assert_eq!(error.error_type, "unsupported_regex_dialect");
+        assert_eq!(error.fallback_reason, "unsupported_multiline_regex");
+    }
+
+    #[test]
+    fn regex_with_encoded_cr_falls_back() {
+        let req = SearchRequest {
+            pattern: "needle.*\\x0D".to_string(),
+            path: Some(".".to_string()),
+            case: Some("sensitive".to_string()),
+            fixed_strings: Some(false),
+            word_regexp: None,
+            glob: None,
+            hidden: None,
+            follow: None,
+            no_ignore: None,
+            context: None,
+            max_results: None,
+            timeout_ms: None,
+            fuzzy: None,
+        };
+        let error = eligible_query_plan(&req).expect_err("CR-capable regex should fall back");
         assert_eq!(error.error_type, "unsupported_regex_dialect");
         assert_eq!(error.fallback_reason, "unsupported_multiline_regex");
     }
