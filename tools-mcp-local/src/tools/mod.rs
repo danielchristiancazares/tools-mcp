@@ -8,6 +8,7 @@ mod pwsh;
 mod read;
 pub(crate) mod scope_cache;
 mod search;
+mod search_context;
 mod write;
 
 use std::env;
@@ -35,6 +36,7 @@ pub fn register_tools(registry: &mut ToolRegistry) {
     }
 
     registry.register::<search::SearchTool>();
+    registry.register::<search_context::SearchContextTool>();
 }
 
 pub fn start_search_cache_warmer() {

@@ -35,6 +35,7 @@
 
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
 - **Search** - Fast local search with an automatic in-memory path for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries, plus ugrep fallback for unsupported regex and search modes.
+- **search_context** - Search plus merged, numbered file windows around each match.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
 - **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
@@ -85,6 +86,7 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 | Task | Tool |
 |------|------|
 | Find code by pattern/regex | Search |
+| Find code and inspect nearby lines | search_context |
 | Fetch web content | WebFetch |
 | Read file contents | Read |
 | Edit existing files | Edit (simple snippet replacement) |
@@ -680,6 +682,33 @@ Fast local search that automatically uses the in-memory POC for common literal s
   - Resource limits are configurable with `TOOLS_SEARCH_INDEX_MAX_FILE_BYTES` (default 1 MiB), `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES` (default 256 MiB per file-selection key), `TOOLS_SEARCH_INDEX_MAX_FILES` (default 50,000), `TOOLS_SEARCH_MAX_CANDIDATES` (default 20,000), `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS` (default 300,000), and the fuzzy verifier limits `TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS` (default 512), `TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES` (default 200,000), and `TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS` (default 16,384). Existing `timeout_ms` and `max_results` still apply.
   - `TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE=1` is an internal safety valve for the in-memory backend. When set, default ignore-aware searches (`no_ignore=false`) use the previous conservative full-scope freshness validation instead of targeted freshness.
   - Limitations: this POC is not semantic search, does not provide ranking or embeddings, does not persist an on-disk index across server processes, does not require file-system watchers, does not accelerate `Read`, and is not a full ugrep replacement or final Hauberk design.
+
+### search_context
+
+Search for matches and expand them into merged, numbered file windows for quick code inspection.
+
+- **Tool name**: `search_context`
+- **Required**:
+  - `pattern` - text or regex pattern to search for.
+- **Optional**:
+  - `path` - file or directory root (default: current working directory).
+  - `case` - `"smart"` (default), `"sensitive"`, or `"insensitive"`.
+  - `fixed_strings` (boolean, default `false`) - treat pattern as a literal string.
+  - `word_regexp` (boolean, default `false`) - match on word boundaries only.
+  - `glob` (string[]) - glob filters to include files.
+  - `hidden`, `follow`, `no_ignore` - same file-selection controls as `Search`.
+  - `context_lines` (integer, minimum `0`, maximum `50`, default `3`) - lines before and after each match.
+  - `max_matches` (integer, minimum `1`, maximum `200`, default `20`) - match lines to expand into file windows.
+  - `max_results` (integer, minimum `1`, maximum `200`) - alias for `max_matches`.
+  - `timeout_ms` and `fuzzy` - same search controls as `Search`.
+- **Response**:
+  - `content[0].text` - readable file windows. Matching lines are prefixed with `>`.
+  - `matches` - array of `{ path, line_number }` entries returned by the underlying search.
+  - `windows` - merged windows with `path`, `start_line`, `end_line`, `match_lines`, `total_lines`, and numbered `text`.
+  - `search_backend`, `search_truncated`, and `search_timed_out` mirror the underlying search execution.
+- **Behavior**:
+  - Runs `Search` with zero grep context, then reads each matched file once and merges overlapping windows.
+  - Preserves `Search` matching and file-selection behavior while avoiding separate `Search` then `Read` calls.
 
 ### Read
 

@@ -10,6 +10,7 @@
 
 mod read_file;
 mod ripgrep;
+mod search_context;
 mod search_contract;
 mod search_file_selection;
 mod search_memory;
@@ -18,6 +19,7 @@ mod search_parity;
 
 pub use read_file::handle_read_file;
 pub use ripgrep::handle_search;
+pub use search_context::handle_search_context;
 
 pub(crate) fn start_search_cache_warmer() {
     search_memory::start_search_cache_warmer();

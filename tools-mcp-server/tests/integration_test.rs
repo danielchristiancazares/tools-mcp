@@ -101,6 +101,7 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"Ping"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
+    assert!(tool_names.contains(&"search_context"));
     assert!(!tool_names.contains(&"CodeQuery"));
     assert!(tool_names.contains(&"Read"));
     assert!(tool_names.contains(&"Edit"));
@@ -137,7 +138,6 @@ fn test_ping_tool_call() {
     );
     assert_eq!(response["result"]["isError"], false);
 }
-
 
 #[test]
 fn test_unknown_fields_are_rejected_for_tool_requests() {
@@ -336,6 +336,50 @@ fn test_search_literal_default_options_uses_memory_backend() {
     assert!(
         text.contains("COMMONNEEDLE"),
         "expected smart-case literal match, got: {text}"
+    );
+}
+
+#[test]
+fn test_search_context_returns_numbered_file_window() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 414,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "search_context",
+            "arguments": {
+                "pattern": "File reading handler implementation.",
+                "path": READ_HANDLER_PATH,
+                "fixed_strings": true,
+                "context_lines": 0,
+                "max_matches": 1,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call search_context tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 414);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(
+        response["result"]["pattern"],
+        "File reading handler implementation."
+    );
+    assert_eq!(response["result"]["path"], READ_HANDLER_PATH);
+    assert_eq!(response["result"]["context_lines"], 0);
+    assert_eq!(response["result"]["windows"].as_array().unwrap().len(), 1);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing search_context content text");
+    assert!(
+        text.contains(READ_HANDLER_PATH),
+        "expected window header, got: {text}"
+    );
+    assert!(
+        text.contains(">1\t//! File reading handler implementation."),
+        "expected marked matching line, got: {text}"
     );
 }
 
