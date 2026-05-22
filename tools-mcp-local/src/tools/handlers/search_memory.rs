@@ -11,7 +11,8 @@ use regex_syntax::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -27,6 +28,7 @@ const DEFAULT_MAX_FUZZY_VERIFIED_LINES: usize = 200_000;
 const DEFAULT_MAX_FUZZY_LINE_CHARS: usize = 16_384;
 const DEFAULT_REGEX_SIZE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_WARM_CACHE_TIMEOUT_MS: u64 = 300_000;
+const GIT_MARKER_READ_LIMIT: u64 = 4096;
 
 #[derive(Clone, Debug)]
 pub(super) struct MemoryError {
@@ -557,15 +559,30 @@ fn git_worktree_root_from(cwd: &Path) -> Option<PathBuf> {
 
 fn has_git_worktree_marker(dir: &Path) -> bool {
     let marker = dir.join(".git");
-    let Ok(metadata) = fs::metadata(&marker) else {
+    let Ok(metadata) = fs::symlink_metadata(&marker) else {
         return false;
     };
+
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
 
     if metadata.is_dir() {
         return true;
     }
 
-    metadata.is_file() && fs::read(&marker).is_ok_and(|content| is_gitdir_file_marker(&content))
+    if !metadata.is_file() || metadata.len() > GIT_MARKER_READ_LIMIT {
+        return false;
+    }
+
+    read_git_marker_prefix(&marker).is_ok_and(|content| is_gitdir_file_marker(&content))
+}
+
+fn read_git_marker_prefix(marker: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(marker)?;
+    let mut content = Vec::with_capacity(GIT_MARKER_READ_LIMIT as usize);
+    file.take(GIT_MARKER_READ_LIMIT).read_to_end(&mut content)?;
+    Ok(content)
 }
 
 fn is_gitdir_file_marker(content: &[u8]) -> bool {
@@ -2807,6 +2824,21 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create directory");
         fs::write(root.join(".git"), "not a gitdir marker\n").expect("write non-git marker");
+
+        assert!(!has_git_worktree_marker(&root));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn has_git_worktree_marker_rejects_oversized_gitdir_file_marker() {
+        let root =
+            workspace_test_dir("has_git_worktree_marker_rejects_oversized_gitdir_file_marker");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create directory");
+        let mut marker = b"gitdir: ".to_vec();
+        marker.extend(vec![b'a'; GIT_MARKER_READ_LIMIT as usize]);
+        fs::write(root.join(".git"), marker).expect("write oversized git marker");
 
         assert!(!has_git_worktree_marker(&root));
 
