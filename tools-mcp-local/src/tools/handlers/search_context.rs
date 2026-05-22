@@ -93,7 +93,8 @@ pub async fn handle_search_context(_id: Option<Value>, args: Value) -> ToolCallO
         return search_outcome;
     }
 
-    let matches = extract_match_locations(&search_outcome.0);
+    let root = req.path.as_deref().unwrap_or(".");
+    let matches = extract_match_locations(&search_outcome.0, root);
     let windows = match expand_match_windows(&matches, context_lines).await {
         Ok(windows) => windows,
         Err(err) => return ToolCallOutcome::err(err),
@@ -134,7 +135,7 @@ fn insert_if_some<T: serde::Serialize>(
     }
 }
 
-fn extract_match_locations(search_payload: &Value) -> Vec<MatchLocation> {
+fn extract_match_locations(search_payload: &Value, root: &str) -> Vec<MatchLocation> {
     search_payload["matches"]
         .as_array()
         .into_iter()
@@ -149,12 +150,28 @@ fn extract_match_locations(search_payload: &Value) -> Vec<MatchLocation> {
                 .filter(|path| !path.trim().is_empty())?;
             let line_number = data.get("line_number")?.as_u64()?;
             let line_number = usize::try_from(line_number).ok()?;
-            Some(MatchLocation {
-                path: path.to_string(),
-                line_number,
-            })
+            let path = validate_match_path(path, root)?;
+            Some(MatchLocation { path, line_number })
         })
         .collect()
+}
+
+fn validate_match_path(path: &str, root: &str) -> Option<String> {
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+
+    if canonical_root.is_file() {
+        if canonical_path == canonical_root {
+            return canonical_path.to_str().map(ToOwned::to_owned);
+        }
+        return None;
+    }
+
+    if canonical_path.starts_with(&canonical_root) {
+        return canonical_path.to_str().map(ToOwned::to_owned);
+    }
+
+    None
 }
 
 async fn expand_match_windows(
@@ -324,7 +341,11 @@ fn build_context_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowRange, collect_lines_lossy, push_merged_range, render_numbered_window};
+    use super::{
+        WindowRange, collect_lines_lossy, push_merged_range, render_numbered_window,
+        validate_match_path,
+    };
+    use std::fs;
 
     #[test]
     fn push_merged_range_merges_overlapping_match_windows() {
@@ -364,5 +385,31 @@ mod tests {
         );
 
         assert_eq!(rendered, " 2\ttwo\n>3\tthree\n 4\tfour");
+    }
+
+    #[test]
+    fn validate_match_path_rejects_out_of_root_path() {
+        let root = tempfile::tempdir().expect("temp root");
+        let in_root = root.path().join("in-root.txt");
+        let outside_dir = tempfile::tempdir().expect("temp outside");
+        let outside = outside_dir.path().join("outside.txt");
+
+        fs::write(&in_root, "needle").expect("write in root");
+        fs::write(&outside, "secret").expect("write outside");
+
+        assert!(
+            validate_match_path(
+                in_root.to_str().expect("utf8"),
+                root.path().to_str().expect("utf8")
+            )
+            .is_some()
+        );
+        assert!(
+            validate_match_path(
+                outside.to_str().expect("utf8"),
+                root.path().to_str().expect("utf8")
+            )
+            .is_none()
+        );
     }
 }
