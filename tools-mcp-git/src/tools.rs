@@ -15,7 +15,7 @@ define_mcp_tool! {
             "working_dir": {"type": "string", "description": "Optional working directory for the git commands"},
             "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds for each git command"},
             "untracked": {"type": "boolean", "default": true, "description": "Include untracked files in status output (when false, uses `-uno`)"},
-            "include_diff_stats": {"type": "boolean", "default": true, "description": "Include unstaged and staged `git diff --stat` summaries"},
+            "include_diff_stats": {"type": "boolean", "default": false, "description": "Include unstaged and staged `git diff --stat` summaries (opt-in)"},
             "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional path list to snapshot (passed after `--`)"}
         },
         "required": [],

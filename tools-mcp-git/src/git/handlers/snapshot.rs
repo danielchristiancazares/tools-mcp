@@ -83,7 +83,7 @@ pub async fn handle_git_snapshot(_id: Option<Value>, args: Value) -> ToolCallOut
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
     let untracked = req.untracked.unwrap_or(true);
-    let include_diff_stats = req.include_diff_stats.unwrap_or(true);
+    let include_diff_stats = req.include_diff_stats.unwrap_or(false);
     let paths = match requested_paths(req.paths) {
         Ok(paths) => paths,
         Err(o) => return o,

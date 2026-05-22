@@ -821,7 +821,7 @@ Return a concise, read-only snapshot of the current Git worktree.
   - `working_dir` (string) - working directory for the Git commands.
   - `timeout_ms` (integer, default 30000) - timeout in milliseconds for each Git command.
   - `untracked` (boolean, default `true`) - include untracked files in status output (when false, uses `-uno`).
-  - `include_diff_stats` (boolean, default `true`) - include unstaged and staged `git diff --stat` summaries.
+  - `include_diff_stats` (boolean, default `false`) - include unstaged and staged `git diff --stat` summaries (opt-in).
   - `paths` (string[]) - limit the snapshot to specific paths (passed after `--`).
 - **Response**:
   - `content[0].text` - branch, clean flag, porcelain status, and optional staged/unstaged diffstat sections.
