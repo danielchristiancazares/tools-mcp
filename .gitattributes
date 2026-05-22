@@ -1,0 +1,23 @@
+# Default: detect text vs binary; commit and check out text files with LF.
+* text=auto eol=lf
+
+# Source and config (always LF)
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+*.codex     text eol=lf
+*.cursorrules text eol=lf
+
+# Shell scripts must stay LF; CRLF breaks shebangs and bash parsing.
+*.sh        text eol=lf
+justfile    text eol=lf
+
+# Windows-native scripts use CRLF by platform convention.
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+
+# Repo-meta text files
+.gitignore     text eol=lf
+.gitattributes text eol=lf
