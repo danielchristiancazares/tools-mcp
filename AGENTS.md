@@ -20,6 +20,7 @@ Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with too
 
 Env vars:
 - `MCP_SKIP_HEADERS=true` — no `Content-Length` framing.
+- `MCP_ENABLE_GIT=true` — register Git tools; omitted or any other value leaves Git tools disabled.
 - `RUST_LOG=debug` — verbose logs.
 - `APP_VERSION=...` - baked into init responses.
 

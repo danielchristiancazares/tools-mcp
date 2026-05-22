@@ -46,13 +46,12 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
     assert_eq!(caps["tools"]["call"], true);
     let tools = result["tools"].as_array().expect("tools in init");
     assert!(
-        tools.len() >= 17,
-        "initialize must embed full tool list (min 17), got {}",
+        tools.len() >= 16,
+        "initialize must embed full tool list (min 16), got {}",
         tools.len()
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(!names.contains(&"CodeQuery"));
-    assert!(names.contains(&"GeminiGate"));
     assert!(names.contains(&"WebFetch"));
 }
 
@@ -224,13 +223,12 @@ fn golden_tools_list_returns_tools_array() {
     assert_eq!(response["id"], 9006);
     let tools = response["result"]["tools"].as_array().expect("tools array");
     assert!(
-        tools.len() >= 17,
+        tools.len() >= 16,
         "tools/list must return full tool list, got {}",
         tools.len()
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"Ping"));
-    assert!(names.contains(&"GeminiGate"));
     assert!(!names.contains(&"CodeQuery"));
 }
 

@@ -16,7 +16,8 @@ pub fn spawn_server() -> Command {
         .current_dir(workspace_root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .env("MCP_ENABLE_GIT", "true");
     command
 }
 

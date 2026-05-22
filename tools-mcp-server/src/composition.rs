@@ -84,7 +84,6 @@ pub fn build_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
     registry.register::<crate::ping::PingTool>();
-    registry.register::<crate::gemini_gate::GeminiGateTool>();
     tools_mcp_webfetch::register_tools(&mut registry);
     tools_mcp_local::register_tools(&mut registry);
     tools_mcp_git::register_tools(&mut registry);

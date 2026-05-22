@@ -90,8 +90,8 @@ fn test_tools_list() {
     let tools = response["result"]["tools"].as_array().unwrap();
     // Tool inventory can grow over time; assert a minimum and validate key tools exist.
     assert!(
-        tools.len() >= 17,
-        "expected at least 17 tools, got {}",
+        tools.len() >= 16,
+        "expected at least 16 tools, got {}",
         tools.len()
     );
 
@@ -99,7 +99,6 @@ fn test_tools_list() {
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     assert!(tool_names.contains(&"Ping"));
-    assert!(tool_names.contains(&"GeminiGate"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
     assert!(!tool_names.contains(&"CodeQuery"));
@@ -139,57 +138,6 @@ fn test_ping_tool_call() {
     assert_eq!(response["result"]["isError"], false);
 }
 
-#[test]
-fn test_gemini_gate_approves_valid_phases() {
-    for phase in ["1", "2", "3", "4"] {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": format!("gemini-{phase}"),
-            "method": "mcp/tools/call",
-            "params": {
-                "name": "GeminiGate",
-                "arguments": {
-                    "phase": phase
-                }
-            }
-        });
-
-        let response = send_mcp_message(&request).expect("Failed to call GeminiGate tool");
-
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["id"], format!("gemini-{phase}"));
-        assert_eq!(
-            response["result"]["content"][0]["text"].as_str(),
-            Some("Approved")
-        );
-        assert_eq!(response["result"]["isError"], false);
-    }
-}
-
-#[test]
-fn test_gemini_gate_rejects_invalid_phase() {
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 5,
-        "method": "mcp/tools/call",
-        "params": {
-            "name": "GeminiGate",
-            "arguments": {
-                "phase": "5"
-            }
-        }
-    });
-
-    let response = send_mcp_message(&request).expect("Failed to call GeminiGate tool");
-
-    assert_eq!(response["jsonrpc"], "2.0");
-    assert_eq!(response["id"], 5);
-    assert_eq!(
-        response["result"]["content"][0]["text"].as_str(),
-        Some("Rejected")
-    );
-    assert_eq!(response["result"]["isError"], false);
-}
 
 #[test]
 fn test_unknown_fields_are_rejected_for_tool_requests() {
@@ -1210,6 +1158,36 @@ fn test_webfetch_blocks_localhost_ssrf() {
     );
 
     assert_eq!(response["result"]["error_type"], "ssrf_blocked");
+}
+
+#[test]
+fn test_git_tools_disabled_by_default() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 999,
+        "method": "mcp/tools/list",
+        "params": {}
+    });
+
+    let mut command = spawn_server();
+    command.env_remove("MCP_ENABLE_GIT");
+
+    let response = support::send_mcp_message_with_command(&request, command)
+        .expect("Failed to send tools/list with env var");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 999);
+
+    let tools = response["result"]["tools"].as_array().unwrap();
+
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for name in tool_names {
+        assert!(
+            !name.starts_with("Git"),
+            "Expected Git tools to be disabled by default, but found tool: {}",
+            name
+        );
+    }
 }
 
 #[cfg(test)]

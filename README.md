@@ -782,19 +782,6 @@ Simple health check for MCP clients.
   - Always returns `pong` in a JSON `content` array.
 - Useful for MCP client connectivity tests or keepalive pings.
 
-### GeminiGate
-
-Approve only Gemini phases 1 through 4.
-
-- **Tool name**: `GeminiGate`
-- **Required**:
-  - `phase` - phase string to evaluate.
-- **Behavior**:
-  - Returns `Approved` when `phase` is exactly `"1"`, `"2"`, `"3"`, or `"4"`.
-  - Returns `Rejected` for any other string value.
-- **Response**:
-  - Always returns `content[0].text` as either `Approved` or `Rejected` with `isError: false`.
-
 ### GitStatus
 
 Run `git status` (porcelain by default).
