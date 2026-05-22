@@ -105,6 +105,7 @@ fn test_tools_list() {
     assert!(!tool_names.contains(&"CodeQuery"));
     assert!(tool_names.contains(&"Read"));
     assert!(tool_names.contains(&"Edit"));
+    assert!(tool_names.contains(&"git_snapshot"));
     assert!(tool_names.contains(&"GitStatus"));
     assert!(tool_names.contains(&"GitDiff"));
     assert!(tool_names.contains(&"GitRestore"));
@@ -803,6 +804,65 @@ fn test_git_status_tool_call_if_git_installed() {
 }
 
 #[test]
+fn test_git_snapshot_tool_call_if_git_installed() {
+    let git_bin = if cfg!(target_os = "windows") {
+        "git.exe"
+    } else {
+        "git"
+    };
+
+    let git_available = Command::new(git_bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !git_available {
+        eprintln!("Skipping git_snapshot test: {git_bin} not found on PATH");
+        return;
+    }
+
+    let dir = workspace_tempdir("git-snapshot");
+    let init_status = Command::new(git_bin)
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .expect("failed to run git init");
+    assert!(init_status.success(), "git init failed");
+
+    std::fs::write(dir.path().join("foo.txt"), "hello\n").expect("write file failed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "git_snapshot",
+            "arguments": {
+                "working_dir": dir.path().to_string_lossy().to_string()
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call git_snapshot tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 43);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["clean"], false);
+    assert_eq!(response["result"]["counts"]["untracked"], 1);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing git_snapshot content text");
+    assert!(
+        text.contains("foo.txt"),
+        "expected snapshot output to mention foo.txt, got: {text}"
+    );
+}
+
+#[test]
 fn test_git_diff_ref_export_preserves_rename_metadata() {
     let git_bin = if cfg!(target_os = "windows") {
         "git.exe"
@@ -1225,6 +1285,10 @@ fn test_git_tools_disabled_by_default() {
     let tools = response["result"]["tools"].as_array().unwrap();
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        !tool_names.contains(&"git_snapshot"),
+        "Expected git_snapshot to be disabled by default"
+    );
     for name in tool_names {
         assert!(
             !name.starts_with("Git"),

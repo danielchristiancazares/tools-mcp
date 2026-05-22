@@ -27,7 +27,7 @@
 
 - **Web Content Fetching**: Retrieve and process web pages with SSRF protection and robots.txt compliance
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
-- **Git Integration**: Execute git commands (status, diff, restore, add, commit)
+- **Git Integration**: Execute git commands and snapshots (status, diff, restore, add, commit, worktree summary)
 - **Code Search**: Fast in-memory search for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries with ugrep fallback for unsupported regex and search modes
 - **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
 
@@ -39,7 +39,7 @@
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
 - **Pwsh** - Run PowerShell commands via pwsh with timeout and stdout/stderr capture.
-- **GitStatus / GitDiff / GitRestore** - Local Git status/diff/restore helpers with timeout and output truncation.
+- **git_snapshot / GitStatus / GitDiff / GitRestore** - Local Git snapshot/status/diff/restore helpers with timeout and output truncation.
 - **Ping** - Lightweight health check for MCP clients.
 - JSON-RPC 2.0 transport over stdin/stdout with optional `Content-Length` framing for Codex-compatible MCP clients.
 
@@ -97,6 +97,7 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 | List directory contents | ListDir |
 | Find files by pattern | Glob |
 | Run shell commands | Pwsh |
+| Snapshot git worktree state | git_snapshot |
 | Check git status | GitStatus |
 | View diffs | GitDiff |
 | Revert changes | GitRestore |
@@ -809,7 +810,29 @@ Simple health check for MCP clients.
 - **Tool name**: `Ping`
 - **Behavior**:
   - Always returns `pong` in a JSON `content` array.
-- Useful for MCP client connectivity tests or keepalive pings.
+  - Useful for MCP client connectivity tests or keepalive pings.
+
+### git_snapshot
+
+Return a concise, read-only snapshot of the current Git worktree.
+
+- **Tool name**: `git_snapshot`
+- **Optional**:
+  - `working_dir` (string) - working directory for the Git commands.
+  - `timeout_ms` (integer, default 30000) - timeout in milliseconds for each Git command.
+  - `untracked` (boolean, default `true`) - include untracked files in status output (when false, uses `-uno`).
+  - `include_diff_stats` (boolean, default `true`) - include unstaged and staged `git diff --stat` summaries.
+  - `paths` (string[]) - limit the snapshot to specific paths (passed after `--`).
+- **Response**:
+  - `content[0].text` - branch, clean flag, porcelain status, and optional staged/unstaged diffstat sections.
+  - `clean` - true when the porcelain status has no entries.
+  - `branch` - porcelain branch header without the `## ` prefix.
+  - `counts` - staged, unstaged, untracked, and conflicted entry counts.
+  - `entries` - parsed porcelain entries with index/worktree status, path, and optional original path for renames.
+  - `status`, `unstaged_diff`, and `staged_diff` - structured summaries of the read-only Git commands.
+- **Behavior**:
+  - Runs `git status --porcelain=1 -b`, `git diff --stat`, and `git diff --cached --stat` through the same deterministic Git execution path as the existing Git tools.
+  - Registered only when `MCP_ENABLE_GIT=true`, like the other Git tools.
 
 ### GitStatus
 

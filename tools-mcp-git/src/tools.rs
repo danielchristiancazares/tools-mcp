@@ -1,9 +1,28 @@
 use crate::git::{
     handle_git_add, handle_git_blame, handle_git_branch, handle_git_checkout, handle_git_commit,
-    handle_git_diff, handle_git_log, handle_git_restore, handle_git_show, handle_git_stash,
-    handle_git_status,
+    handle_git_diff, handle_git_log, handle_git_restore, handle_git_show, handle_git_snapshot,
+    handle_git_stash, handle_git_status,
 };
 use tools_mcp_core::{ToolRegistry, define_mcp_tool};
+
+define_mcp_tool! {
+    GitSnapshotTool,
+    name: "git_snapshot",
+    description: "Return a concise read-only Git worktree snapshot: porcelain status, counts, and staged/unstaged diff stats.",
+    schema: {
+        "type": "object",
+        "properties": {
+            "working_dir": {"type": "string", "description": "Optional working directory for the git commands"},
+            "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds for each git command"},
+            "untracked": {"type": "boolean", "default": true, "description": "Include untracked files in status output (when false, uses `-uno`)"},
+            "include_diff_stats": {"type": "boolean", "default": true, "description": "Include unstaged and staged `git diff --stat` summaries"},
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional path list to snapshot (passed after `--`)"}
+        },
+        "required": [],
+        "additionalProperties": false
+    },
+    handler: handle_git_snapshot
+}
 
 define_mcp_tool! {
     GitStatusTool,
@@ -237,6 +256,7 @@ define_mcp_tool! {
 }
 
 pub fn register_tools(registry: &mut ToolRegistry) {
+    registry.register::<GitSnapshotTool>();
     registry.register::<GitStatusTool>();
     registry.register::<GitDiffTool>();
     registry.register::<GitRestoreTool>();
