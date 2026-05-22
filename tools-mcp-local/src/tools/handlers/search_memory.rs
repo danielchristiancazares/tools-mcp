@@ -368,9 +368,9 @@ pub(super) async fn handle_memory_search(
     req: &SearchRequest,
 ) -> Result<ToolCallOutcome, MemoryError> {
     let limits = Limits::from_env();
-    let plan = eligible_query_plan_with_limits(req, &limits)?;
-    validate_plan_limits(&plan, &limits)?;
     let deadline = Instant::now() + Duration::from_millis(req.timeout_ms());
+    let plan = eligible_query_plan_with_limits(req, &limits, deadline)?;
+    validate_plan_limits(&plan, &limits, deadline)?;
     let cached = get_or_build_snapshot(req, &limits, deadline, plan.requires_utf8_scope())?;
     let snapshot = cached.snapshot;
 
@@ -597,13 +597,15 @@ fn search_index_warm_timeout_ms() -> u64 {
 #[cfg(test)]
 fn eligible_query_plan(req: &SearchRequest) -> Result<QueryPlan, MemoryError> {
     let limits = Limits::from_env();
-    eligible_query_plan_with_limits(req, &limits)
+    eligible_query_plan_with_limits(req, &limits, Instant::now() + Duration::from_secs(30))
 }
 
 fn eligible_query_plan_with_limits(
     req: &SearchRequest,
     limits: &Limits,
+    deadline: Instant,
 ) -> Result<QueryPlan, MemoryError> {
+    check_deadline(deadline)?;
     if let Some(distance) = req.fuzzy {
         return eligible_fuzzy_plan(req, distance);
     }
@@ -624,7 +626,7 @@ fn eligible_query_plan_with_limits(
     }
     let fixed_strings = req.fixed_strings.unwrap_or(false);
     if !fixed_strings && !is_plain_regex_literal(&req.pattern) {
-        return eligible_regex_plan(req, limits);
+        return eligible_regex_plan(req, limits, deadline);
     }
     let case = literal_case_for_request(req, fixed_strings)?;
 
@@ -649,9 +651,21 @@ fn eligible_query_plan_with_limits(
     })
 }
 
-fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan, MemoryError> {
+fn eligible_regex_plan(
+    req: &SearchRequest,
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<QueryPlan, MemoryError> {
+    check_deadline(deadline)?;
     ensure_regex_case_sensitive(req)?;
     ensure_no_unsupported_inline_regex_construct(&req.pattern)?;
+    if req.pattern.len() > limits.regex_size_limit_bytes {
+        return Err(MemoryError::new(
+            "resource_limit_exceeded",
+            "regex_pattern_too_large",
+            "memory regex pattern exceeds configured size limit",
+        ));
+    }
 
     if req.pattern.contains('\n') || req.pattern.contains('\r') {
         return Err(MemoryError::new(
@@ -680,6 +694,7 @@ fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan
                 format!("memory regex search could not parse the pattern: {err}"),
             )
         })?;
+    check_deadline(deadline)?;
     if hir_can_match_lf(&hir) {
         return Err(MemoryError::new(
             "unsupported_regex_dialect",
@@ -687,13 +702,15 @@ fn eligible_regex_plan(req: &SearchRequest, limits: &Limits) -> Result<QueryPlan
             "memory regex search does not support regex patterns that can match line breaks",
         ));
     }
-    let candidates = required_candidate_expr(&hir).ok_or_else(|| {
-        MemoryError::new(
-            "unsupported_regex_dialect",
-            "query_without_required_trigram",
-            "memory regex search requires a proven literal substring of at least three bytes",
-        )
-    })?;
+    let mut remaining_nodes = limits.max_candidates.saturating_mul(8).max(1);
+    let candidates =
+        required_candidate_expr(&hir, &mut remaining_nodes, deadline).ok_or_else(|| {
+            MemoryError::new(
+                "unsupported_regex_dialect",
+                "query_without_required_trigram",
+                "memory regex search requires a proven literal substring of at least three bytes",
+            )
+        })?;
 
     let mut builder = RegexBuilder::new(&req.pattern);
     builder
@@ -831,7 +848,12 @@ fn literal_case_for_request(
     }
 }
 
-fn validate_plan_limits(plan: &QueryPlan, limits: &Limits) -> Result<(), MemoryError> {
+fn validate_plan_limits(
+    plan: &QueryPlan,
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<(), MemoryError> {
+    check_deadline(deadline)?;
     if let QueryPlan::Fuzzy { pattern_chars, .. } = plan
         && pattern_chars.len() > limits.max_fuzzy_pattern_chars
     {
@@ -1260,14 +1282,29 @@ fn candidates_for_candidate_expr(
         CandidateExpr::And(children) => {
             let mut child_sets = Vec::with_capacity(children.len());
             for child in children {
-                child_sets.push(candidates_for_candidate_expr(snapshot, child, usize::MAX)?);
+                child_sets.push(candidates_for_candidate_expr(
+                    snapshot,
+                    child,
+                    max_candidates,
+                )?);
             }
             intersect_candidate_sets(child_sets)
         }
         CandidateExpr::Or(children) => {
             let mut candidate_set = BTreeSet::new();
             for child in children {
-                candidate_set.extend(candidates_for_candidate_expr(snapshot, child, usize::MAX)?);
+                candidate_set.extend(candidates_for_candidate_expr(
+                    snapshot,
+                    child,
+                    max_candidates,
+                )?);
+                if candidate_set.len() > max_candidates {
+                    return Err(MemoryError::new(
+                        "resource_limit_exceeded",
+                        "max_candidates_exceeded",
+                        "memory search candidate limit exceeded",
+                    ));
+                }
             }
             candidate_set.into_iter().collect()
         }
@@ -1500,23 +1537,37 @@ fn class_can_match_lf(class: &Class) -> bool {
     }
 }
 
-fn required_candidate_expr(hir: &Hir) -> Option<CandidateExpr> {
+fn required_candidate_expr(
+    hir: &Hir,
+    remaining_nodes: &mut usize,
+    deadline: Instant,
+) -> Option<CandidateExpr> {
+    if check_deadline(deadline).is_err() || *remaining_nodes == 0 {
+        return None;
+    }
+    *remaining_nodes = remaining_nodes.saturating_sub(1);
     match hir.kind() {
         HirKind::Empty | HirKind::Class(_) | HirKind::Look(_) => None,
         HirKind::Literal(literal) => candidate_seed(literal.0.as_ref()),
-        HirKind::Capture(capture) => required_candidate_expr(capture.sub.as_ref()),
+        HirKind::Capture(capture) => {
+            required_candidate_expr(capture.sub.as_ref(), remaining_nodes, deadline)
+        }
         HirKind::Repetition(repetition) => {
             if repetition.min == 0 {
                 None
             } else {
-                required_candidate_expr(repetition.sub.as_ref())
+                required_candidate_expr(repetition.sub.as_ref(), remaining_nodes, deadline)
             }
         }
-        HirKind::Concat(parts) => candidate_and(parts.iter().filter_map(required_candidate_expr)),
+        HirKind::Concat(parts) => candidate_and(
+            parts
+                .iter()
+                .filter_map(|part| required_candidate_expr(part, remaining_nodes, deadline)),
+        ),
         HirKind::Alternation(parts) => {
             let mut alternatives = Vec::with_capacity(parts.len());
             for part in parts {
-                alternatives.push(required_candidate_expr(part)?);
+                alternatives.push(required_candidate_expr(part, remaining_nodes, deadline)?);
             }
             candidate_or(alternatives)
         }
