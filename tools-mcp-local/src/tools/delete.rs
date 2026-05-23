@@ -26,19 +26,25 @@ async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         Err(err) => return ToolCallOutcome::err(err.to_string()),
     };
 
-    // Reject symlinks to prevent TOCTOU races and deletion of files outside the workspace.
-    if path.is_symlink() {
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ToolCallOutcome::err(format!("file not found: {}", path.display()));
+        }
+        Err(err) => {
+            return ToolCallOutcome::err(format!("failed to inspect {}: {err}", path.display()));
+        }
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
         return ToolCallOutcome::err(format!(
             "cannot delete symlink: {}. Remediation: delete the target file directly instead.",
             path.display()
         ));
     }
 
-    if !path.exists() {
-        return ToolCallOutcome::err(format!("file not found: {}", path.display()));
-    }
-
-    if path.is_dir() {
+    if file_type.is_dir() {
         return ToolCallOutcome::err(format!(
             "cannot delete directory: {}. This tool only deletes files. Remediation: delete files within the directory first, or use a shell tool carefully if you intend to remove a directory.",
             path.display()
@@ -49,9 +55,10 @@ async fn handle_delete(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("failed to delete {}: {err}", path.display()));
     }
 
+    let path_display = path.display().to_string();
     ToolCallOutcome::ok_text_with(
-        format!("Deleted {}", path.display()),
-        [("path", json!(path.display().to_string()))],
+        format!("Deleted {path_display}"),
+        [("path", json!(path_display))],
     )
 }
 
@@ -124,6 +131,27 @@ mod tests {
 
         assert!(!is_error, "deleting a regular file should succeed");
         assert!(!path.exists(), "file should be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_directories_without_removing_them() {
+        use crate::path_policy::tempdir_in_workspace;
+        use std::fs;
+
+        let dir = tempdir_in_workspace("delete-directory-");
+        let path = dir.path().join("subdir");
+        fs::create_dir(&path).expect("create directory");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+        });
+
+        let outcome = super::handle_delete(None, args).await;
+
+        assert_eq!(outcome.0["isError"], true);
+        let msg = outcome.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("cannot delete directory"));
+        assert!(path.exists(), "directory should not be deleted");
     }
 
     #[tokio::test]

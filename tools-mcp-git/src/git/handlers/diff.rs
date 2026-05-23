@@ -4,7 +4,9 @@ use super::super::types::build_git_response;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use tokio::fs;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::config::{
@@ -12,9 +14,15 @@ use tools_mcp_core::config::{
 };
 use tools_mcp_core::validation;
 
+const PATCH_EXPORT_STDOUT_BYTES: usize = 1;
+
 /// Sanitize a file path for use as a filename (replace path separators).
-fn sanitize_path_for_filename(path: &str) -> String {
-    path.replace(['/', '\\'], "__")
+fn sanitize_path_for_filename(path: &str) -> Cow<'_, str> {
+    if path.contains('/') || path.contains('\\') {
+        Cow::Owned(path.replace(['/', '\\'], "__"))
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 fn unique_patch_filename(
@@ -74,27 +82,17 @@ struct DiffStats {
 #[derive(Debug, Clone)]
 struct DiffManifestEntry {
     path: String,
-    status: String,
+    status: &'static str,
     old_path: Option<String>,
     insertions: u32,
     deletions: u32,
     binary: bool,
 }
 
-fn diff_manifest_key(path: &str, old_path: Option<&str>) -> String {
-    match old_path {
-        Some(old_path) => format!("{old_path}\0{path}"),
-        None => path.to_string(),
-    }
-}
-
 fn requested_paths(paths: Option<Vec<String>>) -> Result<Vec<String>, ToolCallOutcome> {
     match paths {
-        Some(paths) => {
-            let paths: Vec<String> = paths
-                .into_iter()
-                .filter(|path| !path.trim().is_empty())
-                .collect();
+        Some(mut paths) => {
+            paths.retain(|path| !path.trim().is_empty());
             if paths.is_empty() {
                 return Err(ToolCallOutcome::err(
                     "paths must include at least one non-empty path",
@@ -112,13 +110,12 @@ fn build_ref_diff_args(
     mode_args: &[&str],
     paths: &[String],
 ) -> Vec<String> {
-    let mut args = vec![
-        "diff".into(),
-        "--no-ext-diff".into(),
-        "--no-textconv".into(),
-        "--find-renames".into(),
-    ];
-    args.extend(mode_args.iter().map(|arg| (*arg).to_string()));
+    let mut args = Vec::with_capacity(6 + mode_args.len() + paths.len());
+    args.push("diff".to_string());
+    args.push("--no-ext-diff".to_string());
+    args.push("--no-textconv".to_string());
+    args.push("--find-renames".to_string());
+    args.extend(mode_args.iter().copied().map(String::from));
     args.push("--end-of-options".into());
     args.push(format!("{from_ref}..{to_ref}"));
     if !paths.is_empty() {
@@ -126,6 +123,92 @@ fn build_ref_diff_args(
         args.extend(paths.iter().cloned());
     }
     args
+}
+
+fn build_ref_patch_args(
+    from_ref: &str,
+    to_ref: &str,
+    output_file: &str,
+    old_path: Option<&str>,
+    path: &str,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(9 + usize::from(old_path.is_some()));
+    args.push("diff".to_string());
+    args.push("--no-ext-diff".to_string());
+    args.push("--no-textconv".to_string());
+    args.push("--find-renames".to_string());
+    args.push(format!("--output={output_file}"));
+    args.push("--end-of-options".to_string());
+    args.push(format!("{from_ref}..{to_ref}"));
+    args.push("--".to_string());
+    if let Some(old_path) = old_path {
+        args.push(old_path.to_string());
+    }
+    args.push(path.to_string());
+    args
+}
+
+fn build_worktree_diff_args(
+    cached: bool,
+    stat: bool,
+    name_only: bool,
+    unified: Option<i64>,
+    paths: &[String],
+) -> Vec<String> {
+    let mut capacity = 3 + usize::from(cached) + usize::from(stat) + usize::from(name_only);
+    if unified.is_some() {
+        capacity += 1;
+    }
+    if !paths.is_empty() {
+        capacity += 1 + paths.len();
+    }
+
+    let mut args = Vec::with_capacity(capacity);
+    args.push("diff".to_string());
+    args.push("--no-ext-diff".to_string());
+    args.push("--no-textconv".to_string());
+
+    if cached {
+        args.push("--cached".to_string());
+    }
+    if stat {
+        args.push("--stat".to_string());
+    }
+    if name_only {
+        args.push("--name-only".to_string());
+    }
+    if let Some(u) = unified {
+        debug_assert!(u >= 0);
+        args.push(format!("-U{u}"));
+    }
+
+    if !paths.is_empty() {
+        args.push("--".to_string());
+        args.extend(paths.iter().cloned());
+    }
+
+    args
+}
+
+fn git_output_path_arg(path: &Path) -> String {
+    let path = path.display().to_string();
+    strip_windows_verbatim_prefix(path)
+}
+
+#[cfg(windows)]
+fn strip_windows_verbatim_prefix(path: String) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_windows_verbatim_prefix(path: String) -> String {
+    path
 }
 
 fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
@@ -149,7 +232,7 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
                 };
                 entries.push(DiffManifestEntry {
                     path: (*path).to_string(),
-                    status: status.to_string(),
+                    status,
                     old_path: None,
                     insertions: 0,
                     deletions: 0,
@@ -165,7 +248,7 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
                 })?;
                 entries.push(DiffManifestEntry {
                     path: (*new_path).to_string(),
-                    status: "renamed".to_string(),
+                    status: "renamed",
                     old_path: Some((*old_path).to_string()),
                     insertions: 0,
                     deletions: 0,
@@ -181,7 +264,7 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
                 })?;
                 entries.push(DiffManifestEntry {
                     path: (*new_path).to_string(),
-                    status: "copied".to_string(),
+                    status: "copied",
                     old_path: Some((*old_path).to_string()),
                     insertions: 0,
                     deletions: 0,
@@ -200,16 +283,14 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
 }
 
 fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<(), String> {
-    let mut entry_index: HashMap<String, usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| {
-            (
-                diff_manifest_key(&entry.path, entry.old_path.as_deref()),
-                idx,
-            )
-        })
-        .collect();
+    let mut entry_index: HashMap<(&str, Option<&str>), usize> =
+        HashMap::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        entry_index.insert((entry.path.as_str(), entry.old_path.as_deref()), idx);
+    }
+
+    let mut seen_entries = vec![false; entries.len()];
+    let mut updates = Vec::with_capacity(entries.len());
     let mut tokens = stdout.split('\0').filter(|token| !token.is_empty());
 
     while let Some(stats) = tokens.next() {
@@ -255,17 +336,28 @@ fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<()
             let new_path = tokens.next().ok_or_else(|| {
                 "git diff --numstat missing new path for rename record".to_string()
             })?;
-            ((*new_path).to_string(), Some((*old_path).to_string()))
+            (new_path, Some(old_path))
         } else {
-            (raw_path.to_string(), None)
+            (raw_path, None)
         };
 
-        let key = diff_manifest_key(&path, old_path.as_deref());
-        let Some(entry_pos) = entry_index.remove(&key) else {
+        let Some(&entry_pos) = entry_index.get(&(path, old_path)) else {
             return Err(format!(
                 "git diff --numstat returned a path not present in --name-status: {path}"
             ));
         };
+
+        if seen_entries[entry_pos] {
+            return Err(format!(
+                "git diff --numstat returned a path not present in --name-status: {path}"
+            ));
+        }
+
+        seen_entries[entry_pos] = true;
+        updates.push((entry_pos, insertions, deletions, binary));
+    }
+
+    for (entry_pos, insertions, deletions, binary) in updates {
         let entry = &mut entries[entry_pos];
         entry.insertions = insertions;
         entry.deletions = deletions;
@@ -273,6 +365,24 @@ fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<()
     }
 
     Ok(())
+}
+
+async fn write_binary_placeholder_if_empty(patch_path: &Path, path: &str) -> Result<(), String> {
+    let metadata = fs::metadata(patch_path)
+        .await
+        .map_err(|e| format!("Failed to inspect {}: {e}", patch_path.display()))?;
+
+    if metadata.len() == 0 {
+        fs::write(patch_path, format!("Binary file: {path}\n"))
+            .await
+            .map_err(|e| format!("Failed to write {}: {e}", patch_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn trim_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches(&['\r', '\n'][..])
 }
 
 async fn collect_ref_diff_manifest(
@@ -340,41 +450,37 @@ async fn write_patches_to_dir(
     let entries =
         collect_ref_diff_manifest(working_dir, from_ref, to_ref, paths, timeout_ms).await?;
 
-    let mut files: Vec<FileDiffEntry> = Vec::new();
+    let mut files: Vec<FileDiffEntry> = Vec::with_capacity(entries.len());
     let mut total_insertions: u64 = 0;
     let mut total_deletions: u64 = 0;
-    let mut used_patch_filenames = HashSet::new();
-    let mut next_patch_suffix_by_base = HashMap::new();
+    let mut used_patch_filenames = HashSet::with_capacity(entries.len());
+    let mut next_patch_suffix_by_base = HashMap::with_capacity(entries.len());
 
     for entry in entries {
         total_insertions += u64::from(entry.insertions);
         total_deletions += u64::from(entry.deletions);
 
+        let sanitized_path = sanitize_path_for_filename(&entry.path);
         let patch_filename = unique_patch_filename(
-            &sanitize_path_for_filename(&entry.path),
+            sanitized_path.as_ref(),
             &mut used_patch_filenames,
             &mut next_patch_suffix_by_base,
         );
         let patch_path = out_path.join(&patch_filename);
 
-        let mut patch_args = vec![
-            "diff".into(),
-            "--no-ext-diff".into(),
-            "--no-textconv".into(),
-            "--find-renames".into(),
-            "--end-of-options".into(),
-            format!("{from_ref}..{to_ref}"),
-            "--".into(),
-        ];
-        if let Some(old_path) = &entry.old_path {
-            patch_args.push(old_path.clone());
-        }
-        patch_args.push(entry.path.clone());
+        let patch_output_arg = git_output_path_arg(&patch_path);
+        let patch_args = build_ref_patch_args(
+            from_ref,
+            to_ref,
+            &patch_output_arg,
+            entry.old_path.as_deref(),
+            &entry.path,
+        );
         let patch_exec = run_git(
             working_dir.map(std::string::ToString::to_string),
             patch_args,
             timeout_ms,
-            MAX_OUTPUT_BYTES,
+            PATCH_EXPORT_STDOUT_BYTES,
             DEFAULT_GIT_STDERR_BYTES,
         )
         .await
@@ -387,19 +493,20 @@ async fn write_patches_to_dir(
             ));
         }
 
-        let patch_content = if patch_exec.stdout.is_empty() && entry.binary {
-            format!("Binary file: {}\n", entry.path)
-        } else {
-            patch_exec.stdout
-        };
+        if patch_exec.truncated_stdout || !patch_exec.stdout.is_empty() {
+            return Err(format!(
+                "git diff wrote unexpected stdout while exporting {} with --output",
+                entry.path
+            ));
+        }
 
-        fs::write(&patch_path, &patch_content)
-            .await
-            .map_err(|e| format!("Failed to write {}: {e}", patch_path.display()))?;
+        if entry.binary {
+            write_binary_placeholder_if_empty(&patch_path, &entry.path).await?;
+        }
 
         files.push(FileDiffEntry {
             path: entry.path,
-            status: entry.status,
+            status: entry.status.to_string(),
             old_path: entry.old_path,
             insertions: entry.insertions,
             deletions: entry.deletions,
@@ -528,34 +635,16 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
     let max_bytes =
         validation::clamp_bytes(req.max_bytes, DEFAULT_GIT_STDOUT_BYTES, MAX_OUTPUT_BYTES);
 
-    let mut cmd_args: Vec<String> = vec![
-        "diff".into(),
-        "--no-ext-diff".into(),
-        "--no-textconv".into(),
-    ];
-
-    if req.cached.unwrap_or(false) {
-        cmd_args.push("--cached".into());
+    if req.unified.is_some_and(|u| u < 0) {
+        return ToolCallOutcome::err("unified must be >= 0");
     }
-    if req.stat.unwrap_or(false) {
-        cmd_args.push("--stat".into());
-    }
-    if req.name_only.unwrap_or(false) {
-        cmd_args.push("--name-only".into());
-    }
-    if let Some(u) = req.unified {
-        if u < 0 {
-            return ToolCallOutcome::err("unified must be >= 0");
-        }
-        cmd_args.push(format!("-U{u}"));
-    }
-
-    if !paths.is_empty() {
-        cmd_args.push("--".into());
-        for p in &paths {
-            cmd_args.push(p.clone());
-        }
-    }
+    let cmd_args = build_worktree_diff_args(
+        req.cached.unwrap_or(false),
+        req.stat.unwrap_or(false),
+        req.name_only.unwrap_or(false),
+        req.unified,
+        &paths,
+    );
 
     let exec = match run_git(
         req.working_dir.clone(),
@@ -572,28 +661,28 @@ pub async fn handle_git_diff(_id: Option<Value>, args: Value) -> ToolCallOutcome
 
     let text = if exec.success {
         if exec.stdout.trim().is_empty() {
-            "no diff".to_string()
+            "no diff"
         } else {
-            exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
+            trim_trailing_newlines(&exec.stdout)
         }
     } else if !exec.stderr.trim().is_empty() {
-        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
+        trim_trailing_newlines(&exec.stderr)
     } else {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
+        trim_trailing_newlines(&exec.stdout)
     };
 
     let mut extra_fields = HashMap::new();
     extra_fields.insert("max_bytes", json!(max_bytes));
 
-    let payload = build_git_response(&exec, &text, Some(extra_fields));
+    let payload = build_git_response(&exec, text, Some(extra_fields));
     ToolCallOutcome::ok(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_numstat_z, build_ref_diff_args, handle_git_diff, parse_name_status_z,
-        unique_patch_filename,
+        apply_numstat_z, build_ref_diff_args, build_ref_patch_args, build_worktree_diff_args,
+        handle_git_diff, parse_name_status_z, strip_windows_verbatim_prefix, unique_patch_filename,
     };
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
@@ -739,6 +828,66 @@ mod tests {
     }
 
     #[test]
+    fn ref_patch_args_keep_output_before_refs_and_paths_after_separator() {
+        let args = build_ref_patch_args(
+            "--output=target/side-effect",
+            "HEAD",
+            "patches/a.txt.patch",
+            Some("old.txt"),
+            "new.txt",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--output=patches/a.txt.patch",
+                "--end-of-options",
+                "--output=target/side-effect..HEAD",
+                "--",
+                "old.txt",
+                "new.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_diff_args_keep_options_before_path_separator() {
+        let paths = vec!["--cached".to_string(), "src/lib.rs".to_string()];
+        let args = build_worktree_diff_args(true, true, true, Some(0), &paths);
+        assert_eq!(
+            args,
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+                "--stat",
+                "--name-only",
+                "-U0",
+                "--",
+                "--cached",
+                "src/lib.rs",
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_output_path_args_strip_windows_verbatim_prefixes() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\repo\patches\a.patch".to_string()),
+            r"C:\repo\patches\a.patch"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\patches\a.patch".to_string()),
+            r"\\server\share\patches\a.patch"
+        );
+    }
+
+    #[test]
     fn unique_patch_filename_disambiguates_sanitized_path_collisions() {
         let mut used = HashSet::new();
         let mut next_suffix_by_base = HashMap::new();
@@ -838,6 +987,63 @@ mod tests {
         assert_eq!(files[0]["path"], "a.txt");
         assert!(patches.join("a.txt.patch").exists());
         assert!(!patches.join("b.txt.patch").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn git_diff_ref_export_preserves_patch_output() {
+        if !git_available() {
+            eprintln!("Skipping GitDiff patch output test: git not found on PATH");
+            return;
+        }
+
+        let root = unique_test_dir("diff-patch-output");
+        let repo = create_two_commit_repo(&root);
+        let patches = root.join("patches");
+
+        let outcome = handle_git_diff(
+            None,
+            json!({
+                "working_dir": repo.to_string_lossy().to_string(),
+                "from_ref": "HEAD~1",
+                "to_ref": "HEAD",
+                "output_dir": patches.to_string_lossy().to_string(),
+                "paths": ["a.txt"]
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], false, "{:?}", outcome.0);
+
+        let exported_patch =
+            std::fs::read_to_string(patches.join("a.txt.patch")).expect("read exported patch");
+        let expected = Command::new(git_bin())
+            .args([
+                "--no-pager",
+                "-c",
+                "color.ui=false",
+                "-c",
+                "diff.external=",
+                "-c",
+                "core.fsmonitor=",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--end-of-options",
+                "HEAD~1..HEAD",
+                "--",
+                "a.txt",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git diff should start");
+        assert!(expected.status.success(), "expected git diff failed");
+        assert_eq!(
+            exported_patch,
+            String::from_utf8(expected.stdout).expect("git diff stdout should be utf-8")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

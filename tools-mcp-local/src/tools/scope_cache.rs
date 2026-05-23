@@ -6,7 +6,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime};
@@ -16,6 +16,7 @@ const DEFAULT_REPO_SCOPE_CACHE_MAX_FILES_TOTAL: usize = 200_000;
 const DEFAULT_REPO_SCOPE_CACHE_FULL_VALIDATE_INTERVAL: u64 = 32;
 const DEFAULT_DIR_CACHE_MAX_ENTRIES: usize = 64;
 const DEFAULT_OUTLINE_CACHE_MAX_ENTRIES: usize = 256;
+const IGNORE_HASH_BUFFER_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScopeFileType {
@@ -67,28 +68,26 @@ impl IgnoreFingerprint {
             return None;
         }
 
-        for entry in &self.entries {
-            match current
-                .entries
-                .iter()
-                .find(|current| current.path == entry.path)
-            {
-                Some(current) if current == entry => {}
-                Some(_) | None => return Some(entry.reason),
+        let mut expected = self.entries.iter().peekable();
+        let mut observed = current.entries.iter().peekable();
+        loop {
+            match (expected.peek(), observed.peek()) {
+                (Some(left), Some(right)) => match left.path.cmp(&right.path) {
+                    std::cmp::Ordering::Equal => {
+                        if left != right {
+                            return Some(left.reason);
+                        }
+                        expected.next();
+                        observed.next();
+                    }
+                    std::cmp::Ordering::Less => return Some(left.reason),
+                    std::cmp::Ordering::Greater => return Some(right.reason),
+                },
+                (Some(left), None) => return Some(left.reason),
+                (None, Some(right)) => return Some(right.reason),
+                (None, None) => return Some("ignore_rules_changed"),
             }
         }
-
-        current
-            .entries
-            .iter()
-            .find(|entry| {
-                !self
-                    .entries
-                    .iter()
-                    .any(|expected| expected.path == entry.path)
-            })
-            .map(|entry| entry.reason)
-            .or(Some("ignore_rules_changed"))
     }
 }
 
@@ -158,6 +157,7 @@ pub struct RepoScopeKey {
     pub hidden: bool,
     pub follow: bool,
     pub no_ignore: bool,
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,7 +247,7 @@ impl RepoScopeCache {
             current_snapshot
                 .directories
                 .iter()
-                .map(|entry| entry.path.clone()),
+                .map(|entry| entry.path.as_path()),
             key.no_ignore,
             current_snapshot.ignore_fingerprint.as_ref(),
             deadline,
@@ -401,13 +401,17 @@ impl RepoScopeCacheInner {
     }
 
     fn evict_to_capacity(&mut self, limits: RepoScopeCacheLimits) {
+        let mut total_cached_scope_entries = self.total_cached_scope_entries();
         while self.entries.len() > limits.max_entries
-            || self.total_cached_scope_entries() > limits.max_files_total
+            || total_cached_scope_entries > limits.max_files_total
         {
             let Some(oldest) = self.access_order.pop_front() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if let Some(removed) = self.entries.remove(&oldest) {
+                total_cached_scope_entries =
+                    total_cached_scope_entries.saturating_sub(removed.snapshot.entries.len());
+            }
         }
     }
 }
@@ -636,6 +640,7 @@ fn build_recursive_scope_snapshot(
     builder
         .hidden(!key.hidden)
         .follow_links(key.follow)
+        .max_depth(key.max_depth)
         .ignore(!key.no_ignore)
         .git_ignore(!key.no_ignore)
         .git_global(!key.no_ignore)
@@ -698,7 +703,7 @@ fn build_recursive_scope_snapshot(
         .collect::<Result<Vec<_>, ScopeCacheError>>()?;
     let ignore_fingerprint = build_ignore_fingerprint(
         &key.root,
-        directories.iter().map(|entry| entry.path.clone()),
+        directories.iter().map(|entry| entry.path.as_path()),
         key.no_ignore,
         deadline,
     )?;
@@ -773,7 +778,7 @@ fn directory_fingerprints_match(
     Ok(true)
 }
 
-pub fn ignore_fingerprint_change_reason<I>(
+pub fn ignore_fingerprint_change_reason<I, P>(
     root: &Path,
     directories: I,
     no_ignore: bool,
@@ -781,7 +786,8 @@ pub fn ignore_fingerprint_change_reason<I>(
     deadline: Instant,
 ) -> Result<Option<&'static str>, ScopeCacheError>
 where
-    I: IntoIterator<Item = PathBuf>,
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
 {
     let current = build_ignore_fingerprint(root, directories, no_ignore, deadline)?;
     Ok(match (expected, current.as_ref()) {
@@ -791,14 +797,15 @@ where
     })
 }
 
-pub fn build_ignore_fingerprint<I>(
+pub fn build_ignore_fingerprint<I, P>(
     root: &Path,
     directories: I,
     no_ignore: bool,
     deadline: Instant,
 ) -> Result<Option<IgnoreFingerprint>, ScopeCacheError>
 where
-    I: IntoIterator<Item = PathBuf>,
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
 {
     if no_ignore {
         return Ok(None);
@@ -807,6 +814,7 @@ where
     let mut controls = BTreeMap::<PathBuf, &'static str>::new();
     for directory in directories {
         check_deadline(deadline)?;
+        let directory = directory.as_ref();
         controls
             .entry(directory.join(".ignore"))
             .or_insert("ignore_file_changed");
@@ -852,11 +860,12 @@ fn ignore_control_stamp(
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => {
             check_deadline(deadline)?;
-            let content = fs::read(path)?;
+            let mut file = fs::File::open(path)?;
+            let content_hash = content_hash_from_reader(&mut file, metadata.len(), deadline)?;
             check_deadline(deadline)?;
             Ok(Some(IgnoreControlStamp {
                 metadata: metadata_stamp_from_metadata(&metadata),
-                content_hash: content_hash(&content),
+                content_hash,
             }))
         }
         Ok(_) => Ok(None),
@@ -865,10 +874,23 @@ fn ignore_control_stamp(
     }
 }
 
-fn content_hash(content: &[u8]) -> u64 {
+fn content_hash_from_reader<R: Read>(
+    reader: &mut R,
+    len: u64,
+    deadline: Instant,
+) -> Result<u64, ScopeCacheError> {
     let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
+    len.hash(&mut hasher);
+    let mut buffer = [0_u8; IGNORE_HASH_BUFFER_BYTES];
+    loop {
+        check_deadline(deadline)?;
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.write(&buffer[..read]);
+    }
+    Ok(hasher.finish())
 }
 
 fn recursive_scope_snapshot_matches(
@@ -1047,6 +1069,7 @@ mod tests {
             hidden: false,
             follow: false,
             no_ignore: false,
+            max_depth: None,
         }
     }
 
@@ -1102,6 +1125,108 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(first.entries, second.entries);
         assert_ne!(first.ignore_fingerprint, second.ignore_fingerprint);
+    }
+
+    #[test]
+    fn repo_scope_snapshot_preserves_hidden_and_ignore_flags() {
+        let dir = TestDir::new("repo-snapshot-hidden-ignore");
+        write_file(&dir.path().join("visible.txt"), "visible");
+        write_file(&dir.path().join(".hidden.txt"), "hidden");
+        write_file(&dir.path().join("ignored.txt"), "ignored");
+        write_file(&dir.path().join(".gitignore"), "ignored.txt\n");
+
+        let cache = RepoScopeCache::new(RepoScopeCacheLimits {
+            max_entries: 8,
+            max_files_total: 1_000,
+            full_validate_interval: 32,
+        });
+
+        let default_snapshot = cache
+            .get_or_build(&repo_key(dir.path()), deadline())
+            .expect("default snapshot");
+        let default_paths = default_snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.rendered_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(default_paths.contains(&"visible.txt"));
+        assert!(!default_paths.contains(&".hidden.txt"));
+        assert!(!default_paths.contains(&"ignored.txt"));
+
+        let mut hidden_key = repo_key(dir.path());
+        hidden_key.hidden = true;
+        let hidden_snapshot = cache
+            .get_or_build(&hidden_key, deadline())
+            .expect("hidden snapshot");
+        let hidden_paths = hidden_snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.rendered_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(hidden_paths.contains(&".hidden.txt"));
+        assert!(!hidden_paths.contains(&"ignored.txt"));
+
+        let mut no_ignore_key = repo_key(dir.path());
+        no_ignore_key.no_ignore = true;
+        let no_ignore_snapshot = cache
+            .get_or_build(&no_ignore_key, deadline())
+            .expect("no-ignore snapshot");
+        let no_ignore_paths = no_ignore_snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.rendered_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(no_ignore_paths.contains(&"ignored.txt"));
+        assert!(!no_ignore_paths.contains(&".hidden.txt"));
+    }
+
+    #[test]
+    fn repo_scope_snapshot_respects_max_depth() {
+        let dir = TestDir::new("repo-snapshot-max-depth");
+        write_file(&dir.path().join("root.txt"), "root");
+        fs::create_dir_all(dir.path().join("nested")).expect("create nested");
+        write_file(&dir.path().join("nested").join("child.txt"), "child");
+
+        let cache = RepoScopeCache::new(RepoScopeCacheLimits {
+            max_entries: 8,
+            max_files_total: 1_000,
+            full_validate_interval: 32,
+        });
+        let key = RepoScopeKey {
+            root: dir.path().to_path_buf(),
+            hidden: false,
+            follow: false,
+            no_ignore: false,
+            max_depth: Some(1),
+        };
+
+        let snapshot = cache
+            .get_or_build(&key, deadline())
+            .expect("bounded snapshot");
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.rendered_path == "root.txt"),
+            "direct child file should be included: {:?}",
+            snapshot.entries
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.rendered_path == "nested"),
+            "direct child directory should be included: {:?}",
+            snapshot.entries
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| !entry.rendered_path.contains("child.txt")),
+            "grandchild file must stay outside max_depth=1 snapshot: {:?}",
+            snapshot.entries
+        );
     }
 
     #[test]

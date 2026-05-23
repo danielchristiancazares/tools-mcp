@@ -3903,7 +3903,7 @@ fn check_ignore_fingerprint(
             .scope_fingerprint
             .directories
             .iter()
-            .map(|entry| entry.path.clone()),
+            .map(|entry| entry.path.as_path()),
         req.no_ignore(),
         expected,
         deadline,
@@ -5556,6 +5556,7 @@ fn index_cache_limits() -> IndexCacheLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -5571,11 +5572,30 @@ mod tests {
     type DedupeProbe = Arc<(Mutex<DedupeProbeState>, Condvar)>;
 
     static INDEX_BUILD_HOOK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static FORCE_FULL_SCOPE_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     struct IndexBuildHookGuard {
         _lock: MutexGuard<'static, ()>,
         previous_build: Option<Arc<IndexBuildTestHook>>,
         previous_wait: Option<Arc<IndexBuildWaitTestHook>>,
+    }
+
+    struct ForceFullScopeEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for ForceFullScopeEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
+                },
+            }
+        }
     }
 
     impl Drop for IndexBuildHookGuard {
@@ -5597,6 +5617,26 @@ mod tests {
             _lock: lock,
             previous_build: replace_index_build_test_hook(build_hook),
             previous_wait: replace_index_build_wait_test_hook(wait_hook),
+        }
+    }
+
+    fn force_full_scope_env(value: Option<&str>) -> ForceFullScopeEnvGuard {
+        let lock = FORCE_FULL_SCOPE_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
+            },
+        }
+        ForceFullScopeEnvGuard {
+            _lock: lock,
+            previous,
         }
     }
 
@@ -7745,6 +7785,7 @@ mod tests {
 
     #[test]
     fn stable_ignore_rules_allow_targeted_default_ignore_validation() {
+        let _env_guard = force_full_scope_env(None);
         let root = workspace_test_dir("stable_ignore_rules_allow_targeted_default_ignore");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test dir");
@@ -7776,6 +7817,7 @@ mod tests {
 
     #[test]
     fn mutated_gitignore_contents_trigger_ignore_full_scope_validation() {
+        let _env_guard = force_full_scope_env(None);
         let root = workspace_test_dir("mutated_gitignore_contents_trigger_full_scope");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test dir");
@@ -7809,13 +7851,7 @@ mod tests {
 
     #[test]
     fn force_full_scope_on_ignore_env_restores_conservative_validation() {
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let previous = std::env::var_os("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
-        unsafe {
-            std::env::set_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", "1");
-        }
+        let _env_guard = force_full_scope_env(Some("1"));
 
         let root = workspace_test_dir("force_full_scope_on_ignore_env");
         let _ = fs::remove_dir_all(&root);
@@ -7845,14 +7881,6 @@ mod tests {
             Some("ignore_rules_forced_full_scope")
         );
 
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE");
-            },
-        }
         let _ = fs::remove_dir_all(&root);
     }
 

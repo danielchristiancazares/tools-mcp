@@ -286,7 +286,7 @@ impl FileSelector {
             .unwrap_or(&self.root);
         let ignore_fingerprint = build_ignore_fingerprint(
             fingerprint_root,
-            directories.iter().cloned(),
+            directories.iter().map(|path| path.as_path()),
             self.no_ignore,
             deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
         )
@@ -311,6 +311,7 @@ impl FileSelector {
             hidden: self.include_hidden,
             follow: self.follow_links,
             no_ignore: self.no_ignore,
+            max_depth: None,
         };
         let effective_deadline =
             deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
@@ -1010,6 +1011,7 @@ mod tests {
             hidden: true,
             follow: false,
             no_ignore: true,
+            max_depth: None,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let cache = repo_scope_cache();

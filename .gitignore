@@ -3,6 +3,9 @@ target/
 **/*.rs.bk
 *.pdb
 
+# Local MCP-generated indexes and model/cache artifacts
+.tools-mcp/
+
 # Coverage output
 /coverage/
 /tmp/

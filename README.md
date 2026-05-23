@@ -29,12 +29,14 @@
 - **File Operations**: Read, write, edit, and delete files with newline-aware processing
 - **Git Integration**: Execute git commands and snapshots (status, diff, restore, add, commit, worktree summary)
 - **Code Search**: Fast in-memory search for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries with ugrep fallback for unsupported regex and search modes
-- **Code Structure Extraction**: Extract C++ class/method signatures using tree-sitter
+- **Semantic Code Search**: Build a local embedding index and query ranked code chunks with natural-language prompts
+- **Code Structure Extraction**: Extract source outlines and Markdown headings using tree-sitter where available
 
 ### Highlights
 
 - **WebFetch** - HTTP + optional headless-browser fetcher with caching, robots.txt enforcement, SSRF hardening, and token-aware Markdown chunking.
 - **Search** - Fast local search with an automatic in-memory path for eligible literal-looking, seeded-regex, fixed-string, and fuzzy fixed-string queries, plus ugrep fallback for unsupported regex and search modes.
+- **SemanticIndex / SemanticSearch** - Local embedding-backed code index and natural-language search over ranked code chunks.
 - **search_context** - Search plus merged, numbered file windows around each match.
 - **Read** - Raw file reader (optionally a line range) for quick inspection, with opt-in line numbers.
 - **Edit** - Simple snippet-based file editing. Finds `old_snippet` and replaces with `new_snippet`, preserving the file's original line endings (LF, CRLF, or CR).
@@ -60,6 +62,8 @@
 - Cargo in PATH (for running the MCP binary).
 - `ugrep` in PATH (required for `Search` unsupported regex, unsupported fuzzy modes, and fallback behavior).
 - Git in PATH (required for all `Git*` tools).
+- `protoc` in PATH, or `PROTOC` set to a `protoc` executable, to build LanceDB/Lance semantic-search dependencies.
+- Semantic search downloads and caches the local FastEmbed model on first index/search use; no external service is called for embeddings after the model is available locally.
 - **WebFetch browser support** (optional)
   - Chrome or Chromium installed and discoverable on PATH to enable headless rendering of JavaScript-heavy sites. Without it, WebFetch still works in HTTP-only mode.
 
@@ -86,6 +90,8 @@ When running under an MCP client, the server reads JSON-RPC messages from stdin 
 | Task | Tool |
 |------|------|
 | Find code by pattern/regex | Search |
+| Find code by natural-language meaning | SemanticSearch |
+| Build or refresh semantic code index | SemanticIndex |
 | Find code and inspect nearby lines | search_context |
 | Fetch web content | WebFetch |
 | Read file contents | Read |
@@ -140,6 +146,7 @@ tools-mcp-server/        # Binary crate: stdin/stdout loop, routing, composition
 tools-mcp-core/          # Shared MCP/runtime support and tool registry
 tools-mcp-webfetch/      # WebFetch tool and fetch pipeline
 tools-mcp-local/         # Read/Edit/Write/Delete/Glob/Search/Outline/Pwsh and smart_file_edit
+tools-mcp-semantic/      # SemanticIndex/SemanticSearch local embedding index
 tools-mcp-git/           # Git tool implementations
 ```
 
@@ -584,28 +591,23 @@ pub async fn handle_glob(id: Option<Value>, args: Value) -> ToolCallOutcome
 
 ---
 
-### outline.rs - C++ Structure Extraction
+### outline.rs - Source Structure Extraction
 
 **Location**: `tools-mcp-local/src/tools/outline.rs`
 
 ```rust
-/// Extracts C++ structure without implementation bodies
+/// Extracts source structure without implementation bodies where supported
 ///
-/// Uses tree-sitter for parsing (tree-sitter-cpp v0.23.4)
+/// Uses tree-sitter for supported programming languages and heading parsing for Markdown
 ///
 /// # Parameters
 /// - path: String (required) - C++ file path
-/// - include_private: bool (default: false) - Include private members
+/// - include_private: bool (default: false) - Include private C++ members
 ///
 /// # Extracted Elements
-/// - Preprocessor includes and conditionals
-/// - Namespace definitions
-/// - Class/struct specifiers with base classes
-/// - Enum specifiers (including enum class)
-/// - Type definitions and using declarations
-/// - Function declarations/signatures (without bodies)
-/// - Template declarations
-/// - Doc comments (/// and /** */)
+/// - C++ declarations, class/struct outlines, enums, templates, and doc comments
+/// - Rust, TypeScript, JavaScript, Python, and Go definitions captured by tree-sitter tags
+/// - Markdown headings
 ///
 /// # Access Control
 /// For classes: default private, for structs: default public
@@ -683,6 +685,48 @@ Fast local search that automatically uses the in-memory POC for common literal s
   - Resource limits are configurable with `TOOLS_SEARCH_INDEX_MAX_FILE_BYTES` (default 1 MiB), `TOOLS_SEARCH_INDEX_MAX_TOTAL_BYTES` (default 256 MiB per file-selection key), `TOOLS_SEARCH_INDEX_MAX_FILES` (default 50,000), `TOOLS_SEARCH_MAX_CANDIDATES` (default 20,000), `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS` (default 300,000), and the fuzzy verifier limits `TOOLS_SEARCH_MAX_FUZZY_PATTERN_CHARS` (default 512), `TOOLS_SEARCH_MAX_FUZZY_VERIFIED_LINES` (default 200,000), and `TOOLS_SEARCH_MAX_FUZZY_LINE_CHARS` (default 16,384). Existing `timeout_ms` and `max_results` still apply.
   - `TOOLS_SEARCH_FORCE_FULL_SCOPE_ON_IGNORE=1` is an internal safety valve for the in-memory backend. When set, default ignore-aware searches (`no_ignore=false`) use the previous conservative full-scope freshness validation instead of targeted freshness.
   - Limitations: this POC is not semantic search, does not provide ranking or embeddings, does not persist an on-disk index across server processes, does not require file-system watchers, does not accelerate `Read`, and is not a full ugrep replacement or final Hauberk design.
+
+### SemanticIndex
+
+Create or refresh a local semantic code-search index under `.tools-mcp/semantic-index` for the server working directory.
+
+- **Tool name**: `SemanticIndex`
+- **Optional**:
+  - `path` (string, default `"."`) - file or directory to index. The path must resolve under the server working directory.
+  - `force` (boolean, default `false`) - reindex files even when stored file hashes are current.
+  - `hidden` (boolean, default `false`) - include hidden files and directories.
+  - `no_ignore` (boolean, default `false`) - bypass ignore files such as `.gitignore`.
+  - `limit` (integer, minimum `1`, maximum `100000`, default `10000`) - maximum files to consider.
+  - `timeout_ms` (integer, minimum `1000`, maximum `1800000`, default `300000`) - indexing timeout in milliseconds.
+- **Behavior**:
+  - Uses FastEmbed with `jina-embeddings-v2-base-code` and stores vectors in LanceDB under the workspace-local `.tools-mcp/semantic-index` directory.
+  - Indexes supported code and text-like files up to 1 MiB each, skips generated/heavy directories such as `.git`, `.tools-mcp`, `target`, `node_modules`, `dist`, and `build`, and follows ignore files unless `no_ignore=true`.
+  - Keeps a manifest with file hashes so normal runs are incremental.
+- **Response**:
+  - `content[0].text` - human-readable indexing summary.
+  - Includes `indexed_files`, `indexed_chunks`, `skipped_files`, `deleted_chunks`, `model`, `store_path`, `duration_ms`, `incremental`, `truncated`, and `timed_out`.
+
+### SemanticSearch
+
+Search a local semantic code index with a natural-language query and return ranked code chunks.
+
+- **Tool name**: `SemanticSearch`
+- **Required**:
+  - `query` (string) - natural-language search query.
+- **Optional**:
+  - `path` (string, default `"."`) - indexed file or directory scope to search. The path must resolve under the server working directory.
+  - `limit` (integer, minimum `1`, maximum `100`, default `10`) - maximum ranked chunks to return.
+  - `language` (string) - optional language filter such as `rust`, `typescript`, `python`, `go`, or `markdown`.
+  - `threshold` (number) - optional maximum vector distance threshold; lower is more similar.
+  - `include_content` (boolean, default `true`) - include chunk content in structured results.
+  - `timeout_ms` (integer, minimum `1000`, maximum `300000`, default `60000`) - search timeout in milliseconds.
+- **Behavior**:
+  - Requires `SemanticIndex` to have created an index for the target workspace and model.
+  - Uses the same local FastEmbed model as indexing and filters results by workspace, path scope, and optional language.
+- **Response**:
+  - `content[0].text` - readable ranked result list with path, line range, distance score, and optional symbol.
+  - Includes `query`, `model`, `count`, `timed_out`, `index_status`, and `results`.
+  - Each result includes `chunk_id`, `path`, `language`, optional `symbol`, `start_line`, `end_line`, `score`, and optional `content`.
 
 ### search_context
 
@@ -1065,15 +1109,15 @@ List files matching a glob pattern.
 
 ### Outline
 
-Extract C++ structure.
+Extract a structural outline from supported source files.
 
 - **Tool name**: `Outline`
 - **Required**:
-  - `path` (string) - C++ file path
+  - `path` (string) - source file path. Supported extensions: `.cpp`, `.cxx`, `.cc`, `.h`, `.hpp`, `.hxx`, `.rs`, `.ts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx`, `.py`, `.pyi`, `.go`, `.md`, and `.markdown`.
 - **Optional**:
-  - `include_private` (boolean, default: false) - include private members
+  - `include_private` (boolean, default: false) - include private members for C++ files; ignored for other languages.
 - **Response**:
-  - `content[0].text` - extracted class/struct signatures and function declarations.
+  - `content[0].text` - extracted declarations, definitions, or headings.
   - `path` - the file path processed.
   - `bytes` - size of the source file.
   - `outline_bytes` - size of the extracted outline.
@@ -1220,6 +1264,7 @@ pub struct FetchChunk {
 | Cache | Path | Purpose |
 |-------|------|---------|
 | WebFetch content | System temp dir (`/tmp/tools-webfetch` on Unix, `%TEMP%\tools-webfetch` on Windows) | HTTP response cache |
+| Semantic index | `<workspace>/.tools-mcp/semantic-index` | FastEmbed model cache, manifest, and LanceDB vector store |
 
 ### MCP Client Configuration Example
 
@@ -1280,6 +1325,12 @@ All tool handlers validate:
 - File paths exist (for read operations)
 - File doesn't exist (for write operations)
 
+### Semantic Index Safety
+
+- `SemanticIndex` and `SemanticSearch` require target paths to canonicalize under the server working directory.
+- The semantic index is stored under `.tools-mcp/semantic-index`, which is ignored by Git and excluded from future semantic walks.
+- Embeddings are generated locally through FastEmbed. Model download can occur on first use, then the model is cached locally under the semantic index directory.
+
 ---
 
 ## Dependencies
@@ -1295,6 +1346,9 @@ All tool handlers validate:
 | reqwest | 0.12 | HTTP client (TLS, compression) |
 | tracing | 0.1 | Structured logging |
 | tracing-subscriber | 0.3 | Log subscriber with env filter |
+| arrow-array / arrow-schema | 58.3 | Arrow arrays and schemas for semantic vector storage |
+| fastembed | 5.13 | Local embedding model runtime for semantic search |
+| lancedb | 0.29 | Workspace-local vector store for semantic search |
 
 ### Web Fetching
 
@@ -1303,7 +1357,6 @@ All tool handlers validate:
 | base64 | 0.22 | Base64 encoding/decoding |
 | chromiumoxide | 0.7 | Headless Chrome via CDP |
 | htmd | 0.4 | HTML to Markdown conversion |
-| readability | 0.3 | Boilerplate removal |
 | scraper | 0.24 | HTML DOM parsing |
 | robotstxt | 0.3 | robots.txt parsing |
 | tiktoken-rs | 0.9 | OpenAI tokenizer |
@@ -1327,6 +1380,11 @@ All tool handlers validate:
 |-------|---------|---------|
 | tree-sitter | 0.26 | Incremental parsing |
 | tree-sitter-cpp | 0.23 | C++ grammar |
+| tree-sitter-go | 0.23 | Go grammar |
+| tree-sitter-javascript | 0.23 | JavaScript grammar |
+| tree-sitter-python | 0.23 | Python grammar |
+| tree-sitter-rust | 0.24 | Rust grammar |
+| tree-sitter-typescript | 0.23 | TypeScript and TSX grammar |
 
 ### Date/Time
 

@@ -906,9 +906,6 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         ));
     }
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut items: Vec<Value> = Vec::new();
-
     // Reuse the shared per-directory snapshot so repeat `ListDir` calls on the
     // same directory skip an async `read_dir` scan. The cache filters hidden
     // entries when `show_hidden = false`, mirroring the prior in-line filter.
@@ -935,6 +932,9 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             );
         }
     };
+
+    let mut lines: Vec<String> = Vec::with_capacity(snapshot.entries.len());
+    let mut items: Vec<Value> = Vec::with_capacity(snapshot.entries.len());
 
     for entry in &snapshot.entries {
         let name = entry.basename.clone();
@@ -985,14 +985,11 @@ async fn handle_listdir(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         }
     }
 
-    // Sort alphabetically
-    lines.sort();
-    items.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
+    if long_format {
+        // Preserve the existing long text ordering, which sorted the formatted
+        // listing lines rather than the structured entry names.
+        lines.sort();
+    }
 
     ToolCallOutcome::ok_text_with(
         lines.join("\n"),
@@ -1143,5 +1140,36 @@ mod list_dir_tests {
             visible_entries.iter().any(|n| n == "visible.txt"),
             "visible.txt must still appear when all=false: {visible_entries:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_listdir_returns_name_sorted_entries_and_text() {
+        let dir = ListDirTestDir::new("sorted-output");
+        std::fs::write(dir.path().join("zeta.txt"), "zeta").expect("write zeta");
+        std::fs::create_dir(dir.path().join("beta")).expect("create beta dir");
+        std::fs::write(dir.path().join("alpha.txt"), "alpha").expect("write alpha");
+
+        let resp = handle_listdir(
+            Some(json!(1)),
+            json!({ "path": dir.path().display().to_string() }),
+        )
+        .await
+        .0;
+        assert_eq!(resp["isError"], false, "expected success: {resp}");
+
+        let entries = resp["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .map(|v| v["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["alpha.txt", "beta", "zeta.txt"]);
+
+        let text = resp["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["alpha.txt", "beta/", "zeta.txt"]);
     }
 }

@@ -24,6 +24,7 @@
 //! The reader auto-detects the format based on whether input starts with `{`.
 
 use anyhow::{Context, Result};
+use memchr::memchr;
 use std::io::Write as _;
 use std::sync::OnceLock;
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -282,10 +283,7 @@ where
             return Ok(line_bytes);
         }
 
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
+        let take = memchr(b'\n', available).map_or(available.len(), |index| index + 1);
 
         if line_bytes.len().saturating_add(take) > MAX_MCP_MESSAGE_BYTES {
             return Err(McpReadError {

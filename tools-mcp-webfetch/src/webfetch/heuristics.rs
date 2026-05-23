@@ -94,11 +94,90 @@ pub fn analyze_js_heavy(
     content_type: Option<&str>,
     content_length: Option<usize>,
 ) -> JsHeuristicResult {
+    analyze_js_heavy_str(html_body, extracted_markdown, content_type, content_length)
+}
+
+/// Analyze HTML bytes and extracted content to determine if site is JS-heavy.
+///
+/// This avoids allocating a lossy UTF-8 `String` in the HTTP pipeline. All current
+/// heuristic patterns are ASCII, so byte scanning preserves the existing matching
+/// semantics while still tolerating invalid response bytes.
+pub fn analyze_js_heavy_bytes(
+    html_body: &[u8],
+    extracted_markdown: &str,
+    content_type: Option<&str>,
+    content_length: Option<usize>,
+) -> JsHeuristicResult {
+    match std::str::from_utf8(html_body) {
+        Ok(html_body) => {
+            analyze_js_heavy_str(html_body, extracted_markdown, content_type, content_length)
+        }
+        Err(_) => analyze_js_heavy_lossy_bytes(
+            html_body,
+            extracted_markdown,
+            content_type,
+            content_length,
+        ),
+    }
+}
+
+fn analyze_js_heavy_str(
+    html_body: &str,
+    extracted_markdown: &str,
+    content_type: Option<&str>,
+    content_length: Option<usize>,
+) -> JsHeuristicResult {
     let mut result = JsHeuristicResult::new();
 
     // Skip analysis for non-HTML content (case-insensitive check)
     if let Some(ct) = content_type
-        && !ct.to_ascii_lowercase().contains("html")
+        && !contains_ignore_ascii_case(ct.as_bytes(), b"html")
+    {
+        return result;
+    }
+
+    // Heuristic 1: Empty or minimal body with SPA root divs
+    if check_empty_spa_shell_str(html_body, extracted_markdown, &mut result) {
+        result.add_indicator(0.5, "Empty SPA shell detected".to_string());
+    }
+
+    // Heuristic 2: High script tag density
+    if check_script_density_str(html_body, &mut result) {
+        result.add_indicator(0.25, "High script tag density".to_string());
+    }
+
+    // Heuristic 3: Framework signatures in HTML
+    if check_framework_signatures_str(html_body, &mut result) {
+        result.add_indicator(0.3, "Framework signatures detected".to_string());
+    }
+
+    // Heuristic 4: Content-Type and size hints
+    if check_header_hints(content_length, &mut result) {
+        result.add_indicator(0.15, "Small HTML payload detected".to_string());
+    }
+
+    // Heuristic 5: Explicit JavaScript requirement warnings
+    if check_noscript_warnings(html_body.as_bytes(), &mut result) {
+        result.add_indicator(0.5, "Explicit JS requirement detected".to_string());
+    }
+
+    // Threshold: 0.5 = 50% confidence
+    result.finalize(0.5);
+
+    result
+}
+
+fn analyze_js_heavy_lossy_bytes(
+    html_body: &[u8],
+    extracted_markdown: &str,
+    content_type: Option<&str>,
+    content_length: Option<usize>,
+) -> JsHeuristicResult {
+    let mut result = JsHeuristicResult::new();
+
+    // Skip analysis for non-HTML content (case-insensitive check)
+    if let Some(ct) = content_type
+        && !contains_ignore_ascii_case(ct.as_bytes(), b"html")
     {
         return result;
     }
@@ -135,7 +214,7 @@ pub fn analyze_js_heavy(
 }
 
 /// Heuristic 1: Check for empty body with SPA mount point divs
-fn check_empty_spa_shell(
+fn check_empty_spa_shell_str(
     html_body: &str,
     extracted_markdown: &str,
     result: &mut JsHeuristicResult,
@@ -181,8 +260,54 @@ fn check_empty_spa_shell(
     false
 }
 
+fn check_empty_spa_shell(
+    html_body: &[u8],
+    extracted_markdown: &str,
+    result: &mut JsHeuristicResult,
+) -> bool {
+    // Check if extracted content is minimal
+    let content_is_minimal = extracted_markdown.trim().len() < MIN_CONTENT_CHARS;
+
+    if !content_is_minimal {
+        return false;
+    }
+
+    // Check for common SPA root element patterns
+    let spa_patterns: [&[u8]; 7] = [
+        br#"<div id="root""#,
+        br#"<div id="app""#,
+        br#"<div id="__next""#,
+        br#"<div id="root-container""#,
+        br#"<div id="app-root""#,
+        br#"<div class="app""#,
+        br"<div data-reactroot",
+    ];
+
+    for pattern in &spa_patterns {
+        if contains_bytes(html_body, pattern) {
+            return true;
+        }
+    }
+
+    // Check content-to-HTML ratio
+    #[allow(clippy::cast_precision_loss)]
+    let html_len = html_body.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let content_len = extracted_markdown.len() as f64;
+
+    if html_len > 0.0 {
+        let ratio = content_len / html_len;
+        if ratio < MIN_CONTENT_RATIO {
+            result.add_indicator(0.2, format!("Low content ratio: {:.2}%", ratio * 100.0));
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Heuristic 2: Check for high script tag density or bundle patterns
-fn check_script_density(html_body: &str, _result: &mut JsHeuristicResult) -> bool {
+fn check_script_density_str(html_body: &str, _result: &mut JsHeuristicResult) -> bool {
     // Count external script tags without building a full DOM.
     let script_count = count_external_script_tags(html_body.as_bytes(), MAX_SCRIPT_TAGS + 1);
     if script_count > MAX_SCRIPT_TAGS {
@@ -201,7 +326,34 @@ fn check_script_density(html_body: &str, _result: &mut JsHeuristicResult) -> boo
     ];
 
     for pattern in &bundle_patterns {
-        if html_body.matches(pattern).count() >= 2 {
+        if html_body.matches(pattern).take(2).count() >= 2 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn check_script_density(html_body: &[u8], _result: &mut JsHeuristicResult) -> bool {
+    // Count external script tags without building a full DOM.
+    let script_count = count_external_script_tags(html_body, MAX_SCRIPT_TAGS + 1);
+    if script_count > MAX_SCRIPT_TAGS {
+        return true;
+    }
+
+    // Check for common bundle naming patterns
+    let bundle_patterns: [&[u8]; 7] = [
+        b"chunk.js",
+        b"bundle.js",
+        b"vendor.js",
+        b"app.js",
+        b"main.js",
+        b".chunk.",
+        b".bundle.",
+    ];
+
+    for pattern in &bundle_patterns {
+        if count_substring(html_body, pattern, 2) >= 2 {
             return true;
         }
     }
@@ -337,8 +489,47 @@ fn starts_with_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
         .all(|(&a, &b)| a.eq_ignore_ascii_case(&b))
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn count_substring(haystack: &[u8], needle: &[u8], limit: usize) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            count += 1;
+            if count >= limit {
+                return count;
+            }
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 /// Heuristic 3: Check for framework-specific attributes and patterns
-fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -> bool {
+fn check_framework_signatures_str(html_body: &str, result: &mut JsHeuristicResult) -> bool {
     let mut found_frameworks = Vec::new();
 
     // React signatures
@@ -385,6 +576,56 @@ fn check_framework_signatures(html_body: &str, result: &mut JsHeuristicResult) -
     }
 }
 
+fn check_framework_signatures(html_body: &[u8], result: &mut JsHeuristicResult) -> bool {
+    let mut found_frameworks = Vec::new();
+
+    // React signatures
+    let react_patterns: [&[u8]; 4] = [
+        b"data-reactroot",
+        b"data-reactid",
+        b"__reactContainer",
+        b"__REACT",
+    ];
+    if react_patterns.iter().any(|p| contains_bytes(html_body, p)) {
+        found_frameworks.push("React");
+    }
+
+    // Vue signatures
+    let vue_patterns: [&[u8]; 4] = [b"data-v-", b"v-cloak", b"__vue", b"__VUE__"];
+    if vue_patterns.iter().any(|p| contains_bytes(html_body, p)) {
+        found_frameworks.push("Vue");
+    }
+
+    // Angular signatures
+    let angular_patterns: [&[u8]; 4] = [b"ng-app", b"ng-version", b"ng-binding", b"[ng-"];
+    if angular_patterns
+        .iter()
+        .any(|p| contains_bytes(html_body, p))
+    {
+        found_frameworks.push("Angular");
+    }
+
+    // Next.js signatures
+    if contains_bytes(html_body, b"__NEXT_DATA__") || contains_bytes(html_body, b"_next/static") {
+        found_frameworks.push("Next.js");
+    }
+
+    // Svelte signatures
+    if contains_bytes(html_body, b"svelte-") || contains_bytes(html_body, b"__SVELTE__") {
+        found_frameworks.push("Svelte");
+    }
+
+    if found_frameworks.is_empty() {
+        false
+    } else {
+        result.add_indicator(
+            0.1,
+            format!("Framework detected: {}", found_frameworks.join(", ")),
+        );
+        true
+    }
+}
+
 /// Heuristic 4: Check HTTP headers and content size hints
 fn check_header_hints(content_length: Option<usize>, _result: &mut JsHeuristicResult) -> bool {
     // Small HTML payload (< 5KB) often indicates a shell page
@@ -398,18 +639,18 @@ fn check_header_hints(content_length: Option<usize>, _result: &mut JsHeuristicRe
 }
 
 /// Heuristic 5: Check for explicit noscript warnings
-fn check_noscript_warnings(html_body: &str, _result: &mut JsHeuristicResult) -> bool {
+fn check_noscript_warnings(html_body: &[u8], _result: &mut JsHeuristicResult) -> bool {
     // Quick scan for <noscript>...</noscript> content without a DOM parse.
-    let warning_phrases = [
-        "enable javascript",
-        "requires javascript",
-        "javascript is required",
-        "turn on javascript",
-        "javascript disabled",
-        "needs javascript",
+    let warning_phrases: [&[u8]; 6] = [
+        b"enable javascript",
+        b"requires javascript",
+        b"javascript is required",
+        b"turn on javascript",
+        b"javascript disabled",
+        b"needs javascript",
     ];
 
-    let bytes = html_body.as_bytes();
+    let bytes = html_body;
     let mut i = 0usize;
     while let Some(open_start) = find_open_tag(bytes, i, b"noscript") {
         let Some(open_end) = find_byte(bytes, b'>', open_start + 1) else {
@@ -420,8 +661,10 @@ fn check_noscript_warnings(html_body: &str, _result: &mut JsHeuristicResult) -> 
             break;
         };
         let content = &bytes[content_start..close_start];
-        let text = String::from_utf8_lossy(content).to_lowercase();
-        if warning_phrases.iter().any(|phrase| text.contains(phrase)) {
+        if warning_phrases
+            .iter()
+            .any(|phrase| contains_ignore_ascii_case(content, phrase))
+        {
             return true;
         }
 
@@ -560,5 +803,62 @@ mod tests {
             result.is_js_heavy,
             "XHTML responses are HTML-like and should still trigger JS-heavy fallback"
         );
+    }
+
+    #[test]
+    fn byte_analysis_matches_string_analysis_for_current_heuristics() {
+        let html = br#"
+            <html>
+            <body>
+                <noscript>You need to ENABLE JavaScript to run this app.</noscript>
+                <div data-reactroot=""></div>
+                <script src="vendor.js"></script>
+                <script src="main.chunk.js"></script>
+                <script src="runtime.bundle.js"></script>
+                <script src="app.chunk.js"></script>
+                <script src="polyfills.js"></script>
+                <script src="utils.js"></script>
+            </body>
+            </html>
+        "#;
+        let lossy_html = String::from_utf8_lossy(html);
+
+        let string_result = analyze_js_heavy(
+            &lossy_html,
+            "",
+            Some("Text/HTML; charset=utf-8"),
+            Some(html.len()),
+        );
+        let byte_result =
+            analyze_js_heavy_bytes(html, "", Some("Text/HTML; charset=utf-8"), Some(html.len()));
+
+        assert_eq!(byte_result.is_js_heavy, string_result.is_js_heavy);
+        assert_eq!(byte_result.confidence, string_result.confidence);
+        assert_eq!(byte_result.reasons, string_result.reasons);
+    }
+
+    #[test]
+    fn byte_analysis_skips_non_html_content_type() {
+        let result = analyze_js_heavy_bytes(
+            br#"<noscript>You need to enable JavaScript.</noscript><div id="root"></div>"#,
+            "",
+            Some("application/json"),
+            None,
+        );
+
+        assert!(!result.is_js_heavy);
+        assert_eq!(result.confidence, 0.0);
+        assert!(result.reasons.is_empty());
+    }
+
+    #[test]
+    fn byte_analysis_handles_invalid_utf8_html() {
+        let html = b"<html><body><noscript>You need to enable JavaScript.</noscript><div id=\"root\">\xff</div></body></html>";
+
+        let result = analyze_js_heavy_bytes(html, "", Some("text/html"), Some(html.len()));
+
+        assert!(result.is_js_heavy);
+        assert!(result.reasons.iter().any(|r| r.contains("Empty SPA")));
+        assert!(result.reasons.iter().any(|r| r.contains("JS requirement")));
     }
 }

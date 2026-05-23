@@ -65,7 +65,7 @@ Tool responses follow the MCP content format with a `content` array of text/json
 ## Cursor Cloud specific instructions
 
 ### System dependencies
-The VM needs **Rust stable ≥ 1.94** (edition 2024), **libssl-dev**, and **ugrep**. Chrome or Chromium is optional for WebFetch browser rendering; without it, WebFetch runs in HTTP-only mode. The update script handles `cargo build --workspace --release`; system packages are pre-installed in the snapshot.
+The VM needs **Rust stable ≥ 1.94** (edition 2024), **libssl-dev**, **ugrep**, and **protoc** (or `PROTOC` pointing at a protobuf compiler) for LanceDB/Lance semantic-search dependencies. Chrome or Chromium is optional for WebFetch browser rendering; without it, WebFetch runs in HTTP-only mode. The update script handles `cargo build --workspace --release`; system packages are pre-installed in the snapshot.
 
 ### Running the MCP server
 The server is a stdin/stdout binary — pipe JSON-RPC messages into it. Use `MCP_SKIP_HEADERS=true` for raw JSON (no Content-Length framing). Example:

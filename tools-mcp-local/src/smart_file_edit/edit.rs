@@ -2,8 +2,10 @@
 //! corresponding bytes with the file's dominant line ending applied to the replacement.
 
 use anyhow::{Context, Result, anyhow};
+use memchr::{memchr, memchr_iter};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 
@@ -80,13 +82,13 @@ pub(super) fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<S
     let maybe_offset = compute_match_range(
         &model.canonical,
         req.match_hint.as_ref(),
-        old_snippet.as_str(),
+        old_snippet.as_ref(),
     )?;
 
     let Some(canonical_start) = maybe_offset else {
         return Ok(SnippetResult {
             status: SnippetStatusKind::NoMatch,
-            payload: no_match_payload(&model, old_snippet.as_str(), req.match_hint.as_ref()),
+            payload: no_match_payload(&model, old_snippet.as_ref(), req.match_hint.as_ref()),
         });
     };
 
@@ -105,19 +107,19 @@ pub(super) fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<S
         .text
         .get(canonical_start..canonical_end)
         .unwrap_or_default();
-    if old_slice != old_snippet {
+    if old_slice != old_snippet.as_ref() {
         return Err(anyhow!(
             "internal invariant violated: canonical slice mismatch"
         ));
     }
 
     let default_newline = model.newline_stats.default_kind();
-    let replacement = build_replacement_bytes(&new_snippet, default_newline);
+    let replacement_len = replacement_byte_len(new_snippet.as_ref(), default_newline);
 
     let mut updated =
-        Vec::with_capacity(model.bytes.len() - (byte_end - byte_start) + replacement.len());
+        Vec::with_capacity(model.bytes.len() - (byte_end - byte_start) + replacement_len);
     updated.extend_from_slice(&model.bytes[..byte_start]);
-    updated.extend_from_slice(&replacement);
+    append_replacement_bytes(&mut updated, new_snippet.as_ref(), default_newline);
     updated.extend_from_slice(&model.bytes[byte_end..]);
 
     fs::write(&path, &updated)
@@ -140,7 +142,7 @@ pub(super) fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<S
             "status": "ok",
             "replaced_byte_range": [byte_start, byte_end],
             "lines": { "start": start_line, "end": end_line },
-            "bytes_written": replacement.len(),
+            "bytes_written": replacement_len,
             "file_hash_before": model.hash,
             "file_hash_after": new_hash,
             "newline_kind": default_newline.label(),
@@ -150,27 +152,64 @@ pub(super) fn apply_snippet_edit_impl(req: &ApplySnippetEditRequest) -> Result<S
 }
 
 /// Converts CRLF/CR newlines to LF.
-fn normalize_newlines_to_lf(input: &str) -> String {
-    input.replace("\r\n", "\n").replace('\r', "\n")
+fn normalize_newlines_to_lf(input: &str) -> Cow<'_, str> {
+    if memchr(b'\r', input.as_bytes()).is_none() {
+        return Cow::Borrowed(input);
+    }
+
+    let mut normalized = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut scan_start = 0usize;
+    let mut copy_start = 0usize;
+
+    while let Some(relative) = memchr(b'\r', &bytes[scan_start..]) {
+        let cr = scan_start + relative;
+        normalized.push_str(&input[copy_start..cr]);
+        normalized.push('\n');
+
+        scan_start = cr + 1;
+        if scan_start < bytes.len() && bytes[scan_start] == b'\n' {
+            scan_start += 1;
+        }
+        copy_start = scan_start;
+    }
+
+    normalized.push_str(&input[copy_start..]);
+    Cow::Owned(normalized)
 }
 
 /// Converts a canonical LF-based snippet to bytes with the target newline style.
+#[cfg(test)]
 fn build_replacement_bytes(new_snippet: &str, newline: NewlineKind) -> Vec<u8> {
-    let newline_bytes = newline.as_bytes();
-    let parts: Vec<&str> = new_snippet.split('\n').collect();
-    if parts.is_empty() {
-        return Vec::new();
-    }
+    let mut out = Vec::with_capacity(replacement_byte_len(new_snippet, newline));
+    append_replacement_bytes(&mut out, new_snippet, newline);
+    out
+}
 
-    let mut out = Vec::new();
-    for (idx, part) in parts.iter().enumerate() {
-        out.extend_from_slice(part.as_bytes());
-        let is_last = idx + 1 == parts.len();
-        if !is_last {
-            out.extend_from_slice(newline_bytes);
+fn replacement_byte_len(new_snippet: &str, newline: NewlineKind) -> usize {
+    match newline {
+        NewlineKind::CrLf => new_snippet.len() + memchr_iter(b'\n', new_snippet.as_bytes()).count(),
+        NewlineKind::Lf | NewlineKind::Cr | NewlineKind::None => new_snippet.len(),
+    }
+}
+
+fn append_replacement_bytes(out: &mut Vec<u8>, new_snippet: &str, newline: NewlineKind) {
+    match newline {
+        NewlineKind::Lf | NewlineKind::None => {
+            out.extend_from_slice(new_snippet.as_bytes());
+        }
+        NewlineKind::CrLf | NewlineKind::Cr => {
+            let newline_bytes = newline.as_bytes();
+            let bytes = new_snippet.as_bytes();
+            let mut copy_start = 0usize;
+            for newline_idx in memchr_iter(b'\n', bytes) {
+                out.extend_from_slice(&bytes[copy_start..newline_idx]);
+                out.extend_from_slice(newline_bytes);
+                copy_start = newline_idx + 1;
+            }
+            out.extend_from_slice(&bytes[copy_start..]);
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -210,7 +249,17 @@ mod tests {
 
     #[test]
     fn normalize_newlines_to_lf_handles_crlf_and_cr() {
-        assert_eq!(normalize_newlines_to_lf("a\r\nb\rc\n"), "a\nb\nc\n");
+        assert_eq!(
+            normalize_newlines_to_lf("a\r\nb\rc\n").as_ref(),
+            "a\nb\nc\n"
+        );
+    }
+
+    #[test]
+    fn normalize_newlines_to_lf_borrows_lf_only_input() {
+        let normalized = normalize_newlines_to_lf("a\nb\n");
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+        assert_eq!(normalized.as_ref(), "a\nb\n");
     }
 
     #[test]
@@ -261,6 +310,30 @@ mod tests {
 
         let out = std::fs::read(&path).expect("read");
         assert_eq!(out, b"one\r\nTWO\r\nTHREE\r\n");
+    }
+
+    #[test]
+    fn apply_snippet_edit_preserves_utf8_byte_offsets() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("utf8.txt");
+        std::fs::write(&path, "alpha\nnaïve café\nomega\n").expect("write");
+
+        let req = ApplySnippetEditRequest {
+            path: path.to_string_lossy().to_string(),
+            old_snippet: "naïve café".to_string(),
+            new_snippet: "jalapeño crème".to_string(),
+            match_hint: None,
+            file_hash: None,
+            region_id: None,
+        };
+
+        let payload = handle_apply_snippet_edit(&req).expect("apply");
+        assert_eq!(payload["status"].as_str(), Some("ok"));
+
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(out, "alpha\njalapeño crème\nomega\n");
     }
 
     #[test]

@@ -203,13 +203,20 @@ pub(crate) async fn run_fetch(req: FetchRequest) -> Result<FetchResponse> {
     let rendering_method = if req.force_browser {
         "http"
     } else {
-        let html_str = String::from_utf8_lossy(&body);
-        let analysis = heuristics::analyze_js_heavy(
-            &html_str,
-            &extracted.markdown,
-            content_type.as_deref(),
-            Some(body.len()),
-        );
+        let analysis = match std::str::from_utf8(&body) {
+            Ok(html) => heuristics::analyze_js_heavy(
+                html,
+                &extracted.markdown,
+                content_type.as_deref(),
+                Some(body.len()),
+            ),
+            Err(_) => heuristics::analyze_js_heavy_bytes(
+                &body,
+                &extracted.markdown,
+                content_type.as_deref(),
+                Some(body.len()),
+            ),
+        };
 
         if analysis.is_js_heavy {
             info!(

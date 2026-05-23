@@ -28,10 +28,8 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         Err(err) => return ToolCallOutcome::err(err.to_string()),
     };
 
-    // Create parent directories if needed
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
-        && !parent.exists()
         && let Err(err) = tokio::fs::create_dir_all(parent).await
     {
         return ToolCallOutcome::err(format!(
@@ -64,12 +62,14 @@ async fn handle_write(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         return ToolCallOutcome::err(format!("failed to write {}: {err}", path.display()));
     }
 
+    if let Err(err) = file.flush().await {
+        return ToolCallOutcome::err(format!("failed to flush {}: {err}", path.display()));
+    }
+
+    let path_display = path.display().to_string();
     ToolCallOutcome::ok_text_with(
-        format!("Created {} ({} bytes)", path.display(), bytes.len()),
-        [
-            ("path", json!(path.display().to_string())),
-            ("bytes", json!(bytes.len())),
-        ],
+        format!("Created {path_display} ({} bytes)", bytes.len()),
+        [("path", json!(path_display)), ("bytes", json!(bytes.len()))],
     )
 }
 
@@ -116,6 +116,32 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&path).await.expect("read file"),
             "created"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_existing_files_without_overwriting() {
+        let dir = tempdir_in_workspace("write-existing-");
+        let path = dir.path().join("existing.txt");
+        tokio::fs::write(&path, "original")
+            .await
+            .expect("seed existing file");
+
+        let outcome = handle_write(
+            None,
+            json!({
+                "path": path.display().to_string(),
+                "content": "replacement"
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.0["isError"], true);
+        let msg = outcome.0["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("file already exists"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "original"
         );
     }
 }

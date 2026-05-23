@@ -79,7 +79,28 @@ const GIT_AUTHORITY_ENV_KEYS: &[&str] = &[
     "SSH_ASKPASS",
 ];
 
+const GIT_BASE_ARGS: &[&str] = &[
+    "--no-pager",
+    "-c",
+    "color.ui=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.fsmonitor=",
+];
+
 static GIT_CONFIG_SPOOFING_ENV_KEYS: OnceLock<Vec<OsString>> = OnceLock::new();
+
+pub(crate) fn build_git_args(subcommand_args: Vec<String>) -> Vec<String> {
+    let mut args: Vec<String> = Vec::with_capacity(GIT_BASE_ARGS.len() + subcommand_args.len());
+    args.extend(GIT_BASE_ARGS.iter().map(|arg| (*arg).to_owned()));
+    args.extend(subcommand_args);
+    args
+}
+
+pub(crate) fn trim_git_line_end(text: &str) -> &str {
+    text.trim_end_matches(['\r', '\n'])
+}
 
 /// Execute a Git command with timeout and output capture.
 ///
@@ -144,23 +165,10 @@ pub(crate) async fn run_git(
     let max_stdout_bytes = max_stdout_bytes.clamp(1, MAX_OUTPUT_BYTES);
     let max_stderr_bytes = max_stderr_bytes.clamp(1, MAX_OUTPUT_BYTES);
 
-    let git_bin = if cfg!(target_os = "windows") {
-        "git.exe".to_string()
-    } else {
-        "git".to_string()
-    };
+    let git_bin = git_bin();
 
     // Force deterministic, non-ANSI output and disable config-driven external helpers.
-    let mut args: Vec<String> = vec![
-        "--no-pager".into(),
-        "-c".into(),
-        "color.ui=false".into(),
-        "-c".into(),
-        "diff.external=".into(),
-        "-c".into(),
-        "core.fsmonitor=".into(),
-    ];
-    args.extend(subcommand_args);
+    let args = build_git_args(subcommand_args);
 
     debug!(
         git_bin = %git_bin,
@@ -170,7 +178,7 @@ pub(crate) async fn run_git(
         "running git command"
     );
 
-    let mut cmd = Command::new(&git_bin);
+    let mut cmd = Command::new(git_bin);
     cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
@@ -262,7 +270,7 @@ pub(crate) async fn run_git(
     }
 
     Ok(types::GitExecResult {
-        git_bin,
+        git_bin: git_bin.to_owned(),
         args,
         working_dir: effective_working_dir,
         exit_code,
@@ -273,6 +281,14 @@ pub(crate) async fn run_git(
         truncated_stderr,
         timed_out,
     })
+}
+
+fn git_bin() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "git.exe"
+    } else {
+        "git"
+    }
 }
 
 fn remove_git_authority_env(cmd: &mut Command) {
@@ -305,7 +321,9 @@ fn is_git_config_spoofing_env_key(key: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIT_AUTHORITY_ENV_KEYS, is_git_config_spoofing_env_key};
+    use super::{
+        GIT_AUTHORITY_ENV_KEYS, build_git_args, is_git_config_spoofing_env_key, trim_git_line_end,
+    };
     use std::ffi::OsStr;
 
     #[test]
@@ -348,5 +366,29 @@ mod tests {
             "GIT_CONFIG_GLOBAL"
         )));
         assert!(!is_git_config_spoofing_env_key(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn build_git_args_preserves_standard_safety_prefix() {
+        assert_eq!(
+            build_git_args(vec!["status".to_string(), "--porcelain=1".to_string()]),
+            vec![
+                "--no-pager",
+                "-c",
+                "color.ui=false",
+                "-c",
+                "diff.external=",
+                "-c",
+                "core.fsmonitor=",
+                "status",
+                "--porcelain=1"
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_git_line_end_removes_only_newline_suffixes() {
+        assert_eq!(trim_git_line_end("message\r\n\n"), "message");
+        assert_eq!(trim_git_line_end(" message "), " message ");
     }
 }

@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as FmtWrite;
 use std::hash::{Hash, Hasher};
@@ -11,7 +12,7 @@ use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator,
 
 use crate::tools::scope_cache::{OutlineKey, outline_ast_cache};
 
-type CachedTagsQuery = Result<Arc<Query>, String>;
+type CachedTagsQuery = Result<Query, String>;
 
 static RUST_TAGS_QUERY: OnceLock<CachedTagsQuery> = OnceLock::new();
 static TYPESCRIPT_TAGS_QUERY: OnceLock<CachedTagsQuery> = OnceLock::new();
@@ -19,6 +20,13 @@ static TSX_TAGS_QUERY: OnceLock<CachedTagsQuery> = OnceLock::new();
 static JAVASCRIPT_TAGS_QUERY: OnceLock<CachedTagsQuery> = OnceLock::new();
 static PYTHON_TAGS_QUERY: OnceLock<CachedTagsQuery> = OnceLock::new();
 static GO_TAGS_QUERY: OnceLock<CachedTagsQuery> = OnceLock::new();
+
+std::thread_local! {
+    static OUTLINE_PARSERS: RefCell<ParserCache> = RefCell::new(ParserCache::default());
+}
+
+const MAX_PREALLOCATED_OUTLINE_BYTES: usize = 64 * 1024;
+const CPP_INDENT: &str = "    ";
 
 const SUPPORTED_OUTLINE_EXTENSIONS: &[&str] = &[
     ".cpp",
@@ -55,6 +63,19 @@ enum OutlineLanguage {
 }
 
 impl OutlineLanguage {
+    fn tree_sitter_language(self) -> Option<Language> {
+        match self {
+            OutlineLanguage::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            OutlineLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            OutlineLanguage::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            OutlineLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            OutlineLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            OutlineLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
+            OutlineLanguage::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            OutlineLanguage::Markdown | OutlineLanguage::Unsupported => None,
+        }
+    }
+
     fn cache_language(self, include_private: bool) -> Option<String> {
         let base = match self {
             OutlineLanguage::Cpp => "cpp",
@@ -77,6 +98,38 @@ impl OutlineLanguage {
     }
 }
 
+#[derive(Default)]
+struct ParserCache {
+    cpp: Option<Parser>,
+    rust: Option<Parser>,
+    typescript: Option<Parser>,
+    tsx: Option<Parser>,
+    javascript: Option<Parser>,
+    python: Option<Parser>,
+    go: Option<Parser>,
+}
+
+impl ParserCache {
+    fn slot_mut(&mut self, language: OutlineLanguage) -> Option<&mut Option<Parser>> {
+        match language {
+            OutlineLanguage::Cpp => Some(&mut self.cpp),
+            OutlineLanguage::Rust => Some(&mut self.rust),
+            OutlineLanguage::TypeScript => Some(&mut self.typescript),
+            OutlineLanguage::Tsx => Some(&mut self.tsx),
+            OutlineLanguage::JavaScript => Some(&mut self.javascript),
+            OutlineLanguage::Python => Some(&mut self.python),
+            OutlineLanguage::Go => Some(&mut self.go),
+            OutlineLanguage::Markdown | OutlineLanguage::Unsupported => None,
+        }
+    }
+}
+
+struct TagsQuerySpec {
+    language: Language,
+    tags_query: &'static str,
+    query_cache: &'static OnceLock<CachedTagsQuery>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OutlineRequest {
@@ -96,9 +149,10 @@ async fn handle_outline(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 
 async fn outline_for_path(path_str: &str, include_private: bool) -> ToolCallOutcome {
     let path = Path::new(path_str);
-    if !path.exists() {
-        return ToolCallOutcome::err(format!("file not found: {}", path.display()));
-    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return ToolCallOutcome::err(format!("file not found: {}", path.display())),
+    };
 
     let extension = normalized_extension(path);
     let language = language_for_extension(extension.as_deref());
@@ -110,22 +164,17 @@ async fn outline_for_path(path_str: &str, include_private: bool) -> ToolCallOutc
         }
     };
 
-    // Build a cache key only for supported languages whose metadata we can read.
-    // Unsupported extensions and metadata failures both bypass the cache and let
-    // the existing code paths surface their original error messages verbatim.
-    let cache_key = match language.cache_language(include_private) {
-        Some(lang) => match std::fs::metadata(path) {
-            Ok(meta) => Some(OutlineKey {
-                path: path.to_path_buf(),
-                language: lang,
-                modified: meta.modified().ok(),
-                len: meta.len(),
-                content_hash: outline_content_hash(source.as_bytes()),
-            }),
-            Err(_) => None,
-        },
-        None => None,
-    };
+    // Build a cache key only for supported languages. Unsupported extensions
+    // bypass the cache and surface the existing render_outline error.
+    let cache_key = language
+        .cache_language(include_private)
+        .map(|lang| OutlineKey {
+            path: path.to_path_buf(),
+            language: lang,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            content_hash: outline_content_hash(source.as_bytes()),
+        });
 
     if let Some(ref key) = cache_key
         && let Some(rendered) = outline_ast_cache().get(key)
@@ -140,7 +189,13 @@ async fn outline_for_path(path_str: &str, include_private: bool) -> ToolCallOutc
         return ToolCallOutcome::ok(payload);
     }
 
-    let output = match render_outline(path, &source, include_private) {
+    let output = match render_outline_for_language(
+        path,
+        extension.as_deref(),
+        language,
+        &source,
+        include_private,
+    ) {
         Ok(output) => output,
         Err(outcome) => return outcome,
     };
@@ -167,6 +222,7 @@ fn outline_content_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+#[cfg(test)]
 fn render_outline(
     path: &Path,
     source: &str,
@@ -175,6 +231,22 @@ fn render_outline(
     let extension = normalized_extension(path);
     let language = language_for_extension(extension.as_deref());
 
+    render_outline_for_language(
+        path,
+        extension.as_deref(),
+        language,
+        source,
+        include_private,
+    )
+}
+
+fn render_outline_for_language(
+    path: &Path,
+    extension: Option<&str>,
+    language: OutlineLanguage,
+    source: &str,
+    include_private: bool,
+) -> Result<String, ToolCallOutcome> {
     match language {
         OutlineLanguage::Cpp => extract_cpp_outline(source, include_private),
         OutlineLanguage::Rust
@@ -215,22 +287,64 @@ fn language_for_extension(extension: Option<&str>) -> OutlineLanguage {
     }
 }
 
-fn parse_tree(source: &str, language: &Language) -> Result<Tree, ToolCallOutcome> {
+fn parse_tree(
+    source: &str,
+    outline_language: OutlineLanguage,
+    language: &Language,
+) -> Result<Tree, ToolCallOutcome> {
+    OUTLINE_PARSERS.with(|cache| {
+        if let Ok(mut cache) = cache.try_borrow_mut()
+            && let Some(slot) = cache.slot_mut(outline_language)
+        {
+            return parse_tree_with_cached_parser(source, language, slot);
+        }
+
+        parse_tree_with_new_parser(source, language)
+    })
+}
+
+fn parse_tree_with_cached_parser(
+    source: &str,
+    language: &Language,
+    parser_slot: &mut Option<Parser>,
+) -> Result<Tree, ToolCallOutcome> {
+    if parser_slot.is_none() {
+        let mut parser = Parser::new();
+        set_parser_language(&mut parser, language)?;
+        *parser_slot = Some(parser);
+    }
+
+    let parser = parser_slot.as_mut().expect("cached parser initialized");
+    parse_with_parser(parser, source)
+}
+
+fn parse_tree_with_new_parser(source: &str, language: &Language) -> Result<Tree, ToolCallOutcome> {
     let mut parser = Parser::new();
+    set_parser_language(&mut parser, language)?;
+    parse_with_parser(&mut parser, source)
+}
+
+fn set_parser_language(parser: &mut Parser, language: &Language) -> Result<(), ToolCallOutcome> {
     if let Err(e) = parser.set_language(language) {
         return Err(ToolCallOutcome::err(format!("failed to set language: {e}")));
     }
 
+    Ok(())
+}
+
+fn parse_with_parser(parser: &mut Parser, source: &str) -> Result<Tree, ToolCallOutcome> {
     parser
         .parse(source, None)
         .ok_or_else(|| ToolCallOutcome::err("failed to parse file"))
 }
 
 fn extract_cpp_outline(source: &str, include_private: bool) -> Result<String, ToolCallOutcome> {
-    let language = tree_sitter_cpp::LANGUAGE.into();
-    let tree = parse_tree(source, &language)?;
+    let language = OutlineLanguage::Cpp
+        .tree_sitter_language()
+        .expect("cpp tree-sitter language");
+    let tree = parse_tree(source, OutlineLanguage::Cpp, &language)?;
 
-    let mut output = String::new();
+    let mut output = String::with_capacity(outline_output_capacity(source));
     let mut ctx = OutlineContext {
         source,
         include_private,
@@ -245,62 +359,57 @@ fn extract_outline_with_tags_query(
     source: &str,
     outline_language: OutlineLanguage,
 ) -> Result<String, ToolCallOutcome> {
-    let (language, tags_query, query_cache) =
-        tags_query_spec(outline_language).expect("tags query language");
-    let tree = parse_tree(source, &language)?;
-    let query = cached_tags_query(query_cache, language, tags_query)?;
-    Ok(extract_outline_via_tags_query(&tree, source, &query))
+    let spec = tags_query_spec(outline_language).expect("tags query language");
+    let tree = parse_tree(source, outline_language, &spec.language)?;
+    let query = cached_tags_query(spec.query_cache, &spec.language, spec.tags_query)?;
+    Ok(extract_outline_via_tags_query(&tree, source, query))
 }
 
-fn tags_query_spec(
-    outline_language: OutlineLanguage,
-) -> Option<(Language, &'static str, &'static OnceLock<CachedTagsQuery>)> {
+fn tags_query_spec(outline_language: OutlineLanguage) -> Option<TagsQuerySpec> {
     match outline_language {
-        OutlineLanguage::Rust => Some((
-            tree_sitter_rust::LANGUAGE.into(),
-            tree_sitter_rust::TAGS_QUERY,
-            &RUST_TAGS_QUERY,
-        )),
-        OutlineLanguage::TypeScript => Some((
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            tree_sitter_typescript::TAGS_QUERY,
-            &TYPESCRIPT_TAGS_QUERY,
-        )),
-        OutlineLanguage::Tsx => Some((
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            tree_sitter_typescript::TAGS_QUERY,
-            &TSX_TAGS_QUERY,
-        )),
-        OutlineLanguage::JavaScript => Some((
-            tree_sitter_javascript::LANGUAGE.into(),
-            tree_sitter_javascript::TAGS_QUERY,
-            &JAVASCRIPT_TAGS_QUERY,
-        )),
-        OutlineLanguage::Python => Some((
-            tree_sitter_python::LANGUAGE.into(),
-            tree_sitter_python::TAGS_QUERY,
-            &PYTHON_TAGS_QUERY,
-        )),
-        OutlineLanguage::Go => Some((
-            tree_sitter_go::LANGUAGE.into(),
-            tree_sitter_go::TAGS_QUERY,
-            &GO_TAGS_QUERY,
-        )),
+        OutlineLanguage::Rust => Some(TagsQuerySpec {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            tags_query: tree_sitter_rust::TAGS_QUERY,
+            query_cache: &RUST_TAGS_QUERY,
+        }),
+        OutlineLanguage::TypeScript => Some(TagsQuerySpec {
+            language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            tags_query: tree_sitter_typescript::TAGS_QUERY,
+            query_cache: &TYPESCRIPT_TAGS_QUERY,
+        }),
+        OutlineLanguage::Tsx => Some(TagsQuerySpec {
+            language: tree_sitter_typescript::LANGUAGE_TSX.into(),
+            tags_query: tree_sitter_typescript::TAGS_QUERY,
+            query_cache: &TSX_TAGS_QUERY,
+        }),
+        OutlineLanguage::JavaScript => Some(TagsQuerySpec {
+            language: tree_sitter_javascript::LANGUAGE.into(),
+            tags_query: tree_sitter_javascript::TAGS_QUERY,
+            query_cache: &JAVASCRIPT_TAGS_QUERY,
+        }),
+        OutlineLanguage::Python => Some(TagsQuerySpec {
+            language: tree_sitter_python::LANGUAGE.into(),
+            tags_query: tree_sitter_python::TAGS_QUERY,
+            query_cache: &PYTHON_TAGS_QUERY,
+        }),
+        OutlineLanguage::Go => Some(TagsQuerySpec {
+            language: tree_sitter_go::LANGUAGE.into(),
+            tags_query: tree_sitter_go::TAGS_QUERY,
+            query_cache: &GO_TAGS_QUERY,
+        }),
         OutlineLanguage::Cpp | OutlineLanguage::Markdown | OutlineLanguage::Unsupported => None,
     }
 }
 
 fn cached_tags_query(
     query_cache: &'static OnceLock<CachedTagsQuery>,
-    language: Language,
+    language: &Language,
     tags_query: &'static str,
-) -> Result<Arc<Query>, ToolCallOutcome> {
+) -> Result<&'static Query, ToolCallOutcome> {
     match query_cache.get_or_init(|| {
-        Query::new(&language, tags_query)
-            .map(Arc::new)
-            .map_err(|e| format!("failed to compile tags query: {e}"))
+        Query::new(language, tags_query).map_err(|e| format!("failed to compile tags query: {e}"))
     }) {
-        Ok(query) => Ok(Arc::clone(query)),
+        Ok(query) => Ok(query),
         Err(message) => Err(ToolCallOutcome::err(message.clone())),
     }
 }
@@ -309,7 +418,7 @@ fn extract_outline_via_tags_query(tree: &Tree, source: &str, query: &Query) -> S
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
-    let mut output = String::new();
+    let mut output = String::with_capacity(outline_output_capacity(source));
 
     while let Some(query_match) = matches.next() {
         let mut kind = None;
@@ -321,7 +430,7 @@ fn extract_outline_via_tags_query(tree: &Tree, source: &str, query: &Query) -> S
             if capture_name == "name" {
                 let captured_name = node_text(capture.node, source).trim();
                 if !captured_name.is_empty() {
-                    name = Some(captured_name.to_string());
+                    name = Some(captured_name);
                 }
                 continue;
             }
@@ -345,7 +454,7 @@ fn extract_outline_via_tags_query(tree: &Tree, source: &str, query: &Query) -> S
 }
 
 fn extract_markdown_outline(source: &str) -> String {
-    let mut output = String::new();
+    let mut output = String::with_capacity(outline_output_capacity(source));
 
     for line in source.lines() {
         let trimmed = line.trim_start();
@@ -367,7 +476,7 @@ fn extract_markdown_outline(source: &str) -> String {
             continue;
         }
 
-        output.push_str(&"  ".repeat(depth - 1));
+        push_repeated(&mut output, "  ", depth - 1);
         output.push_str("# ");
         output.push_str(heading_text);
         output.push('\n');
@@ -376,24 +485,34 @@ fn extract_markdown_outline(source: &str) -> String {
     output.trim_end().to_string()
 }
 
+fn outline_output_capacity(source: &str) -> usize {
+    source.len().min(MAX_PREALLOCATED_OUTLINE_BYTES)
+}
+
 struct OutlineContext<'a> {
     source: &'a str,
     include_private: bool,
     indent: usize,
 }
 
-fn indent_str(level: usize) -> String {
-    "    ".repeat(level)
+fn push_indent(output: &mut String, level: usize) {
+    push_repeated(output, CPP_INDENT, level);
+}
+
+fn push_repeated(output: &mut String, unit: &str, count: usize) {
+    for _ in 0..count {
+        output.push_str(unit);
+    }
 }
 
 fn node_text<'a>(node: Node<'a>, source: &'a str) -> &'a str {
-    node.utf8_text(source.as_bytes()).unwrap_or("")
+    source.get(node.byte_range()).unwrap_or("")
 }
 
 fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
     match node.kind() {
         "preproc_include" => {
-            output.push_str(&indent_str(ctx.indent));
+            push_indent(output, ctx.indent);
             output.push_str(node_text(node, ctx.source).trim());
             output.push('\n');
         }
@@ -401,7 +520,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
         "preproc_ifdef" | "preproc_ifndef" | "preproc_if" => {
             let text = node_text(node, ctx.source);
             if let Some(first_line) = text.lines().next() {
-                output.push_str(&indent_str(ctx.indent));
+                push_indent(output, ctx.indent);
                 output.push_str(first_line.trim());
                 output.push('\n');
             }
@@ -409,7 +528,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             for child in node.children(&mut cursor) {
                 extract_outline(child, ctx, output);
             }
-            output.push_str(&indent_str(ctx.indent));
+            push_indent(output, ctx.indent);
             output.push_str("#endif\n");
         }
 
@@ -442,22 +561,26 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
                 .child_by_field_name("name")
                 .map_or("anonymous", |n| node_text(n, ctx.source));
 
-            let mut base_clause = String::new();
+            let mut base_clause = None;
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "base_class_clause" {
-                    base_clause = format!(" {}", node_text(child, ctx.source).trim());
+                    base_clause = Some(node_text(child, ctx.source).trim());
                     break;
                 }
             }
 
             if let Some(comment) = find_preceding_comment(node, ctx.source) {
-                output.push_str(&indent_str(ctx.indent));
+                push_indent(output, ctx.indent);
                 output.push_str(comment.trim());
                 output.push('\n');
             }
 
-            let _ = writeln!(output, "{keyword} {name}{base_clause} {{");
+            if let Some(base_clause) = base_clause {
+                let _ = writeln!(output, "{keyword} {name} {base_clause} {{");
+            } else {
+                let _ = writeln!(output, "{keyword} {name} {{");
+            }
 
             ctx.indent += 1;
 
@@ -466,7 +589,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             }
 
             ctx.indent -= 1;
-            output.push_str(&indent_str(ctx.indent));
+            push_indent(output, ctx.indent);
             output.push_str("};\n\n");
         }
 
@@ -479,12 +602,12 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             let is_enum_class = text.contains("enum class") || text.contains("enum struct");
 
             if let Some(comment) = find_preceding_comment(node, ctx.source) {
-                output.push_str(&indent_str(ctx.indent));
+                push_indent(output, ctx.indent);
                 output.push_str(comment.trim());
                 output.push('\n');
             }
 
-            output.push_str(&indent_str(ctx.indent));
+            push_indent(output, ctx.indent);
             if is_enum_class {
                 let _ = writeln!(output, "enum class {name} {{");
             } else {
@@ -496,7 +619,7 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
                 let mut cursor = body.walk();
                 for child in body.children(&mut cursor) {
                     if child.kind() == "enumerator" {
-                        output.push_str(&indent_str(ctx.indent));
+                        push_indent(output, ctx.indent);
                         output.push_str(node_text(child, ctx.source).trim());
                         output.push_str(",\n");
                     }
@@ -504,17 +627,17 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
                 ctx.indent -= 1;
             }
 
-            output.push_str(&indent_str(ctx.indent));
+            push_indent(output, ctx.indent);
             output.push_str("};\n\n");
         }
 
         "type_definition" | "alias_declaration" => {
             if let Some(comment) = find_preceding_comment(node, ctx.source) {
-                output.push_str(&indent_str(ctx.indent));
+                push_indent(output, ctx.indent);
                 output.push_str(comment.trim());
                 output.push('\n');
             }
-            output.push_str(&indent_str(ctx.indent));
+            push_indent(output, ctx.indent);
             output.push_str(node_text(node, ctx.source).trim());
             output.push('\n');
         }
@@ -527,11 +650,11 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
                 || text.contains("= delete")
             {
                 if let Some(comment) = find_preceding_comment(node, ctx.source) {
-                    output.push_str(&indent_str(ctx.indent));
+                    push_indent(output, ctx.indent);
                     output.push_str(comment.trim());
                     output.push('\n');
                 }
-                output.push_str(&indent_str(ctx.indent));
+                push_indent(output, ctx.indent);
                 output.push_str(text.trim());
                 output.push('\n');
             }
@@ -541,29 +664,30 @@ fn extract_outline(node: Node, ctx: &mut OutlineContext, output: &mut String) {
             let sig = extract_function_signature(node, ctx.source);
             if !sig.is_empty() {
                 if let Some(comment) = find_preceding_comment(node, ctx.source) {
-                    output.push_str(&indent_str(ctx.indent));
+                    push_indent(output, ctx.indent);
                     output.push_str(comment.trim());
                     output.push('\n');
                 }
-                output.push_str(&indent_str(ctx.indent));
-                output.push_str(&sig);
+                push_indent(output, ctx.indent);
+                output.push_str(sig);
                 output.push_str(";\n");
             }
         }
 
         "template_declaration" => {
-            let mut template_params = String::new();
+            let mut template_params = None;
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "template_parameter_list" {
-                    template_params = format!("template{}", node_text(child, ctx.source));
+                    template_params = Some(node_text(child, ctx.source));
                     break;
                 }
             }
 
-            if !template_params.is_empty() {
-                output.push_str(&indent_str(ctx.indent));
-                output.push_str(&template_params);
+            if let Some(template_params) = template_params {
+                push_indent(output, ctx.indent);
+                output.push_str("template");
+                output.push_str(template_params);
                 output.push('\n');
             }
 
@@ -595,7 +719,7 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
     for child in body.children(&mut cursor) {
         match child.kind() {
             "access_specifier" => {
-                output.push_str(&indent_str(ctx.indent - 1));
+                push_indent(output, ctx.indent - 1);
                 output.push_str(node_text(child, ctx.source).trim());
                 output.push('\n');
 
@@ -625,7 +749,7 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
                 }
 
                 if !has_explicit_access && !printed_current_access && !ctx.include_private {
-                    output.push_str(&indent_str(ctx.indent - 1));
+                    push_indent(output, ctx.indent - 1);
                     output.push_str(current_access);
                     output.push_str(":\n");
                     printed_current_access = true;
@@ -634,11 +758,11 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
                 match child.kind() {
                     "field_declaration" => {
                         if let Some(comment) = find_preceding_comment(child, ctx.source) {
-                            output.push_str(&indent_str(ctx.indent));
+                            push_indent(output, ctx.indent);
                             output.push_str(comment.trim());
                             output.push('\n');
                         }
-                        output.push_str(&indent_str(ctx.indent));
+                        push_indent(output, ctx.indent);
                         output.push_str(node_text(child, ctx.source).trim());
                         output.push('\n');
                     }
@@ -646,23 +770,23 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
                         let sig = extract_function_signature(child, ctx.source);
                         if !sig.is_empty() {
                             if let Some(comment) = find_preceding_comment(child, ctx.source) {
-                                output.push_str(&indent_str(ctx.indent));
+                                push_indent(output, ctx.indent);
                                 output.push_str(comment.trim());
                                 output.push('\n');
                             }
-                            output.push_str(&indent_str(ctx.indent));
-                            output.push_str(&sig);
+                            push_indent(output, ctx.indent);
+                            output.push_str(sig);
                             output.push_str(";\n");
                         }
                     }
                     "declaration" => {
                         let text = node_text(child, ctx.source);
                         if let Some(comment) = find_preceding_comment(child, ctx.source) {
-                            output.push_str(&indent_str(ctx.indent));
+                            push_indent(output, ctx.indent);
                             output.push_str(comment.trim());
                             output.push('\n');
                         }
-                        output.push_str(&indent_str(ctx.indent));
+                        push_indent(output, ctx.indent);
                         output.push_str(text.trim());
                         output.push('\n');
                     }
@@ -674,12 +798,12 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
 
             "friend_declaration" => {
                 if !has_explicit_access && !printed_current_access && !ctx.include_private {
-                    output.push_str(&indent_str(ctx.indent - 1));
+                    push_indent(output, ctx.indent - 1);
                     output.push_str(current_access);
                     output.push_str(":\n");
                     printed_current_access = true;
                 }
-                output.push_str(&indent_str(ctx.indent));
+                push_indent(output, ctx.indent);
                 output.push_str(node_text(child, ctx.source).trim());
                 output.push('\n');
             }
@@ -689,7 +813,7 @@ fn extract_class_body(body: Node, ctx: &mut OutlineContext, output: &mut String,
     }
 }
 
-fn extract_function_signature(node: Node, source: &str) -> String {
+fn extract_function_signature<'a>(node: Node<'a>, source: &'a str) -> &'a str {
     let full_text = node_text(node, source);
 
     let mut body_pos = None;
@@ -711,15 +835,15 @@ fn extract_function_signature(node: Node, source: &str) -> String {
     let cut_pos = init_list_pos.or(body_pos);
 
     if let Some(pos) = cut_pos {
-        let mut sig = full_text[..pos].trim_end();
+        let mut sig = full_text.get(..pos).unwrap_or("").trim_end();
 
         if init_list_pos.is_some() {
             sig = sig.trim_end_matches(':').trim_end();
         }
 
-        sig.to_string()
+        sig
     } else {
-        full_text.trim_end_matches(';').trim().to_string()
+        full_text.trim_end_matches(';').trim()
     }
 }
 
@@ -769,7 +893,6 @@ mod tests {
     };
     use serde_json::json;
     use std::path::Path;
-    use std::sync::Arc;
 
     #[test]
     fn each_supported_language_emits_at_least_one_entry() {
@@ -834,18 +957,28 @@ mod tests {
     }
 
     #[test]
+    fn tags_query_outline_preserves_order_and_utf8_names() {
+        let source = "pub struct Caf\u{00e9};\n\npub fn brew() {}\n";
+
+        let outline = render_outline(Path::new("sample.rs"), source, false).expect("rust outline");
+
+        assert_eq!(
+            outline,
+            "definition.class Caf\u{00e9}\ndefinition.function brew"
+        );
+    }
+
+    #[test]
     fn tags_query_cache_reuses_compiled_query_for_language_variant() {
-        let (language, tags_query, query_cache) =
-            tags_query_spec(OutlineLanguage::Rust).expect("rust tags query spec");
+        let spec = tags_query_spec(OutlineLanguage::Rust).expect("rust tags query spec");
 
-        let first =
-            cached_tags_query(query_cache, language, tags_query).expect("compile rust tags query");
-        let (language, tags_query, query_cache) =
-            tags_query_spec(OutlineLanguage::Rust).expect("rust tags query spec");
-        let second =
-            cached_tags_query(query_cache, language, tags_query).expect("reuse rust tags query");
+        let first = cached_tags_query(spec.query_cache, &spec.language, spec.tags_query)
+            .expect("compile rust tags query");
+        let spec = tags_query_spec(OutlineLanguage::Rust).expect("rust tags query spec");
+        let second = cached_tags_query(spec.query_cache, &spec.language, spec.tags_query)
+            .expect("reuse rust tags query");
 
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(std::ptr::eq(first, second));
     }
 
     #[test]
@@ -886,6 +1019,21 @@ mod tests {
                 .as_str()
                 .expect("content text")
                 .to_string()
+        }
+
+        #[tokio::test]
+        async fn missing_path_returns_file_not_found_error() {
+            let dir = tempdir_in_workspace("outline-cache-missing-");
+            let path = dir.path().join("missing.rs");
+            let path_str = path.to_string_lossy().to_string();
+
+            let outcome = outline_for_path(&path_str, false).await;
+
+            assert_eq!(outcome.0["isError"], true);
+            assert_eq!(
+                outcome.0["content"][0]["text"],
+                format!("file not found: {}", path.display())
+            );
         }
 
         #[tokio::test]

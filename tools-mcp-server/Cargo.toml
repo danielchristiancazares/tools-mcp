@@ -15,6 +15,7 @@ tracing-subscriber.workspace = true
 tools-mcp-core = { path = "../tools-mcp-core" }
 tools-mcp-git = { path = "../tools-mcp-git" }
 tools-mcp-local = { path = "../tools-mcp-local" }
+tools-mcp-semantic = { path = "../tools-mcp-semantic" }
 tools-mcp-webfetch = { path = "../tools-mcp-webfetch" }
 
 [dev-dependencies]

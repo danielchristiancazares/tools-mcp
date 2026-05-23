@@ -1,5 +1,6 @@
 use super::super::run_git;
-use super::super::types::build_git_response;
+use super::super::trim_git_line_end;
+use super::super::types::{GitExecResult, build_git_response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -17,6 +18,30 @@ fn validate_non_option_arg(value: &str, field_name: &str) -> Result<(), ToolCall
         )));
     }
     Ok(())
+}
+
+fn inspect_output_text(exec: &GitExecResult, empty_success_text: Option<&str>) -> String {
+    let stdout = trim_git_line_end(&exec.stdout);
+    if exec.success {
+        if stdout.trim().is_empty() {
+            empty_success_text.unwrap_or(stdout).to_string()
+        } else {
+            stdout.to_string()
+        }
+    } else {
+        let stderr = trim_git_line_end(&exec.stderr);
+        if stderr.trim().is_empty() {
+            stdout.to_string()
+        } else {
+            stderr.to_string()
+        }
+    }
+}
+
+fn max_bytes_fields(max_bytes: usize) -> HashMap<&'static str, Value> {
+    let mut extra_fields = HashMap::with_capacity(1);
+    extra_fields.insert("max_bytes", json!(max_bytes));
+    extra_fields
 }
 
 /// Handle the `GitLog` MCP tool request.
@@ -100,22 +125,8 @@ pub async fn handle_git_log(_id: Option<Value>, args: Value) -> ToolCallOutcome 
         Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
-    let text = if exec.success {
-        if exec.stdout.trim().is_empty() {
-            "no commits".to_string()
-        } else {
-            exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-        }
-    } else if !exec.stderr.trim().is_empty() {
-        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    };
-
-    let mut extra_fields = HashMap::new();
-    extra_fields.insert("max_bytes", json!(max_bytes));
-
-    let payload = build_git_response(&exec, &text, Some(extra_fields));
+    let text = inspect_output_text(&exec, Some("no commits"));
+    let payload = build_git_response(&exec, &text, Some(max_bytes_fields(max_bytes)));
     ToolCallOutcome::ok(payload)
 }
 
@@ -183,18 +194,8 @@ pub async fn handle_git_show(_id: Option<Value>, args: Value) -> ToolCallOutcome
         Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
-    let text = if exec.success {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else if !exec.stderr.trim().is_empty() {
-        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    };
-
-    let mut extra_fields = HashMap::new();
-    extra_fields.insert("max_bytes", json!(max_bytes));
-
-    let payload = build_git_response(&exec, &text, Some(extra_fields));
+    let text = inspect_output_text(&exec, None);
+    let payload = build_git_response(&exec, &text, Some(max_bytes_fields(max_bytes)));
     ToolCallOutcome::ok(payload)
 }
 
@@ -266,15 +267,9 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
         Err(e) => return ToolCallOutcome::err(format!("git error: {e:#}")),
     };
 
-    let text = if exec.success {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else if !exec.stderr.trim().is_empty() {
-        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    };
+    let text = inspect_output_text(&exec, None);
 
-    let mut extra_fields = HashMap::new();
+    let mut extra_fields = HashMap::with_capacity(2);
     extra_fields.insert("path", json!(req.path));
     extra_fields.insert("max_bytes", json!(max_bytes));
 
@@ -284,8 +279,56 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_git_blame, handle_git_show};
+    use super::super::super::types::GitExecResult;
+    use super::{handle_git_blame, handle_git_show, inspect_output_text};
     use serde_json::json;
+
+    fn exec_result(success: bool, stdout: &str, stderr: &str) -> GitExecResult {
+        GitExecResult {
+            git_bin: "git".to_string(),
+            args: Vec::new(),
+            working_dir: None,
+            exit_code: Some(if success { 0 } else { 1 }),
+            success,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            truncated_stdout: false,
+            truncated_stderr: false,
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn inspect_output_text_preserves_success_stdout_trimming() {
+        let exec = exec_result(true, "commit abc\r\n", "");
+
+        assert_eq!(inspect_output_text(&exec, Some("no commits")), "commit abc");
+    }
+
+    #[test]
+    fn inspect_output_text_uses_empty_success_text_when_configured() {
+        let exec = exec_result(true, "\r\n", "");
+
+        assert_eq!(inspect_output_text(&exec, Some("no commits")), "no commits");
+        assert_eq!(inspect_output_text(&exec, None), "");
+    }
+
+    #[test]
+    fn inspect_output_text_prefers_failure_stderr_when_present() {
+        let exec = exec_result(false, "stdout detail\n", "fatal: bad revision\n");
+
+        assert_eq!(
+            inspect_output_text(&exec, Some("no commits")),
+            "fatal: bad revision"
+        );
+    }
+
+    #[test]
+    fn inspect_output_text_falls_back_to_failure_stdout() {
+        let exec = exec_result(false, "stdout detail\n", "\n");
+
+        assert_eq!(inspect_output_text(&exec, None), "stdout detail");
+    }
 
     #[tokio::test]
     async fn git_show_rejects_option_like_commit() {

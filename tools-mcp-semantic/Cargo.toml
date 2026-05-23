@@ -1,0 +1,33 @@
+[package]
+name = "tools-mcp-semantic"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+fastembed.workspace = true
+futures.workspace = true
+hex.workspace = true
+ignore.workspace = true
+lancedb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tools-mcp-core = { path = "../tools-mcp-core" }
+tree-sitter.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

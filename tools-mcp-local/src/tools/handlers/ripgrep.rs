@@ -4,21 +4,23 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::{Duration, Instant as StdInstant};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 use tokio::time;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::cancellation::current_cancellation_token;
 
 use super::search_contract::{
-    NormalizedSearchRequest, SearchCaseMode, SearchEvent, SearchPayloadMeta, build_search_payload,
-    parse_search_request, render_search_text,
+    NormalizedSearchRequest, SearchCaseMode, SearchEvent, SearchPayloadMeta,
+    build_search_payload_from_rendered, parse_search_request, render_search_events,
+    render_search_text_from_rendered,
 };
 use super::search_file_selection::resolve_ugrep_path_list;
 use super::search_memory::{MemoryError, handle_memory_search};
 
 const MAX_UGREP_STDERR_BYTES: usize = 16 * 1024;
 const STDERR_READ_CHUNK_BYTES: usize = 4 * 1024;
+const MAX_UGREP_OUTPUT_LINE_COLUMNS: usize = 4_096;
 
 fn add_fallback_metadata(mut outcome: ToolCallOutcome, err: &MemoryError) -> ToolCallOutcome {
     if let Some(obj) = outcome.0.as_object_mut() {
@@ -222,6 +224,82 @@ fn classify_success(
         && !timed_out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UgrepPathInput {
+    Root,
+    StdinPathList,
+}
+
+fn build_ugrep_args(
+    req: &NormalizedSearchRequest,
+    root: &str,
+    path_input: UgrepPathInput,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(24 + req.raw_globs().len().saturating_mul(2));
+
+    // ugrep: use text output with -n -H for simpler parsing.
+    args.extend(
+        ["-r", "-n", "-H", "--color=never", "--no-group-separator"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    args.push(format!("--width={MAX_UGREP_OUTPUT_LINE_COLUMNS}"));
+
+    if let Some(dist) = req.fuzzy_distance() {
+        args.push(format!("-Z{dist}"));
+    }
+
+    if req.fixed_strings() {
+        args.push("-F".to_string());
+    }
+    if req.word_regexp() {
+        args.push("-w".to_string());
+    }
+
+    match req.case_mode() {
+        SearchCaseMode::Sensitive => {}
+        SearchCaseMode::Insensitive => args.push("-i".to_string()),
+        SearchCaseMode::Smart => args.push("-j".to_string()),
+    }
+
+    if req.hidden() {
+        args.push("--hidden".to_string());
+    }
+    if req.follow() {
+        args.push("--dereference".to_string());
+    }
+    if req.no_ignore() {
+        args.push("--no-ignore-files".to_string());
+    }
+    if req.context() > 0 {
+        args.push("-C".to_string());
+        args.push(req.context().to_string());
+    }
+
+    match path_input {
+        UgrepPathInput::StdinPathList => args.push("--from=-".to_string()),
+        UgrepPathInput::Root => {
+            for glob in req.raw_globs() {
+                if !glob.trim().is_empty() {
+                    args.push("-g".to_string());
+                    args.push(glob.to_string());
+                }
+            }
+        }
+    }
+
+    // End of options marker prevents patterns like "//" or "-foo" from being
+    // interpreted as flags.
+    args.push("--".to_string());
+    args.push(req.pattern().to_string());
+
+    if path_input == UgrepPathInput::Root {
+        args.push(root.to_string());
+    }
+
+    args
+}
+
 /// Run ugrep and return both a readable summary and structured matches.
 ///
 /// Notes:
@@ -261,7 +339,6 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
     let root = req.root().to_string();
     let max_results = req.max_results();
     let timeout_ms = req.timeout_ms();
-    let fuzzy_distance = req.fuzzy_distance();
     let bin = ugrep_binary_name();
 
     let run = async {
@@ -294,67 +371,17 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
                 .collect()
         });
 
-        let mut cmd = Command::new(bin);
-
-        // ugrep: use text output with -n -H for simpler parsing
-        cmd.arg("-r").arg("-n").arg("-H");
-
-        // Fuzzy flag
-        if let Some(dist) = fuzzy_distance {
-            cmd.arg(format!("-Z{dist}"));
-        }
-
-        if req.fixed_strings() {
-            cmd.arg("-F");
-        }
-        if req.word_regexp() {
-            cmd.arg("-w");
-        }
-
-        // Case mode: -j for smart-case, -i for insensitive
-        match req.case_mode() {
-            SearchCaseMode::Sensitive => {
-                // default behavior (no flags)
-            }
-            SearchCaseMode::Insensitive => {
-                cmd.arg("-i");
-            }
-            SearchCaseMode::Smart => {
-                cmd.arg("-j"); // ugrep smart-case
-            }
-        }
-
-        if req.hidden() {
-            cmd.arg("--hidden");
-        }
-        if req.follow() {
-            cmd.arg("--dereference");
-        }
-        if req.no_ignore() {
-            cmd.arg("--no-ignore-files");
-        }
-        if req.context() > 0 {
-            let c = req.context();
-            cmd.arg("-C").arg(c.to_string());
-        }
-        if globbed_files.is_some() {
-            cmd.arg("--from=-");
+        let path_input = if globbed_files.is_some() {
+            UgrepPathInput::StdinPathList
         } else {
-            for g in req.raw_globs() {
-                if !g.trim().is_empty() {
-                    cmd.arg("-g").arg(g);
-                }
-            }
-        }
+            UgrepPathInput::Root
+        };
+        let args = build_ugrep_args(&req, &root, path_input);
 
-        // End of options marker prevents patterns like "//" or "-foo" from being
-        // interpreted as flags
-        cmd.arg("--").arg(req.pattern());
-        if globbed_files.is_none() {
-            cmd.arg(&root);
-        }
+        let mut cmd = Command::new(bin);
+        cmd.args(&args);
 
-        if globbed_files.is_some() {
+        if path_input == UgrepPathInput::StdinPathList {
             cmd.stdin(Stdio::piped());
         } else {
             cmd.stdin(Stdio::null());
@@ -367,11 +394,12 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
         })?;
 
         let stdin_task = if let Some(files) = globbed_files {
-            let mut stdin = child
+            let stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("failed to capture stdin"))?;
             Some(tokio::spawn(async move {
+                let mut stdin = BufWriter::new(stdin);
                 for path in files {
                     if stdin
                         .write_all(path.to_string_lossy().as_bytes())
@@ -383,6 +411,9 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
                     if stdin.write_all(b"\n").await.is_err() {
                         return;
                     }
+                }
+                if stdin.flush().await.is_err() {
+                    return;
                 }
                 let _ = stdin.shutdown().await;
             }))
@@ -402,7 +433,7 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
         // Read stderr concurrently to avoid deadlocks.
         let stderr_task = tokio::spawn(read_stderr_bounded(stderr));
 
-        let mut events: Vec<SearchEvent> = Vec::new();
+        let mut events: Vec<SearchEvent> = Vec::with_capacity(max_results.min(256));
         let mut truncated = false;
         let mut timed_out = false;
         let mut terminated_for_limit = false;
@@ -514,14 +545,15 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
 
     match run.await {
         Ok((events, truncated, exit_code, stderr_text, success, timed_out)) => {
+            let rendered_events = render_search_events(&events);
             let text_view = if !success && !stderr_text.is_empty() {
                 // Show error message when search failed
                 format!("Search error: {stderr_text}")
             } else {
-                render_search_text(&events)
+                render_search_text_from_rendered(&rendered_events)
             };
 
-            let mut payload = build_search_payload(
+            let mut payload = build_search_payload_from_rendered(
                 &req,
                 SearchPayloadMeta::new(
                     root,
@@ -531,7 +563,7 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
                     truncated,
                     timed_out,
                 ),
-                &events,
+                &rendered_events,
             );
 
             if !stderr_text.is_empty()
@@ -548,13 +580,12 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::super::search_contract::SearchRequest;
     #[cfg(unix)]
     use super::super::search_file_selection::path_has_line_separator;
     use super::{
-        MAX_UGREP_STDERR_BYTES, append_bounded_output, classify_success, is_path_authorized,
-        parse_grep_line, render_bounded_stderr,
+        MAX_UGREP_STDERR_BYTES, UgrepPathInput, append_bounded_output, build_ugrep_args,
+        classify_success, is_path_authorized, parse_grep_line, render_bounded_stderr,
     };
     #[cfg(unix)]
     use super::{handle_search, resolve_globbed_files_for_ugrep};
@@ -801,6 +832,89 @@ mod tests {
         assert_eq!(
             ugrep_binary_name(),
             if cfg!(windows) { "ugrep.exe" } else { "ugrep" }
+        );
+    }
+
+    #[test]
+    fn build_ugrep_args_preserves_direct_search_contract() {
+        let req = SearchRequest {
+            pattern: "-needle".to_string(),
+            path: Some("src".to_string()),
+            case: Some("insensitive".to_string()),
+            fixed_strings: Some(true),
+            word_regexp: Some(true),
+            glob: Some(vec![
+                " *.rs ".to_string(),
+                "".to_string(),
+                "*.md".to_string(),
+            ]),
+            hidden: Some(true),
+            follow: Some(true),
+            no_ignore: Some(true),
+            context: Some(2),
+            fuzzy: Some(2),
+            ..SearchRequest::default()
+        }
+        .normalize();
+
+        let args = build_ugrep_args(&req, "src", UgrepPathInput::Root);
+
+        assert_eq!(
+            args,
+            vec![
+                "-r",
+                "-n",
+                "-H",
+                "--color=never",
+                "--no-group-separator",
+                "--width=4096",
+                "-Z2",
+                "-F",
+                "-w",
+                "-i",
+                "--hidden",
+                "--dereference",
+                "--no-ignore-files",
+                "-C",
+                "2",
+                "-g",
+                " *.rs ",
+                "-g",
+                "*.md",
+                "--",
+                "-needle",
+                "src",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ugrep_args_preserves_path_list_contract() {
+        let req = SearchRequest {
+            pattern: "needle".to_string(),
+            path: Some("src".to_string()),
+            case: Some("smart".to_string()),
+            glob: Some(vec!["src/**/*.rs".to_string()]),
+            ..SearchRequest::default()
+        }
+        .normalize();
+
+        let args = build_ugrep_args(&req, "src", UgrepPathInput::StdinPathList);
+
+        assert_eq!(
+            args,
+            vec![
+                "-r",
+                "-n",
+                "-H",
+                "--color=never",
+                "--no-group-separator",
+                "--width=4096",
+                "-j",
+                "--from=-",
+                "--",
+                "needle",
+            ]
         );
     }
 

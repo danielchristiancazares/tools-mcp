@@ -397,6 +397,7 @@ impl SearchPayloadBuilder {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, event: &SearchEvent) {
         self.push_rendered(&RenderedSearchEvent::new(event));
     }
@@ -437,6 +438,7 @@ impl SearchPayloadBuilder {
     }
 }
 
+#[cfg(test)]
 fn build_search_payload_parts(events: &[SearchEvent]) -> SearchPayloadParts {
     let mut builder = SearchPayloadBuilder::with_event_capacity(events.len());
     for event in events {
@@ -468,6 +470,7 @@ pub(super) fn render_search_text_capacity_from_rendered(
     )
 }
 
+#[cfg(test)]
 pub(super) fn render_search_text(events: &[SearchEvent]) -> String {
     render_search_text_from_rendered(&render_search_events(events))
 }
@@ -486,6 +489,7 @@ pub(super) fn render_search_text_from_rendered(
     output
 }
 
+#[cfg(test)]
 pub(super) fn build_search_payload(
     req: &NormalizedSearchRequest,
     meta: SearchPayloadMeta,

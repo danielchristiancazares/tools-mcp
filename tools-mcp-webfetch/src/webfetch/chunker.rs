@@ -96,55 +96,6 @@ pub fn chunk_markdown(
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
 
-    let mut flush_section = |heading: &Option<String>, text: &str| -> Result<()> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-
-        if section_obviously_fits_token_budget(trimmed, max_tokens) {
-            let token_count = encoder.encode_ordinary(trimmed).len();
-            chunks.push((heading.clone(), trimmed.to_string(), token_count));
-            return Ok(());
-        }
-
-        // Tokenize once for the whole section, then slice tokens into max-sized chunks.
-        let tokens = encoder.encode_ordinary(trimmed);
-        if tokens.len() <= max_tokens {
-            chunks.push((heading.clone(), trimmed.to_string(), tokens.len()));
-            return Ok(());
-        }
-
-        // IMPORTANT: `tiktoken-rs` token byte sequences are not guaranteed to align with UTF-8
-        // character boundaries. If we slice the token array at arbitrary indices and decode each
-        // slice independently, we can cut multi-byte UTF-8 sequences in half, producing invalid
-        // UTF-8 and failing with errors like:
-        // "Unable to decode into a valid UTF-8 string: incomplete".
-        //
-        // To make chunking robust, we enforce `max_tokens` while also ensuring each chunk ends on
-        // a token boundary that is also a UTF-8 boundary.
-        let mut start = 0usize;
-        while start < tokens.len() {
-            let window_end = (start + max_tokens).min(tokens.len());
-            let (decoded, used_tokens) =
-                decode_utf8_safe_token_prefix(encoder, &tokens[start..window_end])
-                    .context("decode cl100k_base token slice (utf8-safe)")?;
-
-            // Always make progress, even if the decoded slice is whitespace-only.
-            start += used_tokens;
-
-            // Keep the decoded text as-is so token_count stays exact for the returned text.
-            // (Trimming here would require re-tokenizing, which is expensive and can also break
-            // indentation-sensitive Markdown like code blocks.)
-            if decoded.trim().is_empty() {
-                continue;
-            }
-            chunks.push((heading.clone(), decoded, used_tokens));
-        }
-
-        Ok(())
-    };
-
     // Track fenced code blocks so we don't treat headings inside code as section boundaries.
     // Markdown allows variable-length fences (>=3) using either backticks or tildes, and the
     // closing fence must use the same marker with at least the opening length.
@@ -180,7 +131,13 @@ pub fn chunk_markdown(
         };
         if let Some(heading_text) = heading_text {
             // Flush accumulated content before starting new section
-            flush_section(&current_heading, &current_text)?;
+            push_section_chunks(
+                &mut chunks,
+                encoder,
+                max_tokens,
+                &current_heading,
+                &current_text,
+            )?;
             current_text.clear();
 
             current_heading = Some(heading_text);
@@ -191,9 +148,83 @@ pub fn chunk_markdown(
         current_text.push('\n');
     }
 
-    flush_section(&current_heading, &current_text)?;
+    push_section_chunks(
+        &mut chunks,
+        encoder,
+        max_tokens,
+        &current_heading,
+        &current_text,
+    )?;
 
     Ok(chunks)
+}
+
+fn push_section_chunks(
+    chunks: &mut Vec<(Option<String>, String, usize)>,
+    encoder: &CoreBPE,
+    max_tokens: usize,
+    heading: &Option<String>,
+    text: &str,
+) -> Result<()> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    if section_obviously_fits_token_budget(trimmed, max_tokens) {
+        let token_count = encoder.encode_ordinary(trimmed).len();
+        chunks.push((heading.clone(), trimmed.to_string(), token_count));
+        return Ok(());
+    }
+
+    // Tokenize once for the whole section, then slice tokens into max-sized chunks.
+    let tokens = encoder.encode_ordinary(trimmed);
+    if tokens.len() <= max_tokens {
+        chunks.push((heading.clone(), trimmed.to_string(), tokens.len()));
+        return Ok(());
+    }
+
+    push_token_chunks(chunks, encoder, heading, tokens, max_tokens)
+}
+
+fn push_token_chunks(
+    chunks: &mut Vec<(Option<String>, String, usize)>,
+    encoder: &CoreBPE,
+    heading: &Option<String>,
+    tokens: Vec<Rank>,
+    max_tokens: usize,
+) -> Result<()> {
+    // IMPORTANT: `tiktoken-rs` token byte sequences are not guaranteed to align with UTF-8
+    // character boundaries. If we slice the token array at arbitrary indices and decode each
+    // slice independently, we can cut multi-byte UTF-8 sequences in half, producing invalid
+    // UTF-8 and failing with errors like:
+    // "Unable to decode into a valid UTF-8 string: incomplete".
+    //
+    // Decode token bytes for the whole oversized section once, then use token byte offsets to
+    // enforce `max_tokens` while ensuring each chunk ends on a UTF-8 boundary. This avoids
+    // allocating a token Vec and decoded byte buffer for every output window.
+    let token_bytes = DecodedTokenBytes::from_tokens(encoder, tokens);
+
+    let mut start = 0usize;
+    while start < token_bytes.len() {
+        let window_end = (start + max_tokens).min(token_bytes.len());
+        let (decoded, used_tokens) = token_bytes
+            .decode_utf8_safe_prefix(start, window_end)
+            .context("decode cl100k_base token slice (utf8-safe)")?;
+
+        // Always make progress, even if the decoded slice is whitespace-only.
+        start += used_tokens;
+
+        // Keep the decoded text as-is so token_count stays exact for the returned token slice.
+        // (Trimming here would require re-tokenizing, which is expensive and can also break
+        // indentation-sensitive Markdown like code blocks.)
+        if decoded.trim().is_empty() {
+            continue;
+        }
+        chunks.push((heading.clone(), decoded, used_tokens));
+    }
+
+    Ok(())
 }
 
 fn markdown_control_line(line: &str) -> Option<&str> {
@@ -289,57 +320,81 @@ pub fn estimate_tokens(text: &str) -> Result<usize> {
     Ok(encoder.encode_ordinary(text).len())
 }
 
-/// Decodes a token slice into a valid UTF-8 `String`.
+/// Decoded bytes plus token byte boundaries for one oversized encoded section.
 ///
 /// `CoreBPE::decode(Vec<Rank>)` validates UTF-8 and can fail if the decoded bytes start/end in the
 /// middle of a multi-byte UTF-8 sequence. This can happen when we chunk by tokens: token byte
 /// sequences are not guaranteed to align with UTF-8 character boundaries.
-///
-/// This function decodes the provided token slice to raw bytes first and returns the largest
-/// prefix (measured in whole tokens) that forms valid UTF-8.
-fn decode_utf8_safe_token_prefix(encoder: &CoreBPE, tokens: &[Rank]) -> Result<(String, usize)> {
-    anyhow::ensure!(!tokens.is_empty(), "empty token slice");
+struct DecodedTokenBytes {
+    bytes: Vec<u8>,
+    byte_ends: Vec<usize>,
+}
 
-    // Fast path: most token windows decode cleanly. Avoid any extra bookkeeping unless we hit a
-    // UTF-8 validation failure.
-    if let Ok(s) = encoder.decode(tokens.to_vec()) {
-        return Ok((s, tokens.len()));
+impl DecodedTokenBytes {
+    fn from_tokens(encoder: &CoreBPE, tokens: Vec<Rank>) -> Self {
+        let mut bytes: Vec<u8> = Vec::with_capacity(tokens.len().saturating_mul(2));
+        let mut byte_ends: Vec<usize> = Vec::with_capacity(tokens.len());
+
+        for token_bytes in encoder._decode_native_and_split(tokens) {
+            bytes.extend_from_slice(&token_bytes);
+            byte_ends.push(bytes.len());
+        }
+
+        Self { bytes, byte_ends }
     }
 
-    // Decode to raw bytes (no UTF-8 validation) and record byte-length boundaries after each token.
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut byte_ends: Vec<usize> = Vec::with_capacity(tokens.len());
-    for token_bytes in encoder._decode_native_and_split(tokens.to_vec()) {
-        bytes.extend_from_slice(&token_bytes);
-        byte_ends.push(bytes.len());
+    fn len(&self) -> usize {
+        self.byte_ends.len()
     }
 
-    let utf8_err = match std::str::from_utf8(&bytes) {
-        Ok(s) => return Ok((s.to_string(), tokens.len())),
-        Err(e) => e,
-    };
+    /// Decodes a token window into the largest valid UTF-8 prefix.
+    ///
+    /// Returns the decoded string and the number of whole tokens consumed.
+    fn decode_utf8_safe_prefix(&self, start: usize, end: usize) -> Result<(String, usize)> {
+        anyhow::ensure!(start < end, "empty token slice");
 
-    let valid_up_to = utf8_err.valid_up_to();
+        let byte_start = self.byte_start(start);
+        let byte_limit = self.byte_end(end);
+        let bytes = &self.bytes[byte_start..byte_limit];
 
-    // Find the largest token boundary whose byte offset is <= valid_up_to.
-    let keep_tokens = match byte_ends.binary_search(&valid_up_to) {
-        Ok(idx) => idx + 1,
-        Err(pos) => pos,
-    };
+        let utf8_err = match std::str::from_utf8(bytes) {
+            Ok(s) => return Ok((s.to_string(), end - start)),
+            Err(e) => e,
+        };
 
-    // This should be unreachable if we only start chunks at UTF-8 boundaries, but be defensive:
-    // fall back to a lossy decode of a single token so we always make progress.
-    if keep_tokens == 0 {
-        let first = encoder
-            ._decode_native_and_split(vec![tokens[0]])
-            .next()
-            .unwrap_or_default();
-        return Ok((String::from_utf8_lossy(&first).to_string(), 1));
+        let valid_up_to = byte_start + utf8_err.valid_up_to();
+
+        // Find the largest token boundary whose byte offset is <= valid_up_to.
+        let token_byte_ends = &self.byte_ends[start..end];
+        let keep_tokens = match token_byte_ends.binary_search(&valid_up_to) {
+            Ok(idx) => idx + 1,
+            Err(pos) => pos,
+        };
+
+        // This should be unreachable if we only start chunks at UTF-8 boundaries, but be defensive:
+        // fall back to a lossy decode of a single token so we always make progress.
+        if keep_tokens == 0 {
+            let first_token_end = self.byte_ends[start];
+            let first_token = &self.bytes[byte_start..first_token_end];
+            return Ok((String::from_utf8_lossy(first_token).to_string(), 1));
+        }
+
+        let byte_end = token_byte_ends[keep_tokens - 1];
+        let s = std::str::from_utf8(&self.bytes[byte_start..byte_end]).context("utf8 prefix")?;
+        Ok((s.to_string(), keep_tokens))
     }
 
-    let byte_end = byte_ends[keep_tokens - 1];
-    let s = std::str::from_utf8(&bytes[..byte_end]).context("utf8 prefix")?;
-    Ok((s.to_string(), keep_tokens))
+    fn byte_start(&self, token_start: usize) -> usize {
+        if token_start == 0 {
+            0
+        } else {
+            self.byte_ends[token_start - 1]
+        }
+    }
+
+    fn byte_end(&self, token_end: usize) -> usize {
+        self.byte_ends[token_end - 1]
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +456,33 @@ Body line 2
                 "chunk token_count {token_count} exceeded max_tokens {max_tokens}"
             );
         }
+    }
+
+    #[test]
+    fn chunk_markdown_split_chunks_preserve_heading_and_text_order() {
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa\n".repeat(64);
+        let md = format!("# Long\n{body}");
+        let max_tokens = 12;
+
+        let chunks = chunk_markdown(&md, Some(max_tokens)).expect("chunking failed");
+
+        assert!(
+            chunks.len() > 1,
+            "test input should require token-based splitting"
+        );
+
+        let mut reconstructed = String::new();
+        for (heading, text, token_count) in &chunks {
+            assert_eq!(heading.as_deref(), Some("Long"));
+            assert!(
+                *token_count <= max_tokens,
+                "chunk token_count {token_count} exceeded max_tokens {max_tokens}"
+            );
+            assert!(!text.trim().is_empty());
+            reconstructed.push_str(text);
+        }
+
+        assert_eq!(reconstructed, md.trim());
     }
 
     #[test]

@@ -1,10 +1,23 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+
+static AUTHORITY_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 fn authority_root() -> Result<PathBuf, String> {
-    std::env::current_dir()
+    if let Some(root) = AUTHORITY_ROOT.get() {
+        return Ok(root.clone());
+    }
+
+    let root = std::env::current_dir()
         .map_err(|err| format!("failed to resolve server working directory: {err}"))?
         .canonicalize()
-        .map_err(|err| format!("failed to canonicalize server working directory: {err}"))
+        .map_err(|err| format!("failed to canonicalize server working directory: {err}"))?;
+
+    let _ = AUTHORITY_ROOT.set(root);
+    AUTHORITY_ROOT
+        .get()
+        .cloned()
+        .ok_or_else(|| "failed to cache server working directory".to_string())
 }
 
 fn absolute_path(path: &Path, root: &Path) -> PathBuf {

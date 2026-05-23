@@ -68,7 +68,8 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
 
-    let mut cmd_args: Vec<String> = vec!["restore".into()];
+    let mut cmd_args: Vec<String> = Vec::with_capacity(4 + paths.len());
+    cmd_args.push("restore".into());
     if staged {
         cmd_args.push("--staged".into());
     }
@@ -77,12 +78,10 @@ pub async fn handle_git_restore(_id: Option<Value>, args: Value) -> ToolCallOutc
     }
 
     cmd_args.push("--".into());
-    for p in &paths {
-        cmd_args.push(p.clone());
-    }
+    cmd_args.extend(paths);
 
     let exec = match run_git(
-        req.working_dir.clone(),
+        req.working_dir,
         cmd_args,
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
@@ -147,7 +146,8 @@ pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome 
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
 
-    let mut cmd_args: Vec<String> = vec!["add".into()];
+    let mut cmd_args: Vec<String> = Vec::with_capacity(3 + paths.len());
+    cmd_args.push("add".into());
 
     if use_all {
         cmd_args.push("-A".into());
@@ -157,13 +157,11 @@ pub async fn handle_git_add(_id: Option<Value>, args: Value) -> ToolCallOutcome 
 
     if !paths.is_empty() {
         cmd_args.push("--".into());
-        for p in &paths {
-            cmd_args.push(p.clone());
-        }
+        cmd_args.extend(paths);
     }
 
     let exec = match run_git(
-        req.working_dir.clone(),
+        req.working_dir,
         cmd_args,
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
@@ -231,7 +229,7 @@ pub async fn handle_git_commit(_id: Option<Value>, args: Value) -> ToolCallOutco
     let cmd_args: Vec<String> = vec!["commit".into(), "-m".into(), commit_msg.clone()];
 
     let exec = match run_git(
-        req.working_dir.clone(),
+        req.working_dir,
         cmd_args,
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
@@ -298,7 +296,8 @@ pub async fn handle_git_branch(_id: Option<Value>, args: Value) -> ToolCallOutco
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
-    let mut cmd_args: Vec<String> = vec!["branch".into()];
+    let mut cmd_args: Vec<String> = Vec::with_capacity(4);
+    cmd_args.push("branch".into());
 
     if let Some(name) = &req.create {
         if let Err(o) = validate_non_option_arg(name, "create") {
@@ -341,7 +340,7 @@ pub async fn handle_git_branch(_id: Option<Value>, args: Value) -> ToolCallOutco
     }
 
     let exec = match run_git(
-        req.working_dir.clone(),
+        req.working_dir,
         cmd_args,
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
@@ -396,7 +395,8 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
-    let mut cmd_args: Vec<String> = vec!["checkout".into()];
+    let mut cmd_args: Vec<String> = Vec::with_capacity(3 + req.paths.as_ref().map_or(0, Vec::len));
+    cmd_args.push("checkout".into());
     let paths = non_empty_paths(req.paths.unwrap_or_default());
 
     if let Some(branch) = &req.create_branch {
@@ -419,9 +419,7 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
 
     if !paths.is_empty() {
         cmd_args.push("--".into());
-        for p in &paths {
-            cmd_args.push(p.clone());
-        }
+        cmd_args.extend(paths);
     }
 
     if cmd_args.len() == 1 {
@@ -431,7 +429,7 @@ pub async fn handle_git_checkout(_id: Option<Value>, args: Value) -> ToolCallOut
     }
 
     let exec = match run_git(
-        req.working_dir.clone(),
+        req.working_dir,
         cmd_args,
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
@@ -494,7 +492,8 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
         .filter(|s| !s.is_empty())
         .unwrap_or("push");
 
-    let mut cmd_args: Vec<String> = vec!["stash".into()];
+    let mut cmd_args: Vec<String> = Vec::with_capacity(4);
+    cmd_args.push("stash".into());
 
     match action {
         "push" | "save" => {
@@ -582,7 +581,9 @@ pub async fn handle_git_stash(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_git_add, handle_git_checkout, sanitize_commit_fragment};
+    use super::{
+        handle_git_add, handle_git_checkout, handle_git_restore, sanitize_commit_fragment,
+    };
     use serde_json::json;
 
     // Empty action should preserve the default push behavior.
@@ -637,6 +638,18 @@ mod tests {
         assert!(
             !commit_msg.contains('\r'),
             "commit message should not contain carriage returns: {commit_msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_restore_handler_rejects_whitespace_only_paths() {
+        let outcome = handle_git_restore(None, json!({"paths": ["   ", "\t"]})).await;
+        assert_eq!(outcome.0["isError"], true);
+        assert!(
+            outcome.0["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("paths must be non-empty")
         );
     }
 

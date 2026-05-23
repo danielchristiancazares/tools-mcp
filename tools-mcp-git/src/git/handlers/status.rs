@@ -1,17 +1,55 @@
 use super::super::run_git;
-use super::super::types::build_git_response;
+use super::super::types::{
+    PorcelainStatusSummary, build_git_response_with_extra_fields, git_response_text,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use tools_mcp_core::ToolCallOutcome;
 use tools_mcp_core::config::{
     DEFAULT_GIT_STDERR_BYTES, DEFAULT_GIT_STDOUT_BYTES, DEFAULT_GIT_TIMEOUT_MS,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GitStatusOptions {
+    porcelain: bool,
+    branch: bool,
+    untracked: bool,
+}
+
+impl GitStatusOptions {
+    fn from_optional(
+        porcelain: Option<bool>,
+        branch: Option<bool>,
+        untracked: Option<bool>,
+    ) -> Self {
+        Self {
+            porcelain: porcelain.unwrap_or(true),
+            branch: branch.unwrap_or(true),
+            untracked: untracked.unwrap_or(true),
+        }
+    }
+}
+
+fn build_status_args(options: GitStatusOptions) -> Vec<String> {
+    let mut cmd_args: Vec<String> = vec!["status".into()];
+    if options.porcelain {
+        cmd_args.push("--porcelain=1".into());
+        if options.branch {
+            cmd_args.push("-b".into());
+        }
+        if !options.untracked {
+            cmd_args.push("-uno".into());
+        }
+    }
+    cmd_args
+}
+
+fn build_porcelain_clean_probe_args() -> Vec<String> {
+    vec!["status".into(), "--porcelain=1".into()]
+}
+
 fn porcelain_status_is_clean(stdout: &str) -> bool {
-    stdout
-        .lines()
-        .all(|line| line.trim().is_empty() || line.starts_with("##"))
+    PorcelainStatusSummary::parse_v1(stdout).is_clean()
 }
 
 fn clean_from_primary_status_output(porcelain: bool, stdout: &str) -> Option<bool> {
@@ -39,7 +77,7 @@ async fn probe_porcelain_status_clean(
 ) -> Result<bool, String> {
     let exec = run_git(
         working_dir,
-        vec!["status".into(), "--porcelain=1".into()],
+        build_porcelain_clean_probe_args(),
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
         DEFAULT_GIT_STDERR_BYTES,
@@ -85,24 +123,11 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
     };
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_GIT_TIMEOUT_MS);
-    let porcelain = req.porcelain.unwrap_or(true);
-    let branch = req.branch.unwrap_or(true);
-    let untracked = req.untracked.unwrap_or(true);
-
-    let mut cmd_args: Vec<String> = vec!["status".into()];
-    if porcelain {
-        cmd_args.push("--porcelain=1".into());
-        if branch {
-            cmd_args.push("-b".into());
-        }
-        if !untracked {
-            cmd_args.push("-uno".into());
-        }
-    }
+    let status_options = GitStatusOptions::from_optional(req.porcelain, req.branch, req.untracked);
 
     let exec = match run_git(
         req.working_dir.clone(),
-        cmd_args,
+        build_status_args(status_options),
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
         DEFAULT_GIT_STDERR_BYTES,
@@ -115,35 +140,26 @@ pub async fn handle_git_status(_id: Option<Value>, args: Value) -> ToolCallOutco
 
     let clean = if !exec.success {
         false
-    } else if porcelain {
-        clean_from_status_outputs(porcelain, &exec.stdout, Ok(false))
+    } else if status_options.porcelain {
+        clean_from_status_outputs(status_options.porcelain, &exec.stdout, Ok(false))
     } else {
         clean_from_status_outputs(
-            porcelain,
+            status_options.porcelain,
             &exec.stdout,
-            probe_porcelain_status_clean(req.working_dir.clone(), timeout_ms).await,
+            probe_porcelain_status_clean(exec.working_dir.clone(), timeout_ms).await,
         )
     };
-    let text = if exec.success {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else if !exec.stderr.trim().is_empty() {
-        exec.stderr.trim_end_matches(&['\r', '\n'][..]).to_string()
-    } else {
-        exec.stdout.trim_end_matches(&['\r', '\n'][..]).to_string()
-    };
+    let text = git_response_text(&exec);
 
-    let mut extra_fields = HashMap::new();
-    extra_fields.insert("clean", json!(clean));
-
-    let payload = build_git_response(&exec, &text, Some(extra_fields));
+    let payload = build_git_response_with_extra_fields(&exec, &text, [("clean", json!(clean))]);
     ToolCallOutcome::ok(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_from_primary_status_output, clean_from_status_outputs, handle_git_status,
-        porcelain_status_is_clean,
+        GitStatusOptions, build_status_args, clean_from_primary_status_output,
+        clean_from_status_outputs, handle_git_status, porcelain_status_is_clean,
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -185,6 +201,39 @@ mod tests {
             .status()
             .expect("git command should start");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn status_args_default_to_porcelain_with_branch_header() {
+        let args = build_status_args(GitStatusOptions::from_optional(None, None, None));
+
+        assert_eq!(args, strings(&["status", "--porcelain=1", "-b"]));
+    }
+
+    #[test]
+    fn status_args_preserve_untracked_suppression_in_porcelain_mode() {
+        let args = build_status_args(GitStatusOptions::from_optional(
+            Some(true),
+            Some(false),
+            Some(false),
+        ));
+
+        assert_eq!(args, strings(&["status", "--porcelain=1", "-uno"]));
+    }
+
+    #[test]
+    fn status_args_ignore_porcelain_only_flags_in_human_mode() {
+        let args = build_status_args(GitStatusOptions::from_optional(
+            Some(false),
+            Some(false),
+            Some(false),
+        ));
+
+        assert_eq!(args, strings(&["status"]));
     }
 
     #[test]

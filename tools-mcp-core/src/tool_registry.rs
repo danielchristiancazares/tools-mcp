@@ -36,53 +36,58 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
-type ToolExecutor = Box<
-    dyn Fn(Option<Value>, Value) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>>
-        + Send
-        + Sync,
->;
-
-struct ToolEntry {
-    def: ToolDef,
-    executor: ToolExecutor,
-}
+type ToolFuture = Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>>;
+type ToolExecutor = fn(Option<Value>, Value) -> ToolFuture;
 
 /// Registry of all MCP tools with lookup by canonical name.
 pub struct ToolRegistry {
-    tools: Vec<ToolEntry>,
+    definitions: Vec<ToolDef>,
+    executors: Vec<ToolExecutor>,
     lookup: HashMap<&'static str, usize>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: Vec::new(),
+            definitions: Vec::new(),
+            executors: Vec::new(),
             lookup: HashMap::new(),
         }
     }
 
     /// Register a tool type.
     pub fn register<T: McpTool>(&mut self) {
-        let index = self.tools.len();
+        let index = self.definitions.len();
+        self.lookup.reserve(1 + T::ALIASES.len());
+
         let def = ToolDef {
             name: T::NAME.to_string(),
             description: T::DESCRIPTION.to_string(),
             input_schema: T::input_schema(),
         };
 
-        let executor: ToolExecutor = Box::new(|id, args| T::execute(id, args));
+        let executor: ToolExecutor = T::execute;
 
         self.lookup.entry(T::NAME).or_insert(index);
         for &alias in T::ALIASES {
             self.lookup.entry(alias).or_insert(index);
         }
 
-        self.tools.push(ToolEntry { def, executor });
+        self.definitions.push(def);
+        self.executors.push(executor);
     }
 
     /// Get all tool definitions for protocol responses.
     pub fn list(&self) -> Vec<ToolDef> {
-        self.tools.iter().map(|e| e.def.clone()).collect()
+        self.definitions.clone()
+    }
+
+    /// Borrow registered tool definitions without cloning schemas.
+    ///
+    /// This is intended for server startup paths that serialize or cache the
+    /// complete tool list without allowing callers to mutate registry state.
+    pub fn definitions(&self) -> &[ToolDef] {
+        &self.definitions
     }
 
     /// Look up and execute a tool by name. Returns None if tool not found.
@@ -105,9 +110,12 @@ impl ToolRegistry {
         args: Value,
         token: CancellationToken,
     ) -> Option<DispatchOutcome> {
-        let entry = self.lookup.get(name).and_then(|idx| self.tools.get(*idx))?;
+        let executor = self
+            .lookup
+            .get(name)
+            .and_then(|idx| self.executors.get(*idx))?;
         let outcome = CURRENT_CANCEL_TOKEN
-            .scope(token.clone(), (entry.executor)(id, args))
+            .scope(token.clone(), executor(id, args))
             .await;
 
         if token.is_cancelled() {
@@ -175,7 +183,10 @@ macro_rules! define_mcp_tool {
             const DESCRIPTION: &'static str = $desc;
 
             fn input_schema() -> serde_json::Value {
-                serde_json::json!($schema)
+                static INPUT_SCHEMA: std::sync::OnceLock<serde_json::Value> =
+                    std::sync::OnceLock::new();
+
+                INPUT_SCHEMA.get_or_init(|| serde_json::json!($schema)).clone()
             }
 
             fn execute(
@@ -274,6 +285,40 @@ mod tests {
 
         let r1 = reg.call("Dummy", Some(json!(1)), json!({})).await;
         assert!(r1.is_some());
+    }
+
+    #[test]
+    fn macro_input_schema_returns_owned_values() {
+        let mut schema = DummyTool::input_schema();
+        schema["additionalProperties"] = json!(true);
+
+        assert_eq!(
+            DummyTool::input_schema(),
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn registry_definitions_borrows_registered_tool_definitions() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        let definitions = reg.definitions();
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "Dummy");
+        assert_eq!(
+            definitions[0].input_schema,
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        );
     }
 
     #[tokio::test]

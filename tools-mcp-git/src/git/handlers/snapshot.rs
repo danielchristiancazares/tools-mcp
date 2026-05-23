@@ -1,4 +1,5 @@
-use super::super::run_git;
+use super::super::types::GitExecResult;
+use super::super::{build_git_args, run_git, trim_git_line_end};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -117,16 +118,28 @@ pub async fn handle_git_snapshot(_id: Option<Value>, args: Value) -> ToolCallOut
     let clean = parsed.entries.is_empty();
 
     let (unstaged_diff, staged_diff) = if include_diff_stats {
-        let unstaged = match run_diff_stat(req.working_dir.clone(), false, &paths, timeout_ms).await
-        {
-            Ok(exec) => exec,
-            Err(err) => return ToolCallOutcome::err(format!("git diff --stat error: {err:#}")),
-        };
-        let staged = match run_diff_stat(req.working_dir.clone(), true, &paths, timeout_ms).await {
-            Ok(exec) => exec,
-            Err(err) => {
-                return ToolCallOutcome::err(format!("git diff --cached --stat error: {err:#}"));
-            }
+        let (unstaged, staged) = if clean && !status_exec.truncated_stdout {
+            (
+                empty_diff_stat_exec(&status_exec, false, &paths),
+                empty_diff_stat_exec(&status_exec, true, &paths),
+            )
+        } else {
+            let unstaged = run_diff_stat(req.working_dir.clone(), false, &paths, timeout_ms);
+            let staged = run_diff_stat(req.working_dir.clone(), true, &paths, timeout_ms);
+            let (unstaged, staged) = tokio::join!(unstaged, staged);
+            let unstaged = match unstaged {
+                Ok(exec) => exec,
+                Err(err) => return ToolCallOutcome::err(format!("git diff --stat error: {err:#}")),
+            };
+            let staged = match staged {
+                Ok(exec) => exec,
+                Err(err) => {
+                    return ToolCallOutcome::err(format!(
+                        "git diff --cached --stat error: {err:#}"
+                    ));
+                }
+            };
+            (unstaged, staged)
         };
 
         if !unstaged.success || !staged.success {
@@ -217,12 +230,7 @@ fn build_status_args(untracked: bool, paths: &[String]) -> Vec<String> {
     args
 }
 
-async fn run_diff_stat(
-    working_dir: Option<String>,
-    cached: bool,
-    paths: &[String],
-    timeout_ms: u64,
-) -> Result<super::super::types::GitExecResult, anyhow::Error> {
+fn build_diff_stat_args(cached: bool, paths: &[String]) -> Vec<String> {
     let mut args = vec![
         "diff".to_string(),
         "--no-ext-diff".to_string(),
@@ -233,15 +241,42 @@ async fn run_diff_stat(
         args.push("--cached".to_string());
     }
     append_pathspec(&mut args, paths);
+    args
+}
 
+async fn run_diff_stat(
+    working_dir: Option<String>,
+    cached: bool,
+    paths: &[String],
+    timeout_ms: u64,
+) -> Result<GitExecResult, anyhow::Error> {
     run_git(
         working_dir,
-        args,
+        build_diff_stat_args(cached, paths),
         timeout_ms,
         DEFAULT_GIT_STDOUT_BYTES,
         DEFAULT_GIT_STDERR_BYTES,
     )
     .await
+}
+
+fn empty_diff_stat_exec(
+    status_exec: &GitExecResult,
+    cached: bool,
+    paths: &[String],
+) -> GitExecResult {
+    GitExecResult {
+        git_bin: status_exec.git_bin.clone(),
+        args: build_git_args(build_diff_stat_args(cached, paths)),
+        working_dir: status_exec.working_dir.clone(),
+        exit_code: Some(0),
+        success: true,
+        stdout: String::new(),
+        stderr: String::new(),
+        truncated_stdout: false,
+        truncated_stderr: false,
+        timed_out: false,
+    }
 }
 
 fn append_pathspec(args: &mut Vec<String>, paths: &[String]) {
@@ -266,7 +301,9 @@ fn parse_porcelain_status(stdout: &str) -> StatusParse {
         let mut chars = line.chars();
         let index_status = chars.next().unwrap_or(' ');
         let worktree_status = chars.next().unwrap_or(' ');
-        let path_text = line[3..].to_string();
+        let Some(path_text) = line.get(3..) else {
+            continue;
+        };
         let (path, original_path) = parse_porcelain_path(path_text);
         parsed.entries.push(StatusEntry {
             index_status,
@@ -278,11 +315,11 @@ fn parse_porcelain_status(stdout: &str) -> StatusParse {
     parsed
 }
 
-fn parse_porcelain_path(path_text: String) -> (String, Option<String>) {
+fn parse_porcelain_path(path_text: &str) -> (String, Option<String>) {
     if let Some((original, path)) = path_text.split_once(" -> ") {
         (path.to_string(), Some(original.to_string()))
     } else {
-        (path_text, None)
+        (path_text.to_string(), None)
     }
 }
 
@@ -312,11 +349,18 @@ fn render_snapshot_text(
     unstaged_diff: Option<&str>,
     staged_diff: Option<&str>,
 ) -> String {
-    let mut text = String::new();
+    let status = trim_git_line_end(status_stdout);
+    let unstaged_diff = unstaged_diff.map(trim_git_line_end);
+    let staged_diff = staged_diff.map(trim_git_line_end);
+    let mut text = String::with_capacity(snapshot_text_capacity(
+        branch,
+        status,
+        unstaged_diff,
+        staged_diff,
+    ));
     let _ = writeln!(text, "branch: {}", branch.unwrap_or("<unknown>"));
     let _ = writeln!(text, "clean: {clean}");
     text.push_str("status:\n");
-    let status = status_stdout.trim_end_matches(&['\r', '\n'][..]);
     if status.is_empty() {
         text.push_str("  <clean>\n");
     } else {
@@ -335,20 +379,37 @@ fn render_snapshot_text(
     text
 }
 
+fn snapshot_text_capacity(
+    branch: Option<&str>,
+    status: &str,
+    unstaged_diff: Option<&str>,
+    staged_diff: Option<&str>,
+) -> usize {
+    let mut capacity = "branch: \nclean: false\nstatus:\n".len()
+        + branch.unwrap_or("<unknown>").len()
+        + status.len();
+    if let Some(diff) = unstaged_diff {
+        capacity += "\nunstaged diff stat:\n".len() + diff.len().max("  <none>".len()) + 1;
+    }
+    if let Some(diff) = staged_diff {
+        capacity += "\nstaged diff stat:\n".len() + diff.len().max("  <none>".len()) + 1;
+    }
+    capacity
+}
+
 fn push_optional_block(output: &mut String, block: &str, empty_text: &str) {
-    let trimmed = block.trim_end_matches(&['\r', '\n'][..]);
-    if trimmed.is_empty() {
+    if block.is_empty() {
         output.push_str(empty_text);
     } else {
-        output.push_str(trimmed);
+        output.push_str(block);
     }
     output.push('\n');
 }
 
 fn first_non_empty(first: &str, second: &str) -> String {
-    let first = first.trim_end_matches(&['\r', '\n'][..]);
+    let first = trim_git_line_end(first);
     if first.is_empty() {
-        second.trim_end_matches(&['\r', '\n'][..]).to_string()
+        trim_git_line_end(second).to_string()
     } else {
         first.to_string()
     }
@@ -369,7 +430,12 @@ fn command_summary(exec: &super::super::types::GitExecResult) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_status_entries, parse_porcelain_status, render_snapshot_text};
+    use super::super::super::{build_git_args, types::GitExecResult};
+    use super::{
+        build_diff_stat_args, command_summary, count_status_entries, empty_diff_stat_exec,
+        parse_porcelain_status, render_snapshot_text,
+    };
+    use serde_json::json;
 
     #[test]
     fn parse_porcelain_status_extracts_branch_and_entries() {
@@ -401,5 +467,58 @@ mod tests {
         assert!(text.contains("clean: true"));
         assert!(text.contains("unstaged diff stat:\n  <none>"));
         assert!(text.contains("staged diff stat:\n  <none>"));
+    }
+
+    #[test]
+    fn build_diff_stat_args_preserves_pathspec_and_cached_order() {
+        let paths = vec!["src/lib.rs".to_string(), "README.md".to_string()];
+
+        assert_eq!(
+            build_diff_stat_args(true, &paths),
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--stat",
+                "--cached",
+                "--",
+                "src/lib.rs",
+                "README.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_diff_stat_exec_matches_diff_command_summary_contract() {
+        let paths = vec!["src/lib.rs".to_string()];
+        let status_exec = GitExecResult {
+            git_bin: "git".to_string(),
+            args: Vec::new(),
+            working_dir: Some("C:/repo".to_string()),
+            exit_code: Some(0),
+            success: true,
+            stdout: "## main\n".to_string(),
+            stderr: String::new(),
+            truncated_stdout: false,
+            truncated_stderr: false,
+            timed_out: false,
+        };
+
+        let diff_exec = empty_diff_stat_exec(&status_exec, true, &paths);
+        let summary = command_summary(&diff_exec);
+
+        assert_eq!(
+            diff_exec.args,
+            build_git_args(build_diff_stat_args(true, &paths))
+        );
+        assert_eq!(diff_exec.working_dir, status_exec.working_dir);
+        assert_eq!(summary["args"], json!(diff_exec.args));
+        assert_eq!(summary["stdout"], "");
+        assert_eq!(summary["stderr"], "");
+        assert_eq!(summary["exit_code"], 0);
+        assert_eq!(summary["success"], true);
+        assert_eq!(summary["timed_out"], false);
+        assert_eq!(summary["truncated_stdout"], false);
+        assert_eq!(summary["truncated_stderr"], false);
     }
 }

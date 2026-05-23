@@ -52,6 +52,8 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
     );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(!names.contains(&"CodeQuery"));
+    assert!(names.contains(&"SemanticIndex"));
+    assert!(names.contains(&"SemanticSearch"));
     assert!(names.contains(&"WebFetch"));
 }
 

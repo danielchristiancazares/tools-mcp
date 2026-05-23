@@ -5,6 +5,7 @@
 //! when no exact match is found, to guide the caller.
 
 use anyhow::{Result, anyhow};
+use memchr::memmem::Finder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -33,7 +34,8 @@ pub(super) fn compute_match_range(
         return Ok(None);
     }
 
-    let haystack = &canonical.text;
+    let haystack = canonical.text.as_bytes();
+    let finder = Finder::new(needle.as_bytes());
     let search_slice = if let Some(h) = hint {
         let total_lines = canonical.line_views.len();
         let start_line = h.start_line.unwrap_or(1);
@@ -52,10 +54,10 @@ pub(super) fn compute_match_range(
     };
 
     if let Some((start, end)) = search_slice {
-        return Ok(haystack[start..end].find(needle).map(|rel| start + rel));
+        return Ok(finder.find(&haystack[start..end]).map(|rel| start + rel));
     }
 
-    Ok(haystack.find(needle))
+    Ok(finder.find(haystack))
 }
 
 pub(super) fn no_match_payload(model: &FileModel, needle: &str, hint: Option<&MatchHint>) -> Value {
@@ -70,6 +72,10 @@ pub(super) fn no_match_payload(model: &FileModel, needle: &str, hint: Option<&Ma
 }
 
 fn suggest_candidates(model: &FileModel, needle: &str, limit: usize) -> Vec<Value> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
     let lines = logical_snippet_lines(needle);
     if lines.is_empty() {
         return Vec::new();
@@ -84,21 +90,20 @@ fn suggest_candidates(model: &FileModel, needle: &str, limit: usize) -> Vec<Valu
         return Vec::new();
     }
 
-    let mut start = 0usize;
-    let mut seen = Vec::new();
-    let mut suggestions = Vec::new();
-    while let Some(pos) = model.canonical.text[start..].find(target) {
-        let absolute = start + pos;
+    let finder = Finder::new(target.as_bytes());
+    let mut suggestions = Vec::with_capacity(limit);
+    for absolute in finder.find_iter(model.canonical.text.as_bytes()) {
         let line_idx = model.canonical.line_index_for_offset(absolute).unwrap_or(0);
-        if !seen.contains(&line_idx) {
-            seen.push(line_idx);
+        if !suggestions
+            .iter()
+            .any(|(seen_idx, _)| *seen_idx == line_idx)
+        {
             let similarity = compute_line_similarity(&model.canonical.line_views, line_idx, &lines);
             suggestions.push((line_idx, similarity));
             if suggestions.len() >= limit {
                 break;
             }
         }
-        start = absolute + target.len();
     }
 
     suggestions

@@ -1,7 +1,10 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
+use std::ops::Range;
 use tools_mcp_core::{ToolCallOutcome, validation};
 
 use super::handle_search;
@@ -46,6 +49,7 @@ struct SearchContextRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MatchLocation {
     path: String,
+    read_path: String,
     line_number: usize,
 }
 
@@ -57,6 +61,27 @@ struct FileWindow {
     match_lines: Vec<usize>,
     total_lines: usize,
     text: String,
+}
+
+#[derive(Clone, Debug)]
+struct LossyLines<'a> {
+    text: Cow<'a, str>,
+    line_ranges: Vec<Range<usize>>,
+}
+
+impl LossyLines<'_> {
+    fn len(&self) -> usize {
+        self.line_ranges.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.line_ranges.is_empty()
+    }
+
+    fn line(&self, line_number: usize) -> Option<&str> {
+        let range = self.line_ranges.get(line_number.checked_sub(1)?)?;
+        self.text.get(range.start..range.end)
+    }
 }
 
 pub async fn handle_search_context(_id: Option<Value>, args: Value) -> ToolCallOutcome {
@@ -150,8 +175,12 @@ fn extract_match_locations(search_payload: &Value, root: &str) -> Vec<MatchLocat
                 .filter(|path| !path.trim().is_empty())?;
             let line_number = data.get("line_number")?.as_u64()?;
             let line_number = usize::try_from(line_number).ok()?;
-            let path = validate_match_path(path, root)?;
-            Some(MatchLocation { path, line_number })
+            let read_path = validate_match_path(path, root)?;
+            Some(MatchLocation {
+                path: path.to_string(),
+                read_path,
+                line_number,
+            })
         })
         .collect()
 }
@@ -179,50 +208,58 @@ async fn expand_match_windows(
     context_lines: usize,
 ) -> Result<Vec<FileWindow>, String> {
     let mut path_order = Vec::new();
-    let mut matches_by_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut matches_by_path: HashMap<&str, (String, Vec<usize>)> = HashMap::new();
     for location in matches {
-        if !matches_by_path.contains_key(location.path.as_str()) {
-            path_order.push(location.path.as_str());
+        match matches_by_path.entry(location.read_path.as_str()) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().1.push(location.line_number);
+            }
+            Entry::Vacant(entry) => {
+                path_order.push(location.read_path.as_str());
+                entry.insert((location.path.clone(), vec![location.line_number]));
+            }
         }
-        matches_by_path
-            .entry(location.path.as_str())
-            .or_default()
-            .push(location.line_number);
     }
 
-    let mut windows = Vec::new();
-    for path in path_order {
-        let data = tokio::fs::read(path)
+    let mut windows = Vec::with_capacity(matches.len());
+    for read_path in path_order {
+        let data = tokio::fs::read(read_path)
             .await
-            .map_err(|err| format!("failed to read search match path {path}: {err}"))?;
+            .map_err(|err| format!("failed to read search match path {read_path}: {err}"))?;
         let lines = collect_lines_lossy(&data);
         let total_lines = lines.len();
-        if total_lines == 0 {
+        if lines.is_empty() {
             continue;
         }
 
         let mut ranges = Vec::new();
-        if let Some(line_numbers) = matches_by_path.get_mut(path) {
-            line_numbers.sort_unstable();
-            line_numbers.dedup();
-            for line_number in line_numbers {
-                if *line_number == 0 || *line_number > total_lines {
-                    continue;
+        let display_path =
+            if let Some((display_path, line_numbers)) = matches_by_path.get_mut(read_path) {
+                ranges.reserve(line_numbers.len());
+                line_numbers.sort_unstable();
+                line_numbers.dedup();
+                for line_number in line_numbers {
+                    if *line_number == 0 || *line_number > total_lines {
+                        continue;
+                    }
+                    let start_line = line_number.saturating_sub(context_lines).max(1);
+                    let end_line = line_number.saturating_add(context_lines).min(total_lines);
+                    push_merged_range(&mut ranges, start_line, end_line, *line_number);
                 }
-                let start_line = line_number.saturating_sub(context_lines).max(1);
-                let end_line = line_number.saturating_add(context_lines).min(total_lines);
-                push_merged_range(&mut ranges, start_line, end_line, *line_number);
-            }
-        }
+                display_path.clone()
+            } else {
+                continue;
+            };
 
         for range in ranges {
+            let text = render_numbered_window(&lines, &range);
             windows.push(FileWindow {
-                path: path.to_string(),
+                path: display_path.clone(),
                 start_line: range.start_line,
                 end_line: range.end_line,
-                match_lines: range.match_lines.clone(),
+                match_lines: range.match_lines,
                 total_lines,
-                text: render_numbered_window(&lines, &range),
+                text,
             });
         }
     }
@@ -258,26 +295,81 @@ fn push_merged_range(
     });
 }
 
-fn collect_lines_lossy(data: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(data)
-        .lines()
-        .map(ToOwned::to_owned)
-        .collect()
+fn collect_lines_lossy(data: &[u8]) -> LossyLines<'_> {
+    let text = String::from_utf8_lossy(data);
+    let line_ranges = collect_line_ranges(text.as_ref());
+
+    LossyLines { text, line_ranges }
 }
 
-fn render_numbered_window(lines: &[String], range: &WindowRange) -> String {
-    let width = range.end_line.max(1).to_string().len();
-    let mut output = String::new();
+fn collect_line_ranges(text: &str) -> Vec<Range<usize>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+
+        let end = if index > start && bytes[index - 1] == b'\r' {
+            index - 1
+        } else {
+            index
+        };
+        ranges.push(start..end);
+        start = index + 1;
+    }
+
+    if start < bytes.len() {
+        ranges.push(start..bytes.len());
+    }
+
+    ranges
+}
+
+fn decimal_width(mut value: usize) -> usize {
+    value = value.max(1);
+    let mut width = 1;
+    while value >= 10 {
+        value /= 10;
+        width += 1;
+    }
+    width
+}
+
+fn render_numbered_window(lines: &LossyLines<'_>, range: &WindowRange) -> String {
+    let width = decimal_width(range.end_line);
+    let line_count = range.end_line.saturating_sub(range.start_line) + 1;
+    let line_bytes = (range.start_line..=range.end_line)
+        .filter_map(|line_number| lines.line(line_number))
+        .map(str::len)
+        .sum::<usize>();
+    let mut output =
+        String::with_capacity(line_bytes + line_count * (width + 2) + line_count.saturating_sub(1));
+    let mut match_line_index = 0;
+
     for line_number in range.start_line..=range.end_line {
         if line_number > range.start_line {
             output.push('\n');
         }
-        let marker = if range.match_lines.contains(&line_number) {
+        while range
+            .match_lines
+            .get(match_line_index)
+            .is_some_and(|match_line| *match_line < line_number)
+        {
+            match_line_index += 1;
+        }
+        let marker = if range.match_lines.get(match_line_index) == Some(&line_number) {
             '>'
         } else {
             ' '
         };
-        let line = lines.get(line_number - 1).map(String::as_str).unwrap_or("");
+        let line = lines.line(line_number).unwrap_or("");
         let _ = write!(output, "{marker}{line_number:>width$}\t{line}");
     }
     output
@@ -288,7 +380,17 @@ fn render_context_text(windows: &[FileWindow]) -> String {
         return String::new();
     }
 
-    let mut output = String::new();
+    let capacity = windows
+        .iter()
+        .fold(windows.len().saturating_sub(1) * 2, |capacity, window| {
+            capacity
+                + window.path.len()
+                + decimal_width(window.start_line)
+                + decimal_width(window.end_line)
+                + 3
+                + window.text.len()
+        });
+    let mut output = String::with_capacity(capacity);
     for (index, window) in windows.iter().enumerate() {
         if index > 0 {
             output.push_str("\n\n");
@@ -342,10 +444,16 @@ fn build_context_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        WindowRange, collect_lines_lossy, push_merged_range, render_numbered_window,
-        validate_match_path,
+        FileWindow, WindowRange, collect_lines_lossy, push_merged_range, render_context_text,
+        render_numbered_window, validate_match_path,
     };
     use std::fs;
+
+    fn line_texts<'a>(lines: &'a super::LossyLines<'_>) -> Vec<&'a str> {
+        (1..=lines.len())
+            .map(|line_number| lines.line(line_number).expect("line exists"))
+            .collect()
+    }
 
     #[test]
     fn push_merged_range_merges_overlapping_match_windows() {
@@ -373,18 +481,74 @@ mod tests {
     }
 
     #[test]
-    fn render_numbered_window_marks_match_lines() {
-        let lines = collect_lines_lossy(b"one\ntwo\nthree\nfour\n");
+    fn render_numbered_window_marks_multiple_match_lines() {
+        let lines = collect_lines_lossy(b"one\ntwo\nthree\nfour\nfive\n");
         let rendered = render_numbered_window(
             &lines,
             &WindowRange {
-                start_line: 2,
-                end_line: 4,
-                match_lines: vec![3],
+                start_line: 1,
+                end_line: 5,
+                match_lines: vec![2, 4],
             },
         );
 
-        assert_eq!(rendered, " 2\ttwo\n>3\tthree\n 4\tfour");
+        assert_eq!(rendered, " 1\tone\n>2\ttwo\n 3\tthree\n>4\tfour\n 5\tfive");
+    }
+
+    #[test]
+    fn collect_lines_lossy_matches_str_lines_edges() {
+        let lines = collect_lines_lossy(b"one\r\ntwo\n\nthree\r\n");
+
+        assert_eq!(line_texts(&lines), vec!["one", "two", "", "three"]);
+    }
+
+    #[test]
+    fn collect_lines_lossy_replaces_invalid_utf8() {
+        let lines = collect_lines_lossy(b"valid\ninvalid-\xFF-byte\n");
+
+        assert_eq!(line_texts(&lines), vec!["valid", "invalid-\u{FFFD}-byte"]);
+    }
+
+    #[test]
+    fn render_numbered_window_omits_crlf_terminators() {
+        let lines = collect_lines_lossy(b"alpha\r\nbeta\r\ngamma\r\n");
+        let rendered = render_numbered_window(
+            &lines,
+            &WindowRange {
+                start_line: 1,
+                end_line: 3,
+                match_lines: vec![2],
+            },
+        );
+
+        assert_eq!(rendered, " 1\talpha\n>2\tbeta\n 3\tgamma");
+    }
+
+    #[test]
+    fn render_context_text_assembles_window_headers_and_spacing() {
+        let rendered = render_context_text(&[
+            FileWindow {
+                path: "src/a.rs".to_string(),
+                start_line: 2,
+                end_line: 4,
+                match_lines: vec![3],
+                total_lines: 10,
+                text: " 2\tbefore\n>3\tmatch\n 4\tafter".to_string(),
+            },
+            FileWindow {
+                path: "src/b.rs".to_string(),
+                start_line: 7,
+                end_line: 7,
+                match_lines: vec![7],
+                total_lines: 8,
+                text: ">7\tother".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            rendered,
+            "src/a.rs:2-4\n 2\tbefore\n>3\tmatch\n 4\tafter\n\nsrc/b.rs:7-7\n>7\tother"
+        );
     }
 
     #[test]

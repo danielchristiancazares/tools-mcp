@@ -91,6 +91,70 @@ fn expand_single_brace(pattern: &str) -> Result<Option<Vec<String>>, String> {
     Ok(None)
 }
 
+fn glob_traversal_max_depth(patterns: &[String]) -> Option<usize> {
+    let mut max_depth = 0;
+
+    for pattern in patterns {
+        let depth = pattern_traversal_max_depth(pattern)?;
+        max_depth = max_depth.max(depth);
+    }
+
+    Some(max_depth)
+}
+
+fn pattern_traversal_max_depth(pattern: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut component_len = 0;
+    let mut component_is_recursive = false;
+    let mut in_class = false;
+
+    for ch in pattern.chars() {
+        if !in_class && is_glob_separator(ch) {
+            finish_depth_component(&mut depth, &mut component_len, &mut component_is_recursive)?;
+            continue;
+        }
+
+        match ch {
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            _ => {}
+        }
+
+        match component_len {
+            0 => component_is_recursive = ch == '*',
+            1 => component_is_recursive = component_is_recursive && ch == '*',
+            _ => component_is_recursive = false,
+        }
+        component_len += 1;
+    }
+
+    finish_depth_component(&mut depth, &mut component_len, &mut component_is_recursive)?;
+    Some(depth)
+}
+
+fn finish_depth_component(
+    depth: &mut usize,
+    component_len: &mut usize,
+    component_is_recursive: &mut bool,
+) -> Option<()> {
+    if *component_len == 0 {
+        return Some(());
+    }
+
+    if *component_len == 2 && *component_is_recursive {
+        return None;
+    }
+
+    *depth += 1;
+    *component_len = 0;
+    *component_is_recursive = false;
+    Some(())
+}
+
+fn is_glob_separator(ch: char) -> bool {
+    ch == '/' || ch == '\\'
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobRequest {
@@ -162,13 +226,14 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
 
     // Reuse the shared recursive-scope snapshot for this root + flag set so
     // repeat globs on the same scope skip an `ignore::WalkBuilder` traversal.
-    // The key flags mirror the prior in-line `WalkBuilder` defaults exactly
-    // (`hidden = include_hidden`, `follow_links = false`, `ignore = true`).
+    // Finite non-`**` patterns can bound traversal depth without changing
+    // which relative paths can match under `require_literal_separator`.
     let key = RepoScopeKey {
         root: base.to_path_buf(),
         hidden: include_hidden,
         follow: false,
         no_ignore: false,
+        max_depth: glob_traversal_max_depth(&expanded),
     };
     let deadline = Instant::now() + GLOB_SCOPE_CACHE_DEADLINE;
     let snapshot = match repo_scope_cache().get_or_build(&key, deadline) {
@@ -190,7 +255,7 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         }
     };
 
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::with_capacity(limit.min(snapshot.entries.len()));
     let mut truncated = false;
 
     for entry in &snapshot.entries {
@@ -217,9 +282,6 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             break;
         }
     }
-
-    // Sort for consistent output
-    files.sort();
 
     let text_output = if files.is_empty() {
         format!("No files match pattern: {}", req.pattern)
@@ -276,7 +338,8 @@ define_mcp_tool! {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_EXPANDED_PATTERNS, RepoScopeKey, expand_braces, handle_glob, repo_scope_cache,
+        MAX_EXPANDED_PATTERNS, RepoScopeKey, expand_braces, glob_traversal_max_depth, handle_glob,
+        repo_scope_cache,
     };
     use serde_json::json;
     use std::fs;
@@ -345,6 +408,18 @@ mod tests {
     }
 
     #[test]
+    fn derives_bounded_traversal_depth_for_finite_patterns() {
+        assert_eq!(
+            glob_traversal_max_depth(&["*.rs".to_string(), "src/*.rs".to_string()]),
+            Some(2)
+        );
+        assert_eq!(
+            glob_traversal_max_depth(&["src/**/mod.rs".to_string()]),
+            None
+        );
+    }
+
+    #[test]
     fn scope_cache_returns_same_snapshot_for_repeat_glob_key() {
         let dir = GlobTestDir::new("repeat-snapshot");
         fs::write(dir.path().join("alpha.rs"), "fn alpha() {}").expect("write alpha");
@@ -355,6 +430,7 @@ mod tests {
             hidden: false,
             follow: false,
             no_ignore: false,
+            max_depth: None,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
 
@@ -408,5 +484,40 @@ mod tests {
             files.iter().all(|f| !f.ends_with("gamma.txt")),
             "did not expect gamma.txt in {files:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_glob_returns_sorted_limited_files() {
+        let dir = GlobTestDir::new("sorted-limit");
+        fs::write(dir.path().join("zeta.rs"), "fn zeta() {}").expect("write zeta");
+        fs::write(dir.path().join("alpha.rs"), "fn alpha() {}").expect("write alpha");
+        fs::write(dir.path().join("beta.rs"), "fn beta() {}").expect("write beta");
+
+        let resp = handle_glob(
+            Some(json!(1)),
+            json!({
+                "pattern": "*.rs",
+                "path": dir.path().display().to_string(),
+                "limit": 2,
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(resp["isError"], false, "expected success: {resp}");
+        assert_eq!(resp["truncated"], true, "expected limit truncation: {resp}");
+
+        let files = resp["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .map(|v| {
+                PathBuf::from(v.as_str().unwrap_or_default())
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["alpha.rs", "beta.rs"]);
     }
 }

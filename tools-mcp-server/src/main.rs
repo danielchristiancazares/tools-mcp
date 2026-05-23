@@ -11,7 +11,6 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tools_mcp_core::{
     RpcResponse, read_mcp_message, should_skip_headers, write_mcp_payload_with_mode,
-    write_mcp_response_with_mode,
 };
 use tracing::{error, info};
 
@@ -32,13 +31,13 @@ enum ServerControl {
     AbortPendingTasks,
 }
 
-async fn write_response(
+async fn write_response<T: serde::Serialize + ?Sized>(
     writer: &SharedWriter,
-    response: &RpcResponse,
+    response: &T,
     skip_headers: bool,
 ) -> Result<()> {
     let mut writer = writer.lock().await;
-    write_mcp_response_with_mode(&mut *writer, response, skip_headers).await
+    write_mcp_payload_with_mode(&mut *writer, response, skip_headers).await
 }
 
 async fn write_payload<T: serde::Serialize + ?Sized>(
@@ -50,19 +49,8 @@ async fn write_payload<T: serde::Serialize + ?Sized>(
     write_mcp_payload_with_mode(&mut *writer, payload, skip_headers).await
 }
 
-fn is_tool_call_method(method: &str) -> bool {
-    matches!(
-        method,
-        "mcp/tools/call" | "tools/call" | "server/tools/call"
-    )
-}
-
-fn is_shutdown_method(method: &str) -> bool {
-    matches!(method, "mcp/shutdown" | "shutdown" | "server/shutdown")
-}
-
 fn request_requests_shutdown(req: &RpcRequest) -> bool {
-    !req.is_notification && is_shutdown_method(&req.method)
+    !req.is_notification && req.method_kind.is_shutdown()
 }
 
 fn batch_requests_shutdown(items: &[RpcBatchItem]) -> bool {
@@ -219,7 +207,7 @@ async fn main() -> Result<()> {
                 let control_tx = control_tx.clone();
                 let abort_requested = Arc::clone(&abort_requested);
                 let cancellation_token =
-                    is_tool_call_method(&req.method).then(CancellationToken::new);
+                    req.method_kind.is_tool_call().then(CancellationToken::new);
                 let inflight_guard = cancellation_token.as_ref().and_then(|token| {
                     req.id
                         .as_ref()
@@ -244,7 +232,7 @@ async fn main() -> Result<()> {
                         return;
                     };
 
-                    info!("Sending response for request id: {:?}", resp.id);
+                    info!("Sending response for request id: {:?}", resp.id());
                     if let Err(write_err) = write_response(&writer, &resp, skip_headers).await {
                         error!("failed to write MCP response: {}", write_err);
                         abort_requested.store(true, Ordering::SeqCst);

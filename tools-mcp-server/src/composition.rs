@@ -86,6 +86,7 @@ pub fn build_tool_registry() -> ToolRegistry {
     registry.register::<crate::ping::PingTool>();
     tools_mcp_webfetch::register_tools(&mut registry);
     tools_mcp_local::register_tools(&mut registry);
+    tools_mcp_semantic::register_tools(&mut registry);
     tools_mcp_git::register_tools(&mut registry);
 
     registry

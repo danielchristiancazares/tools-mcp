@@ -1,5 +1,9 @@
 //! Text helpers shared across tool crates.
 
+use memchr::memchr;
+
+const ESC: u8 = b'\x1b';
+
 /// Strips ANSI escape codes from a string, returning clean plaintext.
 ///
 /// Handles CSI sequences (`ESC [ ... final_byte`), OSC sequences
@@ -15,62 +19,80 @@
 /// assert_eq!(strip_ansi_codes(colored), "Error: file not found");
 /// ```
 pub fn strip_ansi_codes(s: &str) -> String {
-    if !s.as_bytes().contains(&b'\x1b') {
+    let bytes = s.as_bytes();
+    let Some(mut marker) = find_next_esc(bytes, 0) else {
         return s.to_owned();
-    }
+    };
 
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    let mut span_start = 0usize;
 
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            result.push(c);
-            continue;
-        }
+    loop {
+        result.push_str(&s[span_start..marker]);
 
-        match chars.peek() {
-            Some('[') => {
-                // CSI: ESC [ <params> <final_byte in 0x40..=0x7E>
-                chars.next();
-                while let Some(&ch) = chars.peek() {
-                    chars.next();
-                    if ('@'..='~').contains(&ch) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                // OSC: ESC ] <data> (BEL | ESC \)
-                chars.next();
-                while let Some(&ch) = chars.peek() {
-                    if ch == '\x07' {
-                        chars.next();
-                        break;
-                    }
-                    if ch == '\x1b' {
-                        chars.next();
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                        continue;
-                    }
-                    chars.next();
-                }
-            }
-            Some('(' | ')') => {
-                // Character-set designation: ESC ( G  or  ESC ) G
-                chars.next();
-                chars.next();
-            }
-            _ => {
-                // Other single-char escapes (e.g. ESC M reverse linefeed)
-                chars.next();
-            }
-        }
+        span_start = skip_esc_sequence(s, bytes, marker + 1);
+
+        let Some(next_marker) = find_next_esc(bytes, span_start) else {
+            break;
+        };
+        marker = next_marker;
     }
 
+    result.push_str(&s[span_start..]);
     result
+}
+
+fn find_next_esc(bytes: &[u8], start: usize) -> Option<usize> {
+    memchr(ESC, &bytes[start..]).map(|relative| start + relative)
+}
+
+fn skip_esc_sequence(s: &str, bytes: &[u8], mut cursor: usize) -> usize {
+    if cursor >= bytes.len() {
+        return cursor;
+    }
+
+    match bytes[cursor] {
+        b'[' => skip_csi_sequence(bytes, cursor + 1),
+        b']' => skip_string_control_sequence(bytes, cursor + 1),
+        b'(' | b')' => {
+            cursor += 1;
+            skip_one_scalar(s, cursor)
+        }
+        _ => skip_one_scalar(s, cursor),
+    }
+}
+
+fn skip_one_scalar(s: &str, cursor: usize) -> usize {
+    s.get(cursor..)
+        .and_then(|tail| tail.chars().next())
+        .map_or(cursor, |ch| cursor + ch.len_utf8())
+}
+
+fn skip_csi_sequence(bytes: &[u8], mut cursor: usize) -> usize {
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        cursor += 1;
+        if (0x40..=0x7E).contains(&byte) {
+            break;
+        }
+    }
+    cursor
+}
+
+fn skip_string_control_sequence(bytes: &[u8], mut cursor: usize) -> usize {
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\x07' => return cursor + 1,
+            ESC => {
+                cursor += 1;
+                if cursor < bytes.len() && bytes[cursor] == b'\\' {
+                    return cursor + 1;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    cursor
 }
 
 /// Truncates `s` to at most `max_chars` Unicode scalar values at a char boundary,
@@ -87,16 +109,15 @@ pub fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
         };
     }
 
-    let mut truncation_byte_idx = s.len();
-    for (char_count, (byte_idx, _)) in s.char_indices().enumerate() {
-        if char_count == max_chars {
-            truncation_byte_idx = byte_idx;
-            break;
-        }
+    if s.len() <= max_chars {
+        return s.to_string();
     }
 
-    if truncation_byte_idx < s.len() {
-        format!("{}…", &s[..truncation_byte_idx])
+    if let Some((truncation_byte_idx, _)) = s.char_indices().nth(max_chars) {
+        let mut truncated = String::with_capacity(truncation_byte_idx + '…'.len_utf8());
+        truncated.push_str(&s[..truncation_byte_idx]);
+        truncated.push('…');
+        truncated
     } else {
         s.to_string()
     }
@@ -125,6 +146,42 @@ mod tests {
     #[test]
     fn strip_ansi_codes_passthrough() {
         assert_eq!(strip_ansi_codes("Hello, world!"), "Hello, world!");
+    }
+
+    #[test]
+    fn strip_ansi_codes_preserves_unicode_around_escapes() {
+        assert_eq!(
+            strip_ansi_codes("pré\x1b[31mfix\x1b[0m 漢字"),
+            "préfix 漢字"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_drops_incomplete_escape_at_end() {
+        assert_eq!(strip_ansi_codes("partial\x1b["), "partial");
+    }
+
+    #[test]
+    fn strip_ansi_codes_preserves_c1_controls_without_esc() {
+        assert_eq!(
+            strip_ansi_codes("\u{009b}31mred\u{009b}0m plain"),
+            "\u{009b}31mred\u{009b}0m plain"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_preserves_payload_after_unsupported_esc_sequences() {
+        assert_eq!(strip_ansi_codes("\x1bPpayload\x1b\\done"), "payloaddone");
+    }
+
+    #[test]
+    fn strip_ansi_codes_consumes_full_unicode_scalar_after_single_char_escape() {
+        assert_eq!(strip_ansi_codes("\x1béx"), "x");
+    }
+
+    #[test]
+    fn strip_ansi_codes_consumes_full_unicode_scalar_after_charset_escape() {
+        assert_eq!(strip_ansi_codes("\x1b(éx"), "x");
     }
 
     #[test]

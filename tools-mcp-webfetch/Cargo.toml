@@ -14,7 +14,6 @@ chromiumoxide.workspace = true
 futures.workspace = true
 hex.workspace = true
 htmd.workspace = true
-readability.workspace = true
 reqwest.workspace = true
 robotstxt.workspace = true
 scraper.workspace = true

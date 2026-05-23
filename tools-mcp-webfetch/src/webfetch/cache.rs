@@ -44,7 +44,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -369,7 +369,7 @@ fn read_cache_from_root(
 ) -> Result<Option<CachedFetch>> {
     let path = cache_path_in_root(root, url);
     if is_readable_cache_leaf(&path)? {
-        let mut file = match open_cache_file_for_read(&path) {
+        let file = match open_cache_file_for_read(&path) {
             Ok(file) => file,
             Err(err) if is_symlink_open_error(&err) => {
                 remove_cache_file_best_effort(&path, "unsafe");
@@ -397,9 +397,7 @@ fn read_cache_from_root(
             return Ok(None);
         }
 
-        let mut buf = Vec::with_capacity(file_len as usize);
-        file.read_to_end(&mut buf).context("read cache file")?;
-        match serde_json::from_slice::<CachedFetch>(&buf) {
+        match serde_json::from_reader::<_, CachedFetch>(BufReader::new(file)) {
             Ok(entry) => {
                 if is_expired(entry.fetched_at, policy.ttl, Utc::now()) {
                     remove_cache_file_best_effort(&path, "expired");
@@ -408,6 +406,7 @@ fn read_cache_from_root(
                     Ok(Some(entry))
                 }
             }
+            Err(err) if err.is_io() => Err(err).context("read cache file"),
             Err(err) => {
                 remove_cache_file_best_effort(&path, "corrupted");
                 tracing::warn!(
@@ -1161,6 +1160,23 @@ mod tests {
         assert!(
             target.exists(),
             "rejecting a symlinked cache entry must not remove its target"
+        );
+    }
+
+    #[test]
+    fn read_cache_treats_non_file_cache_entry_as_miss() {
+        let cache = TestCacheDir::new("cache-entry-non-file");
+        let key = format!("test://cache-entry-non-file-{}_http", uuid::Uuid::new_v4());
+        let path = cache.path_for(&key);
+        fs::create_dir(&path).expect("create non-file cache entry");
+
+        let loaded = read_cache_from_root(cache.root(), &key, CachePolicy::defaults())
+            .expect("non-file cache entry should be treated as cache miss");
+
+        assert!(loaded.is_none());
+        assert!(
+            path.is_dir(),
+            "non-file cache entry should not be read as cache data"
         );
     }
 

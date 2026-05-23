@@ -101,6 +101,8 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"Ping"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
+    assert!(tool_names.contains(&"SemanticIndex"));
+    assert!(tool_names.contains(&"SemanticSearch"));
     assert!(tool_names.contains(&"search_context"));
     assert!(!tool_names.contains(&"CodeQuery"));
     assert!(tool_names.contains(&"Read"));

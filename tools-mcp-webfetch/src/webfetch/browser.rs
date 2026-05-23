@@ -41,12 +41,15 @@
 //! - Images are disabled via Blink settings
 //! - Web fonts are disabled (system fallbacks used)
 //! - Video/audio autoplay is blocked
+//! - Browser cache and service workers are bypassed for render requests
 //! - Background networking is disabled
 
 use anyhow::{Context, Result, anyhow};
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
-use chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired;
+use chromiumoxide::cdp::browser_protocol::network::{
+    EventResponseReceived, SetBlockedUrLsParams, SetBypassServiceWorkerParams,
+};
+use chromiumoxide::listeners::EventStream;
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -70,9 +73,72 @@ const MAX_BROWSER_AGE: Duration = Duration::from_secs(3600); // 1 hour
 /// Covers DNS resolution, TCP connect, TLS handshake, and initial HTML load.
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Timeout for Chrome process launch and CDP connection setup.
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for individual CDP protocol requests.
+const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for opening a new tab in an existing browser process.
+const PAGE_CREATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for closing a tab after render completion, error, or timeout.
+const PAGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for asking Chrome to close during managed browser restart.
+const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for reaping the Chrome child process after a clean close.
+const BROWSER_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Time to wait for network activity to settle after page load.
 /// Allows dynamic content and XHR requests to complete.
 const NETWORK_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time spent waiting for network idle after navigation finishes.
+const NETWORK_IDLE_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// Passive resource URL patterns blocked through CDP.
+///
+/// Scripts, stylesheets, and documents are intentionally not blocked because
+/// browser rendering is only useful when page JavaScript can hydrate content.
+const BLOCKED_RESOURCE_URL_PATTERNS: &[&str] = &[
+    "data:image/*",
+    "*://*/*.avif",
+    "*://*/*.avif?*",
+    "*://*/*.bmp",
+    "*://*/*.bmp?*",
+    "*://*/*.gif",
+    "*://*/*.gif?*",
+    "*://*/*.ico",
+    "*://*/*.ico?*",
+    "*://*/*.jpeg",
+    "*://*/*.jpeg?*",
+    "*://*/*.jpg",
+    "*://*/*.jpg?*",
+    "*://*/*.png",
+    "*://*/*.png?*",
+    "*://*/*.webp",
+    "*://*/*.webp?*",
+    "*://*/*.mp3",
+    "*://*/*.mp3?*",
+    "*://*/*.mp4",
+    "*://*/*.mp4?*",
+    "*://*/*.ogg",
+    "*://*/*.ogg?*",
+    "*://*/*.wav",
+    "*://*/*.wav?*",
+    "*://*/*.webm",
+    "*://*/*.webm?*",
+    "*://*/*.otf",
+    "*://*/*.otf?*",
+    "*://*/*.ttf",
+    "*://*/*.ttf?*",
+    "*://*/*.woff",
+    "*://*/*.woff?*",
+    "*://*/*.woff2",
+    "*://*/*.woff2?*",
+];
 
 /// Thread-safe browser pool with automatic lifecycle management.
 ///
@@ -167,8 +233,7 @@ impl BrowserPool {
         // ====================================================================
         let needs_restart = if let Some(instance) = &*guard {
             let age = instance.created_at.elapsed();
-            let should_restart =
-                instance.request_count >= MAX_REQUESTS_BEFORE_RESTART || age >= MAX_BROWSER_AGE;
+            let should_restart = should_restart_browser(instance.request_count, age);
 
             if should_restart {
                 info!(
@@ -191,9 +256,7 @@ impl BrowserPool {
             match Arc::get_mut(&mut instance.browser) {
                 Some(browser) => {
                     // We have exclusive access - close cleanly via CDP
-                    if let Err(e) = browser.close().await {
-                        warn!("Error closing browser during restart: {}", e);
-                    }
+                    close_browser_for_restart(browser).await;
                 }
                 None => {
                     // Other references exist (concurrent renders in progress).
@@ -258,20 +321,28 @@ impl BrowserPool {
     ///
     /// # Timeout Behavior
     ///
-    /// The entire render operation is wrapped in a 15-second timeout.
-    /// This covers navigation, JavaScript execution, and network idle wait.
+    /// Page creation, rendering, and page close are each bounded. Rendering is
+    /// wrapped in a 15-second timeout that covers navigation, JavaScript
+    /// execution, and network idle wait.
     pub async fn render_page(&self, url: &str) -> Result<String> {
         let browser = self.get_or_spawn().await?;
 
         // Open new tab starting at about:blank (stealth config applied before navigation)
-        let page = browser
-            .new_page("about:blank")
+        let page = tokio::time::timeout(PAGE_CREATE_TIMEOUT, browser.new_page("about:blank"))
             .await
+            .map_err(|_| anyhow!("Timed out creating browser page after {PAGE_CREATE_TIMEOUT:?}"))?
             .context("Failed to create new browser page")?;
 
         // Render with timeout
         let result =
-            tokio::time::timeout(NAVIGATION_TIMEOUT, render_page_internal(page, url)).await;
+            tokio::time::timeout(NAVIGATION_TIMEOUT, render_page_internal(&page, url)).await;
+
+        // Always attempt to close the page, including after render timeout.
+        match tokio::time::timeout(PAGE_CLOSE_TIMEOUT, page.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Error closing page: {}", e),
+            Err(_) => warn!("Timed out closing browser page after {PAGE_CLOSE_TIMEOUT:?}"),
+        }
 
         match result {
             Ok(Ok(html)) => Ok(html),
@@ -343,13 +414,16 @@ async fn spawn_browser() -> Result<Browser> {
 
     let config = BrowserConfig::builder()
         .chrome_executable(&chrome_path)
+        .new_headless_mode()
+        .no_sandbox()
+        .incognito()
+        .disable_cache()
+        .launch_timeout(BROWSER_LAUNCH_TIMEOUT)
+        .request_timeout(CDP_REQUEST_TIMEOUT)
         .disable_default_args() // We'll specify our own for better control
         .args(vec![
-            "--headless=new".to_string(),
             "--disable-gpu".to_string(),
-            "--no-sandbox".to_string(), // Required for containerized environments
             "--disable-dev-shm-usage".to_string(),
-            "--disable-setuid-sandbox".to_string(),
             // Memory limits to prevent leaks
             "--max-old-space-size=512".to_string(),
             // Block resource loading for performance and bandwidth
@@ -369,7 +443,6 @@ async fn spawn_browser() -> Result<Browser> {
             "--disable-features=TranslateUI".to_string(),
             "--disable-hang-monitor".to_string(),
             "--disable-ipc-flooding-protection".to_string(),
-            "--disable-popup-blocking".to_string(),
             "--disable-prompt-on-repost".to_string(),
             "--disable-sync".to_string(),
             "--metrics-recording-only".to_string(),
@@ -396,57 +469,92 @@ async fn spawn_browser() -> Result<Browser> {
     Ok(browser)
 }
 
-/// Internal page rendering logic with guaranteed cleanup.
+/// Internal page rendering logic.
 ///
 /// This function handles the complete page lifecycle:
 /// 1. Apply stealth configuration (user agent, JS patches)
-/// 2. Navigate to the target URL
-/// 3. Wait for the page load event
-/// 4. Wait for network activity to settle (XHR, dynamic content)
-/// 5. Extract the rendered HTML
-/// 6. Close the page (always, even on error)
-///
-/// # Page Cleanup
-///
-/// The page is always closed after rendering, regardless of success or failure.
-/// This prevents resource leaks from accumulated browser tabs.
-async fn render_page_internal(page: Page, url: &str) -> Result<String> {
+/// 2. Apply per-page network restrictions
+/// 3. Subscribe to network events
+/// 4. Navigate to the target URL
+/// 5. Wait for network activity to settle (XHR, dynamic content)
+/// 6. Extract the rendered HTML
+async fn render_page_internal(page: &Page, url: &str) -> Result<String> {
     debug!("Navigating to: {}", url);
 
-    // Use async block to ensure page cleanup happens even on early return/error
-    let result: Result<String> = async {
-        // Step 1: Apply stealth configuration before navigation
-        configure_stealth(&page).await?;
+    // Step 1: Apply page configuration before navigation
+    configure_page_network(page).await?;
+    configure_stealth(page).await?;
 
-        // Step 2: Navigate to target URL
-        page.goto(url).await.context("Failed to navigate to URL")?;
+    // Step 2: Subscribe before navigation so the idle wait sees navigation-time responses.
+    let response_event = page.event_listener::<EventResponseReceived>().await?;
 
-        // Step 3: Wait for initial page load (DOMContentLoaded + resources)
-        debug!("Waiting for page load event");
-        let mut load_event = page.event_listener::<EventLoadEventFired>().await?;
-        let _ = tokio::time::timeout(Duration::from_secs(10), load_event.next()).await;
+    // Step 3: Navigate to target URL. chromiumoxide::Page::goto resolves after load.
+    page.goto(url).await.context("Failed to navigate to URL")?;
 
-        // Step 4: Wait for network to settle (catches AJAX/fetch requests)
-        debug!("Waiting for network idle");
-        wait_for_network_idle(&page).await?;
+    // Step 4: Wait for network to settle (catches AJAX/fetch requests)
+    debug!("Waiting for network idle");
+    wait_for_network_idle(response_event).await?;
 
-        // Step 5: Extract fully-rendered HTML including JS-generated content
-        debug!("Extracting HTML content");
-        let html = page
-            .content()
-            .await
-            .context("Failed to extract page content")?;
+    // Step 5: Extract fully-rendered HTML including JS-generated content
+    debug!("Extracting HTML content");
+    page.content()
+        .await
+        .context("Failed to extract page content")
+}
 
-        Ok(html)
+fn should_restart_browser(request_count: usize, age: Duration) -> bool {
+    request_count >= MAX_REQUESTS_BEFORE_RESTART || age >= MAX_BROWSER_AGE
+}
+
+async fn close_browser_for_restart(browser: &mut Browser) {
+    match tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.close()).await {
+        Ok(Ok(_)) => match tokio::time::timeout(BROWSER_WAIT_TIMEOUT, browser.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("Error waiting for browser process during restart: {}", e),
+            Err(_) => {
+                warn!("Timed out waiting for browser process during restart");
+                kill_browser_for_restart(browser).await;
+            }
+        },
+        Ok(Err(e)) => {
+            warn!("Error closing browser during restart: {}", e);
+            kill_browser_for_restart(browser).await;
+        }
+        Err(_) => {
+            warn!("Timed out closing browser during restart");
+            kill_browser_for_restart(browser).await;
+        }
     }
-    .await;
+}
 
-    // Step 6: Always close page to free resources (runs even if above failed)
-    if let Err(e) = page.close().await {
-        warn!("Error closing page: {}", e);
+async fn kill_browser_for_restart(browser: &mut Browser) {
+    match tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.kill()).await {
+        Ok(Some(Ok(()))) | Ok(None) => {}
+        Ok(Some(Err(e))) => warn!("Error killing browser during restart: {}", e),
+        Err(_) => warn!("Timed out killing browser during restart"),
     }
+}
 
-    result
+/// Applies per-page network restrictions before navigation.
+///
+/// This complements Chrome process flags with CDP controls that are scoped to
+/// each new page. It keeps JavaScript and documents available for hydration
+/// while blocking passive resources and avoiding service worker interception.
+async fn configure_page_network(page: &Page) -> Result<()> {
+    page.execute(SetBypassServiceWorkerParams::new(true))
+        .await
+        .context("Failed to bypass service workers")?;
+
+    page.execute(SetBlockedUrLsParams::new(
+        BLOCKED_RESOURCE_URL_PATTERNS
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+    ))
+    .await
+    .context("Failed to configure blocked resource URL patterns")?;
+
+    Ok(())
 }
 
 /// Applies stealth configuration to avoid headless browser detection.
@@ -495,9 +603,9 @@ async fn configure_stealth(page: &Page) -> Result<()> {
         });
     ";
 
-    page.evaluate(stealth_script)
+    page.evaluate_on_new_document(stealth_script)
         .await
-        .context("Failed to inject stealth script")?;
+        .context("Failed to install stealth script")?;
 
     Ok(())
 }
@@ -513,36 +621,43 @@ async fn configure_stealth(page: &Page) -> Result<()> {
 /// 1. Subscribe to CDP `Network.responseReceived` events
 /// 2. Track timestamp of last network activity
 /// 3. Wait until no activity for 2 seconds (idle timeout)
-/// 4. Safety limit: Always exit after 20 seconds maximum
+/// 4. Safety limit: Always exit after 5 seconds maximum
 ///
 /// ## Exit Conditions
 ///
 /// The function returns when any of these conditions are met:
 /// - No network activity for 2 seconds (success - page is idle)
 /// - Event stream ends (browser closed or navigation)
-/// - 20 second safety timeout exceeded (prevents infinite wait)
+/// - 5 second safety timeout exceeded (prevents infinite wait)
 ///
 /// # Note
 ///
 /// This heuristic works well for typical SPAs but may not catch all dynamic
 /// content (e.g., content loaded on scroll or after user interaction).
-async fn wait_for_network_idle(page: &Page) -> Result<()> {
-    let mut response_event = page.event_listener::<EventResponseReceived>().await?;
+async fn wait_for_network_idle(
+    mut response_event: EventStream<EventResponseReceived>,
+) -> Result<()> {
     let start = Instant::now();
     let mut last_activity = Instant::now();
 
     loop {
         // Calculate remaining time until we consider network idle
-        let timeout_remaining = NETWORK_IDLE_TIMEOUT
-            .checked_sub(last_activity.elapsed())
-            .unwrap_or(Duration::from_secs(0));
+        let timeout_remaining = NETWORK_IDLE_TIMEOUT.saturating_sub(last_activity.elapsed());
 
         if timeout_remaining.is_zero() {
             debug!("Network idle detected");
             break;
         }
 
-        match tokio::time::timeout(timeout_remaining, response_event.next()).await {
+        let max_wait_remaining = NETWORK_IDLE_MAX_WAIT.saturating_sub(start.elapsed());
+        if max_wait_remaining.is_zero() {
+            debug!("Network idle wait timeout (safety limit)");
+            break;
+        }
+
+        let wait_for = std::cmp::min(timeout_remaining, max_wait_remaining);
+
+        match tokio::time::timeout(wait_for, response_event.next()).await {
             Ok(Some(_)) => {
                 // Network activity detected - reset the idle timer
                 last_activity = Instant::now();
@@ -552,15 +667,13 @@ async fn wait_for_network_idle(page: &Page) -> Result<()> {
                 break;
             }
             Err(_) => {
-                // Timeout expired with no activity - network is idle
+                if start.elapsed() >= NETWORK_IDLE_MAX_WAIT {
+                    debug!("Network idle wait timeout (safety limit)");
+                } else {
+                    debug!("Network idle detected");
+                }
                 break;
             }
-        }
-
-        // Safety valve: never wait longer than 20 seconds total
-        if start.elapsed() > Duration::from_secs(20) {
-            debug!("Network idle wait timeout (safety limit)");
-            break;
         }
     }
 
@@ -666,6 +779,37 @@ fn find_binary_in_path(bin: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_policy_keeps_fresh_browser() {
+        assert!(!should_restart_browser(0, Duration::ZERO));
+        assert!(!should_restart_browser(
+            MAX_REQUESTS_BEFORE_RESTART - 1,
+            MAX_BROWSER_AGE.saturating_sub(Duration::from_secs(1)),
+        ));
+    }
+
+    #[test]
+    fn restart_policy_restarts_at_request_limit() {
+        assert!(should_restart_browser(
+            MAX_REQUESTS_BEFORE_RESTART,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn restart_policy_restarts_at_age_limit() {
+        assert!(should_restart_browser(0, MAX_BROWSER_AGE));
+    }
+
+    #[test]
+    fn blocked_resource_patterns_preserve_documents_and_scripts() {
+        assert!(
+            !BLOCKED_RESOURCE_URL_PATTERNS
+                .iter()
+                .any(|pattern| pattern == &"*" || pattern.contains(".js"))
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires Chrome/Chromium installation"]
