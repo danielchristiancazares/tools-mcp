@@ -202,7 +202,13 @@ fn tags_query_chunks(
         ));
     }
 
-    chunks.sort_by_key(|chunk| (chunk.start_line, chunk.end_line, chunk.chunk_id.clone()));
+    chunks.sort_by(|left, right| {
+        (left.start_line, left.end_line, left.chunk_id.as_str()).cmp(&(
+            right.start_line,
+            right.end_line,
+            right.chunk_id.as_str(),
+        ))
+    });
     chunks
 }
 

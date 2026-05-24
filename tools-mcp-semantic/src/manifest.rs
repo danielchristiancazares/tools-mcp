@@ -85,12 +85,12 @@ impl IndexManifest {
     pub(crate) fn stale_paths_under(
         &self,
         filter: &crate::discovery::PathFilter,
-        discovered: &HashSet<String>,
+        discovered: &HashSet<&str>,
     ) -> Vec<String> {
         self.files
             .keys()
-            .filter(|path| filter.contains(path))
-            .filter(|path| !discovered.contains(*path))
+            .filter(|path| filter.contains(path.as_str()))
+            .filter(|path| !discovered.contains(path.as_str()))
             .cloned()
             .collect()
     }

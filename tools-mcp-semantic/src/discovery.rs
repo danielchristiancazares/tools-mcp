@@ -221,10 +221,15 @@ pub(crate) fn storage_relative_path(workspace: &Path, path: &Path) -> Result<Str
         return Ok(".".to_string());
     }
 
-    let mut parts = Vec::new();
+    let mut normalized = String::new();
     for component in relative.components() {
         match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::Normal(part) => {
+                if !normalized.is_empty() {
+                    normalized.push('/');
+                }
+                normalized.push_str(&part.to_string_lossy());
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
                 bail!(
@@ -234,7 +239,7 @@ pub(crate) fn storage_relative_path(workspace: &Path, path: &Path) -> Result<Str
             }
         }
     }
-    Ok(parts.join("/"))
+    Ok(normalized)
 }
 
 pub(crate) fn escape_sql_literal(value: &str) -> String {
@@ -340,9 +345,9 @@ fn language_for_extension(extension: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn discovered_path_set(files: &[FileCandidate]) -> HashSet<String> {
+pub(crate) fn discovered_path_set(files: &[FileCandidate]) -> HashSet<&str> {
     let mut paths = HashSet::with_capacity(files.len());
-    paths.extend(files.iter().map(|file| file.relative_path.clone()));
+    paths.extend(files.iter().map(|file| file.relative_path.as_str()));
     paths
 }
 

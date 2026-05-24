@@ -44,6 +44,7 @@ const DEFAULT_WARM_CACHE_GIT_TIMEOUT_MS: u64 = 2_000;
 const TRIGRAM_DEADLINE_CHECK_STRIDE: usize = 1024;
 const POSTINGS_DEADLINE_CHECK_STRIDE: usize = 1024;
 const LINE_VERIFY_DEADLINE_CHECK_STRIDE: usize = 128;
+const FUZZY_DEADLINE_CHECK_STRIDE: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_ALTERNATIVES: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_BYTES: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_REPEAT_COUNT: usize = 8;
@@ -3572,11 +3573,11 @@ fn verify_and_render(
     limits: &Limits,
     deadline: Instant,
 ) -> Result<(Vec<SearchEvent>, bool, VerificationStats, BTreeSet<DocId>), MemoryError> {
-    let mut events = Vec::with_capacity(req.max_results().min(256));
+    let max_results = req.max_results();
+    let mut events = Vec::with_capacity(max_results.min(256));
     let mut result_doc_ids = BTreeSet::new();
     let mut truncated = false;
     let mut verification_stats = VerificationStats::default();
-    let max_results = req.max_results();
     let context = req.context();
     let cancel_token = current_cancellation_token();
     let cancel = cancel_token.as_ref();
@@ -3981,7 +3982,7 @@ fn check_snapshot_fresh(
 
 fn literal_trigrams(bytes: &[u8]) -> Vec<[u8; 3]> {
     let mut trigrams = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(bytes.len().saturating_sub(2).min(256));
     for window in bytes.windows(3) {
         let trigram = [window[0], window[1], window[2]];
         if seen.insert(trigram) {
@@ -3997,7 +3998,7 @@ fn literal_trigrams_with_deadline(
 ) -> Result<Vec<[u8; 3]>, MemoryError> {
     check_deadline(deadline)?;
     let mut trigrams = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(bytes.len().saturating_sub(2).min(256));
     for (index, window) in bytes.windows(3).enumerate() {
         if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
             check_deadline(deadline)?;
@@ -4035,8 +4036,9 @@ fn index_document_trigrams_with_deadline(
     deadline: Instant,
 ) -> Result<(), MemoryError> {
     check_deadline(deadline)?;
-    let mut sensitive_seen = HashSet::new();
-    let mut folded_seen = HashSet::new();
+    let dedupe_capacity = content.len().saturating_sub(2).min(4096);
+    let mut sensitive_seen = HashSet::with_capacity(dedupe_capacity);
+    let mut folded_seen = HashSet::with_capacity(dedupe_capacity);
     for (index, window) in content.windows(3).enumerate() {
         if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
             check_deadline(deadline)?;
@@ -4848,6 +4850,7 @@ fn fuzzy_line_matches_with_seeds(
     let min_len = pattern_chars.len().saturating_sub(distance);
     let max_len = pattern_chars.len().saturating_add(distance);
 
+    let mut checked_ranges = 0usize;
     for start in starts {
         check_deadline(deadline)?;
         let remaining = line_chars.len().saturating_sub(start);
@@ -4856,7 +4859,10 @@ fn fuzzy_line_matches_with_seeds(
         }
         let max_len = max_len.min(remaining);
         for len in min_len..=max_len {
-            check_deadline(deadline)?;
+            if checked_ranges.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+                check_deadline(deadline)?;
+            }
+            checked_ranges = checked_ranges.saturating_add(1);
             let end = start + len;
             if bounded_edit_distance(pattern_chars, &line_chars[start..end], distance, deadline)?
                 .is_some()
@@ -4889,7 +4895,9 @@ fn fuzzy_candidate_starts(
         }
 
         for occurrence_start in 0..=line_chars.len() - seed.chars.len() {
-            check_deadline(deadline)?;
+            if occurrence_start.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+                check_deadline(deadline)?;
+            }
             if line_chars[occurrence_start..occurrence_start + seed.chars.len()] != seed.chars[..] {
                 continue;
             }
@@ -4903,8 +4911,15 @@ fn fuzzy_candidate_starts(
                 continue;
             }
 
-            for possible in possible_starts.iter_mut().take(upper + 1).skip(lower) {
-                check_deadline(deadline)?;
+            for (offset, possible) in possible_starts
+                .iter_mut()
+                .take(upper + 1)
+                .skip(lower)
+                .enumerate()
+            {
+                if offset.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+                    check_deadline(deadline)?;
+                }
                 *possible = true;
             }
         }
@@ -4952,7 +4967,9 @@ fn bounded_edit_distance(
         }
 
         for column in min_column..=max_column {
-            check_deadline(deadline)?;
+            if column.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+                check_deadline(deadline)?;
+            }
             let right_char = &right[column - 1];
             let deletion = previous[column].saturating_add(1).min(limit);
             let insertion = current[column - 1].saturating_add(1).min(limit);

@@ -34,9 +34,9 @@ const SEARCH_COLUMNS_WITHOUT_CONTENT: [&str; 6] = [
 pub(crate) struct StoredChunk {
     pub(crate) chunk: CodeChunk,
     pub(crate) embedding: Vec<f32>,
-    pub(crate) root: String,
-    pub(crate) model_id: String,
-    pub(crate) indexed_at: String,
+    pub(crate) root: Arc<str>,
+    pub(crate) model_id: Arc<str>,
+    pub(crate) indexed_at: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -250,7 +250,7 @@ fn records_to_batch(records: &[StoredChunk], schema: SchemaRef) -> Result<Record
 
     for record in records {
         chunk_ids.append_value(&record.chunk.chunk_id);
-        roots.append_value(&record.root);
+        roots.append_value(record.root.as_ref());
         paths.append_value(&record.chunk.path);
         languages.append_value(&record.chunk.language);
         symbols.append_option(record.chunk.symbol.as_deref());
@@ -259,8 +259,8 @@ fn records_to_batch(records: &[StoredChunk], schema: SchemaRef) -> Result<Record
         contents.append_value(&record.chunk.content);
         content_hashes.append_value(&record.chunk.content_hash);
         file_hashes.append_value(&record.chunk.file_hash);
-        model_ids.append_value(&record.model_id);
-        indexed_at.append_value(&record.indexed_at);
+        model_ids.append_value(record.model_id.as_ref());
+        indexed_at.append_value(record.indexed_at.as_ref());
         for value in &record.embedding {
             vectors.values().append_value(*value);
         }
@@ -448,6 +448,7 @@ mod tests {
     };
     use crate::chunking::CodeChunk;
     use crate::discovery::PathFilter;
+    use std::sync::Arc;
 
     #[test]
     fn table_names_include_model_and_dimension() {
@@ -663,9 +664,9 @@ mod tests {
                 file_hash: format!("{path}-file"),
             },
             embedding,
-            root: "repo".to_string(),
-            model_id: "test_model".to_string(),
-            indexed_at: "2026-05-22T00:00:00Z".to_string(),
+            root: Arc::from("repo"),
+            model_id: Arc::from("test_model"),
+            indexed_at: Arc::from("2026-05-22T00:00:00Z"),
         }
     }
 }

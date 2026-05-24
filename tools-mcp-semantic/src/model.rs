@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -86,21 +88,31 @@ impl SearchSummary {
         let text = if self.results.is_empty() {
             "No semantic matches found.".to_string()
         } else {
-            self.results
+            let estimated_text_len = self
+                .results
                 .iter()
                 .map(|result| {
-                    let symbol = result
-                        .symbol
-                        .as_deref()
-                        .map(|value| format!(" {value}"))
-                        .unwrap_or_default();
-                    format!(
-                        "{}:{}-{} {:.4}{}",
-                        result.path, result.start_line, result.end_line, result.score, symbol
-                    )
+                    result.path.len()
+                        + result.symbol.as_deref().map(str::len).unwrap_or_default()
+                        + 40
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .sum::<usize>();
+            let mut text = String::with_capacity(estimated_text_len);
+            for (index, result) in self.results.iter().enumerate() {
+                if index > 0 {
+                    text.push('\n');
+                }
+                let _ = write!(
+                    text,
+                    "{}:{}-{} {:.4}",
+                    result.path, result.start_line, result.end_line, result.score
+                );
+                if let Some(symbol) = &result.symbol {
+                    text.push(' ');
+                    text.push_str(symbol);
+                }
+            }
+            text
         };
 
         json!({
@@ -231,7 +243,10 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
         .context("failed to delete replaced semantic chunks")?;
 
     let indexed_at = Utc::now().to_rfc3339();
+    let indexed_at_record = Arc::<str>::from(indexed_at.as_str());
     let root = workspace_key(&scope);
+    let root_record = Arc::<str>::from(root.as_str());
+    let model_id_record = Arc::<str>::from(provider.model_id());
     let mut embedding_iter = embeddings.into_iter();
     let mut records = Vec::with_capacity(total_chunks);
     let mut manifest_updates = Vec::with_capacity(files_to_index.len());
@@ -247,9 +262,9 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
             records.push(StoredChunk {
                 chunk,
                 embedding,
-                root: root.clone(),
-                model_id: provider.model_id().to_string(),
-                indexed_at: indexed_at.clone(),
+                root: root_record.clone(),
+                model_id: model_id_record.clone(),
+                indexed_at: indexed_at_record.clone(),
             });
         }
         manifest_updates.push((path, file_hash, chunk_ids));
@@ -309,7 +324,7 @@ pub(crate) async fn search_workspace(options: SearchOptions) -> Result<SearchSum
     ensure_deadline(deadline)?;
     let provider = FastEmbedProvider::new(&scope.index_dir).await?;
     ensure_deadline(deadline)?;
-    let query_embedding = provider.embed_query(options.query.clone()).await?;
+    let query_embedding = provider.embed_query(&options.query).await?;
     if query_embedding.len() != vector_dim {
         bail!(
             "semantic query embedding dimension {} does not match index dimension {}",
@@ -346,15 +361,32 @@ pub(crate) async fn search_workspace(options: SearchOptions) -> Result<SearchSum
 }
 
 fn embedding_document(chunk: &CodeChunk) -> String {
-    let symbol = chunk
+    let symbol_len = chunk
         .symbol
         .as_deref()
-        .map(|value| format!("symbol: {value}\n"))
+        .map(|symbol| "symbol: \n".len() + symbol.len())
         .unwrap_or_default();
-    format!(
-        "path: {}\nlanguage: {}\n{}code:\n{}",
-        chunk.path, chunk.language, symbol, chunk.content
-    )
+    let mut document = String::with_capacity(
+        "passage: ".len()
+            + "path: \nlanguage: \ncode:\n".len()
+            + chunk.path.len()
+            + chunk.language.len()
+            + symbol_len
+            + chunk.content.len(),
+    );
+    document.push_str("path: ");
+    document.push_str(&chunk.path);
+    document.push_str("\nlanguage: ");
+    document.push_str(&chunk.language);
+    document.push('\n');
+    if let Some(symbol) = &chunk.symbol {
+        document.push_str("symbol: ");
+        document.push_str(symbol);
+        document.push('\n');
+    }
+    document.push_str("code:\n");
+    document.push_str(&chunk.content);
+    document
 }
 
 async fn embed_index_chunks(

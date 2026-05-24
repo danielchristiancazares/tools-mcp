@@ -70,16 +70,22 @@ impl FastEmbedProvider {
         .await
     }
 
-    pub(crate) async fn embed_query(&self, query: String) -> Result<Vec<f32>> {
-        let mut embeddings = self
-            .embed_prefixed(
-                vec![query],
-                "query: ",
-                "search query",
-                default_embedding_batch_size(),
-            )
-            .await
-            .context("failed to embed semantic search query")?;
+    pub(crate) async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let mut prepared_query = String::with_capacity("query: ".len() + query.len());
+        prepared_query.push_str("query: ");
+        prepared_query.push_str(query);
+
+        let model = self.model.clone();
+        let mut embeddings = tokio::task::spawn_blocking(move || {
+            let mut model = model
+                .lock()
+                .map_err(|_| anyhow!("FastEmbed model lock was poisoned"))?;
+            model
+                .embed(vec![prepared_query], Some(default_embedding_batch_size()))
+                .context("failed to embed semantic search query")
+        })
+        .await
+        .context("semantic query embedding task failed")??;
         embeddings
             .pop()
             .ok_or_else(|| anyhow!("FastEmbed returned no query embedding"))
@@ -109,23 +115,15 @@ impl FastEmbedProvider {
             return Ok(Vec::new());
         }
 
-        let provider = self.clone();
+        let model = self.model.clone();
         tokio::task::spawn_blocking(move || {
-            let prepared = texts
-                .into_iter()
-                .map(|text| {
-                    let mut prepared = String::with_capacity(prefix.len() + text.len());
-                    prepared.push_str(prefix);
-                    prepared.push_str(&text);
-                    prepared
-                })
-                .collect::<Vec<_>>();
-            let mut model = provider
-                .model
+            let mut texts = texts;
+            texts.iter_mut().for_each(|text| text.insert_str(0, prefix));
+            let mut model = model
                 .lock()
                 .map_err(|_| anyhow!("FastEmbed model lock was poisoned"))?;
             model
-                .embed(prepared, Some(batch_size))
+                .embed(texts, Some(batch_size))
                 .with_context(|| format!("failed to embed semantic {operation}"))
         })
         .await
