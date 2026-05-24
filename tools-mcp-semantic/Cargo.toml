@@ -6,6 +6,10 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Re-exports internal embedding APIs for the bench harness. Not for downstream use.
+bench-api = []
+
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
@@ -30,4 +34,13 @@ tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+futures.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+
+[[bench]]
+name = "semantic_cpu"
+path = "benches/semantic.rs"
+harness = false
+required-features = ["bench-api"]

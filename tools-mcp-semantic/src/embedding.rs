@@ -60,13 +60,23 @@ impl FastEmbedProvider {
     }
 
     pub(crate) async fn embed_documents(&self, documents: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.embed_prefixed(documents, "passage: ", "index documents")
-            .await
+        self.embed_prefixed(
+            documents,
+            "passage: ",
+            "index documents",
+            DEFAULT_BATCH_SIZE,
+        )
+        .await
     }
 
     pub(crate) async fn embed_query(&self, query: String) -> Result<Vec<f32>> {
         let mut embeddings = self
-            .embed_prefixed(vec![query], "query: ", "search query")
+            .embed_prefixed(
+                vec![query],
+                "query: ",
+                "search query",
+                DEFAULT_BATCH_SIZE,
+            )
             .await
             .context("failed to embed semantic search query")?;
         embeddings
@@ -74,11 +84,25 @@ impl FastEmbedProvider {
             .ok_or_else(|| anyhow!("FastEmbed returned no query embedding"))
     }
 
+    /// Embed documents with an explicit internal batch size. Used by the bench harness to
+    /// measure how FastEmbed/ONNX throughput varies with the internal batch size; production
+    /// callers should use `embed_documents`.
+    #[cfg(feature = "bench-api")]
+    pub(crate) async fn embed_documents_with_batch_size(
+        &self,
+        documents: Vec<String>,
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.embed_prefixed(documents, "passage: ", "index documents", batch_size)
+            .await
+    }
+
     async fn embed_prefixed(
         &self,
         texts: Vec<String>,
         prefix: &'static str,
         operation: &'static str,
+        batch_size: usize,
     ) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -100,7 +124,7 @@ impl FastEmbedProvider {
                 .lock()
                 .map_err(|_| anyhow!("FastEmbed model lock was poisoned"))?;
             model
-                .embed(prepared, Some(DEFAULT_BATCH_SIZE))
+                .embed(prepared, Some(batch_size))
                 .with_context(|| format!("failed to embed semantic {operation}"))
         })
         .await
