@@ -142,9 +142,22 @@ pub(crate) fn default_model_slug() -> &'static str {
 
 async fn initialize_model(cache_dir: PathBuf, model_id: String) -> Result<SharedModel> {
     tokio::task::spawn_blocking(move || {
-        let options = InitOptions::new(EmbeddingModel::JinaEmbeddingsV2BaseCode)
+        // `mut` is only needed in the gpu-cuda configuration; suppress the warning on CPU builds.
+        #[allow(unused_mut)]
+        let mut options = InitOptions::new(EmbeddingModel::JinaEmbeddingsV2BaseCode)
             .with_cache_dir(cache_dir)
             .with_show_download_progress(false);
+
+        #[cfg(feature = "gpu-cuda")]
+        {
+            // Registers NVIDIA CUDA as the preferred execution provider. ORT falls back to CPU
+            // silently if registration fails (e.g. missing CUDA libraries), which would silently
+            // erase the GPU signal in benchmarks. `.error_on_failure()` makes that case loud.
+            use ort::ep::CUDA;
+            options =
+                options.with_execution_providers(vec![CUDA::default().build().error_on_failure()]);
+        }
+
         let model = TextEmbedding::try_new(options)
             .with_context(|| format!("failed to initialize FastEmbed model {model_id}"))?;
         Ok(Arc::new(Mutex::new(model)))

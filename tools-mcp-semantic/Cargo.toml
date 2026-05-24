@@ -9,6 +9,19 @@ doctest = false
 [features]
 # Re-exports internal embedding APIs for the bench harness. Not for downstream use.
 bench-api = []
+# Enables the NVIDIA CUDA execution provider on the embedding model.
+#
+# Off by default; production `cargo build` is unaffected. When enabled, requires a
+# CUDA-enabled ONNX Runtime to be available at build time. The current workspace expects:
+#
+#     $env:ORT_LIB_LOCATION  = "C:\Users\Daniel\onnxruntime\build\Windows\Release\Release"
+#     $env:ORT_CUDA_VERSION  = "13"
+#
+# At runtime the bench harness can prepend BENCH_GPU_DLL_PATHS for lazily loaded
+# cuDNN/CUDA transitive imports. The ORT build directory must be available before
+# process startup or copied next to the binary by build.rs. See the
+# `benches/semantic.rs` module docstring for the full setup.
+gpu-cuda = ["dep:ort", "ort/cuda"]
 
 [dependencies]
 anyhow.workspace = true
@@ -20,6 +33,7 @@ futures.workspace = true
 hex.workspace = true
 ignore.workspace = true
 lancedb.workspace = true
+ort = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -44,3 +58,9 @@ name = "semantic_cpu"
 path = "benches/semantic.rs"
 harness = false
 required-features = ["bench-api"]
+
+[[bench]]
+name = "semantic_gpu"
+path = "benches/semantic.rs"
+harness = false
+required-features = ["bench-api", "gpu-cuda"]
