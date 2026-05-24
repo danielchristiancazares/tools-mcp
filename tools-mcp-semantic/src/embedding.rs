@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const DEFAULT_MODEL_ID: &str = "jina-embeddings-v2-base-code";
 const DEFAULT_MODEL_SLUG: &str = "jina_embeddings_v2_base_code";
-const DEFAULT_BATCH_SIZE: usize = 32;
+const CPU_EMBEDDING_BATCH_SIZE: usize = 32;
+const CUDA_EMBEDDING_BATCH_SIZE: usize = 128;
 
 type SharedModel = Arc<Mutex<TextEmbedding>>;
 
@@ -64,7 +65,7 @@ impl FastEmbedProvider {
             documents,
             "passage: ",
             "index documents",
-            DEFAULT_BATCH_SIZE,
+            default_embedding_batch_size(),
         )
         .await
     }
@@ -75,7 +76,7 @@ impl FastEmbedProvider {
                 vec![query],
                 "query: ",
                 "search query",
-                DEFAULT_BATCH_SIZE,
+                default_embedding_batch_size(),
             )
             .await
             .context("failed to embed semantic search query")?;
@@ -140,6 +141,14 @@ pub(crate) fn default_model_slug() -> &'static str {
     DEFAULT_MODEL_SLUG
 }
 
+pub(crate) fn default_embedding_batch_size() -> usize {
+    if cfg!(feature = "gpu-cuda") {
+        CUDA_EMBEDDING_BATCH_SIZE
+    } else {
+        CPU_EMBEDDING_BATCH_SIZE
+    }
+}
+
 async fn initialize_model(cache_dir: PathBuf, model_id: String) -> Result<SharedModel> {
     tokio::task::spawn_blocking(move || {
         // `mut` is only needed in the gpu-cuda configuration; suppress the warning on CPU builds.
@@ -197,7 +206,9 @@ fn slugify_model_id(model_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MODEL_ID, default_model_slug, slugify_model_id};
+    use super::{
+        DEFAULT_MODEL_ID, default_embedding_batch_size, default_model_slug, slugify_model_id,
+    };
 
     #[test]
     fn model_slug_is_table_safe() {
@@ -210,5 +221,11 @@ mod tests {
     #[test]
     fn default_model_slug_is_stable() {
         assert_eq!(slugify_model_id(DEFAULT_MODEL_ID), default_model_slug());
+    }
+
+    #[test]
+    fn default_embedding_batch_size_matches_execution_provider() {
+        let expected = if cfg!(feature = "gpu-cuda") { 128 } else { 32 };
+        assert_eq!(default_embedding_batch_size(), expected);
     }
 }

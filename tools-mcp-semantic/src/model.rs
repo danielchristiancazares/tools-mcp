@@ -2,7 +2,9 @@ use crate::chunking::{CodeChunk, chunk_source, hash_bytes};
 use crate::discovery::{
     DiscoveryOptions, WorkspaceScope, discover_files, discovered_path_set, storage_relative_path,
 };
-use crate::embedding::{FastEmbedProvider, default_model_id, default_model_slug};
+use crate::embedding::{
+    FastEmbedProvider, default_embedding_batch_size, default_model_id, default_model_slug,
+};
 use crate::manifest::{IndexManifest, ManifestFile};
 use crate::store::{LanceDbStore, SearchFilter, SemanticMatch, StoredChunk, table_name};
 use anyhow::{Context, Result, anyhow, bail};
@@ -10,8 +12,6 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
-
-const INDEX_EMBEDDING_BATCH_SIZE: usize = 128;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IndexOptions {
@@ -363,8 +363,9 @@ async fn embed_index_chunks(
     total_chunks: usize,
     deadline: Instant,
 ) -> Result<Vec<Vec<f32>>> {
+    let batch_size = default_embedding_batch_size();
     let mut embeddings = Vec::with_capacity(total_chunks);
-    let mut documents = Vec::with_capacity(INDEX_EMBEDDING_BATCH_SIZE);
+    let mut documents = Vec::with_capacity(batch_size);
     let mut vector_dim = None;
 
     for chunk in files_to_index
@@ -373,15 +374,28 @@ async fn embed_index_chunks(
     {
         ensure_deadline(deadline)?;
         documents.push(embedding_document(chunk));
-        if documents.len() >= INDEX_EMBEDDING_BATCH_SIZE {
-            append_embedding_batch(provider, &mut documents, &mut embeddings, &mut vector_dim)
-                .await?;
+        if documents.len() >= batch_size {
+            append_embedding_batch(
+                provider,
+                &mut documents,
+                &mut embeddings,
+                &mut vector_dim,
+                batch_size,
+            )
+            .await?;
             ensure_deadline(deadline)?;
         }
     }
 
     if !documents.is_empty() {
-        append_embedding_batch(provider, &mut documents, &mut embeddings, &mut vector_dim).await?;
+        append_embedding_batch(
+            provider,
+            &mut documents,
+            &mut embeddings,
+            &mut vector_dim,
+            batch_size,
+        )
+        .await?;
         ensure_deadline(deadline)?;
     }
 
@@ -393,11 +407,12 @@ async fn append_embedding_batch(
     documents: &mut Vec<String>,
     embeddings: &mut Vec<Vec<f32>>,
     vector_dim: &mut Option<usize>,
+    batch_size: usize,
 ) -> Result<()> {
     let expected = documents.len();
     let batch_documents = std::mem::take(documents);
     let batch_embeddings = provider.embed_documents(batch_documents).await?;
-    documents.reserve(INDEX_EMBEDDING_BATCH_SIZE);
+    documents.reserve(batch_size);
 
     if batch_embeddings.len() != expected {
         bail!(
@@ -450,6 +465,11 @@ impl From<SemanticMatch> for SearchResult {
             content: value.content,
         }
     }
+}
+
+#[allow(dead_code)]
+fn _relative_target_for_tests(scope: &WorkspaceScope) -> Result<String> {
+    storage_relative_path(&scope.workspace, &scope.target)
 }
 
 #[cfg(test)]
@@ -506,9 +526,4 @@ mod tests {
         );
         assert!(payload["results"][0].get("content").is_none());
     }
-}
-
-#[allow(dead_code)]
-fn _relative_target_for_tests(scope: &WorkspaceScope) -> Result<String> {
-    storage_relative_path(&scope.workspace, &scope.target)
 }
