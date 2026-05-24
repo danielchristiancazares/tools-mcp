@@ -2710,6 +2710,7 @@ fn build_index_with_selector(
     })
 }
 
+#[cfg(test)]
 fn discover_files(
     req: &NormalizedSearchRequest,
     deadline: Option<Instant>,
@@ -2717,6 +2718,16 @@ fn discover_files(
     FileSelector::for_memory(req)
         .map_err(MemoryError::from)?
         .discover_memory_files(deadline)
+        .map_err(MemoryError::from)
+}
+
+fn discover_files_uncached(
+    req: &NormalizedSearchRequest,
+    deadline: Option<Instant>,
+) -> Result<Vec<PathBuf>, MemoryError> {
+    FileSelector::for_memory(req)
+        .map_err(MemoryError::from)?
+        .discover_memory_files_uncached(deadline)
         .map_err(MemoryError::from)
 }
 
@@ -3932,7 +3943,7 @@ fn check_snapshot_fresh(
         full_scope_scans: 1,
         ..FreshnessValidationStats::default()
     };
-    let current_paths = discover_files(req, Some(deadline))?;
+    let current_paths = discover_files_uncached(req, Some(deadline))?;
     check_deadline(deadline)?;
     let expected_paths: BTreeSet<PathBuf> =
         snapshot.documents.iter().map(|d| d.path.clone()).collect();

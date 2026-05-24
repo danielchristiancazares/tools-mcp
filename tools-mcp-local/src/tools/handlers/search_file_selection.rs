@@ -133,11 +133,20 @@ impl FileSelector {
         &self.glob_key
     }
 
+    #[cfg(test)]
     pub(super) fn discover_memory_files(
         &self,
         deadline: Option<Instant>,
     ) -> Result<Vec<PathBuf>, FileSelectionError> {
         self.discover_memory_scope(deadline)
+            .map(|scope| scope.files)
+    }
+
+    pub(super) fn discover_memory_files_uncached(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<PathBuf>, FileSelectionError> {
+        self.discover_memory_scope_via_walker(deadline)
             .map(|scope| scope.files)
     }
 
