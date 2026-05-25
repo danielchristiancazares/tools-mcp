@@ -40,34 +40,46 @@ Each row links to the tool's design contract under [`docs/tools/`](./docs/README
 
 | Task | Tool | Spec |
 |---|---|---|
-| Health check | `Ping` | [docs/tools/ping.md](./docs/tools/ping.md) |
-| Fetch and chunk web content | `WebFetch` | [docs/tools/webfetch.md](./docs/tools/webfetch.md) |
-| Search by regex / literal / fuzzy | `Search` | [docs/tools/search.md](./docs/tools/search.md) |
-| Search and expand matches into file windows | `search_context` | [docs/tools/search-context.md](./docs/tools/search-context.md) |
-| Build or refresh semantic code index | `SemanticIndex` | [docs/tools/semantic-index.md](./docs/tools/semantic-index.md) |
-| Natural-language semantic code search | `SemanticSearch` | [docs/tools/semantic-search.md](./docs/tools/semantic-search.md) |
-| Read a file (optionally a line range) | `Read` | [docs/tools/read.md](./docs/tools/read.md) |
-| Edit a file by snippet replacement (preserves newlines) | `Edit` | [docs/tools/edit.md](./docs/tools/edit.md) |
-| Create a new file | `Write` | [docs/tools/write.md](./docs/tools/write.md) |
-| Delete a file | `Delete` | [docs/tools/delete.md](./docs/tools/delete.md) |
-| Move or rename a file or directory | `Move` | [docs/tools/move.md](./docs/tools/move.md) |
-| Copy a file or directory | `Copy` | [docs/tools/copy.md](./docs/tools/copy.md) |
-| List directory entries | `ListDir` | [docs/tools/list-dir.md](./docs/tools/list-dir.md) |
-| Find files by glob pattern | `Glob` | [docs/tools/glob.md](./docs/tools/glob.md) |
-| Extract source structure (Rust, TS/JS, Python, Go, C++, Markdown) | `Outline` | [docs/tools/outline.md](./docs/tools/outline.md) |
-| Run PowerShell commands **(gated: `MCP_ENABLE_PWSH_TOOL=true`)** | `Pwsh` | [docs/tools/pwsh.md](./docs/tools/pwsh.md) |
-| Read-only worktree snapshot **(gated: `MCP_ENABLE_GIT=true`)** | `git_snapshot` | [docs/tools/git-snapshot.md](./docs/tools/git-snapshot.md) |
-| `git status` **(gated)** | `GitStatus` | [docs/tools/git-status.md](./docs/tools/git-status.md) |
-| `git diff` **(gated)** | `GitDiff` | [docs/tools/git-diff.md](./docs/tools/git-diff.md) |
-| `git restore` **(gated)** | `GitRestore` | [docs/tools/git-restore.md](./docs/tools/git-restore.md) |
-| `git add` **(gated)** | `GitAdd` | [docs/tools/git-add.md](./docs/tools/git-add.md) |
-| `git commit` (Conventional Commits) **(gated)** | `GitCommit` | [docs/tools/git-commit.md](./docs/tools/git-commit.md) |
-| `git log` **(gated)** | `GitLog` | [docs/tools/git-log.md](./docs/tools/git-log.md) |
-| `git branch` (list/create/rename/delete) **(gated)** | `GitBranch` | [docs/tools/git-branch.md](./docs/tools/git-branch.md) |
-| `git checkout` **(gated)** | `GitCheckout` | [docs/tools/git-checkout.md](./docs/tools/git-checkout.md) |
-| `git stash` **(gated)** | `GitStash` | [docs/tools/git-stash.md](./docs/tools/git-stash.md) |
-| `git show` **(gated)** | `GitShow` | [docs/tools/git-show.md](./docs/tools/git-show.md) |
-| `git blame` **(gated)** | `GitBlame` | [docs/tools/git-blame.md](./docs/tools/git-blame.md) |
+| Health check | **Tool name**: `Ping` | [docs/tools/ping.md](./docs/tools/ping.md) |
+| Fetch and chunk web content | **Tool name**: `WebFetch` | [docs/tools/webfetch.md](./docs/tools/webfetch.md) |
+| Search by regex / literal / fuzzy | **Tool name**: `Search` | [docs/tools/search.md](./docs/tools/search.md) |
+| Search and expand matches into file windows | **Tool name**: `search_context` | [docs/tools/search-context.md](./docs/tools/search-context.md) |
+| Build or refresh semantic code index with indexed/updated counts | **Tool name**: `SemanticIndex` | [docs/tools/semantic-index.md](./docs/tools/semantic-index.md) |
+| Natural-language semantic code search | **Tool name**: `SemanticSearch` | [docs/tools/semantic-search.md](./docs/tools/semantic-search.md) |
+| Read a file (optionally a line range) | **Tool name**: `Read` | [docs/tools/read.md](./docs/tools/read.md) |
+| Edit a file by snippet replacement (preserves newlines) | **Tool name**: `Edit` | [docs/tools/edit.md](./docs/tools/edit.md) |
+| Create a new file | **Tool name**: `Write` | [docs/tools/write.md](./docs/tools/write.md) |
+| Delete a file | **Tool name**: `Delete` | [docs/tools/delete.md](./docs/tools/delete.md) |
+| Move or rename a file or directory | **Tool name**: `Move` | [docs/tools/move.md](./docs/tools/move.md) |
+| Copy a file or directory | **Tool name**: `Copy` | [docs/tools/copy.md](./docs/tools/copy.md) |
+| List directory entries | **Tool name**: `ListDir` | [docs/tools/list-dir.md](./docs/tools/list-dir.md) |
+| Find files by glob pattern | **Tool name**: `Glob` | [docs/tools/glob.md](./docs/tools/glob.md) |
+| Extract source structure (Rust, TS/JS, Python, Go, C++, Markdown) | **Tool name**: `Outline` | [docs/tools/outline.md](./docs/tools/outline.md) |
+| Run PowerShell commands **(gated: `MCP_ENABLE_PWSH_TOOL=true`)** | **Tool name**: `Pwsh` | [docs/tools/pwsh.md](./docs/tools/pwsh.md) |
+| Read-only worktree snapshot **(gated: `MCP_ENABLE_GIT=true`)** | **Tool name**: `git_snapshot` | [docs/tools/git-snapshot.md](./docs/tools/git-snapshot.md) |
+| `git status` **(gated)** | **Tool name**: `GitStatus` | [docs/tools/git-status.md](./docs/tools/git-status.md) |
+| `git diff` **(gated)** | **Tool name**: `GitDiff` | [docs/tools/git-diff.md](./docs/tools/git-diff.md) |
+| `git restore` **(gated)** | **Tool name**: `GitRestore` | [docs/tools/git-restore.md](./docs/tools/git-restore.md) |
+| `git add` **(gated)** | **Tool name**: `GitAdd` | [docs/tools/git-add.md](./docs/tools/git-add.md) |
+| `git commit` (Conventional Commits) **(gated)** | **Tool name**: `GitCommit` | [docs/tools/git-commit.md](./docs/tools/git-commit.md) |
+| `git log` **(gated)** | **Tool name**: `GitLog` | [docs/tools/git-log.md](./docs/tools/git-log.md) |
+| `git branch` (list/create/rename/delete) **(gated)** | **Tool name**: `GitBranch` | [docs/tools/git-branch.md](./docs/tools/git-branch.md) |
+| `git checkout` **(gated)** | **Tool name**: `GitCheckout` | [docs/tools/git-checkout.md](./docs/tools/git-checkout.md) |
+| `git stash` **(gated)** | **Tool name**: `GitStash` | [docs/tools/git-stash.md](./docs/tools/git-stash.md) |
+| `git show` **(gated)** | **Tool name**: `GitShow` | [docs/tools/git-show.md](./docs/tools/git-show.md) |
+| `git blame` **(gated)** | **Tool name**: `GitBlame` | [docs/tools/git-blame.md](./docs/tools/git-blame.md) |
+
+## Protocol Error Codes
+
+Observable JSON-RPC error codes returned by the server (full details in [`docs/protocol.md`](./docs/protocol.md)):
+
+| Code | Meaning |
+|---|---|
+| `-32700` | Parse error — request body is not valid JSON |
+| `-32600` | Invalid request — missing or malformed JSON-RPC fields |
+| `-32601` | Method not found — unknown method or unknown tool name |
+| `-32602` | Invalid params — missing required tool argument |
+| `-32603` | Internal error — unexpected server-side failure |
 
 ## Cross-Cutting Documentation
 
