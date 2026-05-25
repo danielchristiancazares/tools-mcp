@@ -94,7 +94,7 @@ pub fn chunk_markdown(
     // section is then chunked by tokens to avoid O(n^2) re-tokenization on each line.
     let mut chunks: Vec<(Option<String>, String, usize)> = Vec::new();
     let mut current_heading: Option<String> = None;
-    let mut current_text = String::new();
+    let mut current_text = String::with_capacity(markdown.len().min(64 * 1024));
 
     // Track fenced code blocks so we don't treat headings inside code as section boundaries.
     // Markdown allows variable-length fences (>=3) using either backticks or tildes, and the
