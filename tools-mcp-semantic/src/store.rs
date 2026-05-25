@@ -149,9 +149,7 @@ impl LanceDbStore {
             .select(search_projection(filter.include_content))
             .limit(filter.limit);
 
-        if let Some(predicate) = predicate {
-            query = query.only_if(predicate);
-        }
+        query = query.only_if(predicate);
 
         let mut stream = query
             .execute()
@@ -217,18 +215,12 @@ fn records_to_batch(records: &[StoredChunk], schema: SchemaRef) -> Result<Record
         .first()
         .map(|record| record.embedding.len())
         .ok_or_else(|| anyhow!("cannot create semantic batch without records"))?;
-    if records
-        .iter()
-        .any(|record| record.embedding.len() != vector_dim)
-    {
-        return Err(anyhow!("semantic embedding dimensions are inconsistent"));
-    }
+    let capacities = BatchStringCapacities::for_records(records, vector_dim)?;
     let vector_dim = i32::try_from(vector_dim)
         .context("semantic vector dimension exceeds Arrow fixed-size list limit")?;
     let vector_value_count = row_count
         .checked_mul(vector_dim as usize)
         .ok_or_else(|| anyhow!("semantic vector batch is too large"))?;
-    let capacities = BatchStringCapacities::for_records(records);
 
     let mut chunk_ids = StringBuilder::with_capacity(row_count, capacities.chunk_ids);
     let mut roots = StringBuilder::with_capacity(row_count, capacities.roots);
@@ -319,22 +311,32 @@ fn search_projection(include_content: bool) -> Select {
     }
 }
 
-fn build_filter_predicate(filter: &SearchFilter) -> Option<String> {
-    let mut clauses = vec![format!("root = '{}'", escape_sql_literal(&filter.root))];
+fn build_filter_predicate(filter: &SearchFilter) -> String {
+    let root = escape_sql_literal(&filter.root);
+    let mut predicate = String::with_capacity(root.len() + "root = ''".len());
+    predicate.push_str("root = '");
+    predicate.push_str(&root);
+    predicate.push('\'');
+
     if let Some(path_filter) = filter.path_filter.to_sql() {
-        clauses.push(path_filter);
+        predicate.reserve(path_filter.len() + " AND ".len());
+        predicate.push_str(" AND ");
+        predicate.push_str(&path_filter);
     }
+
     if let Some(language) = filter
         .language
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        clauses.push(format!(
-            "language = '{}'",
-            escape_sql_literal(language.trim())
-        ));
+        let language = escape_sql_literal(language.trim());
+        predicate.reserve(language.len() + " AND language = ''".len());
+        predicate.push_str(" AND language = '");
+        predicate.push_str(&language);
+        predicate.push('\'');
     }
-    Some(clauses.join(" AND "))
+
+    predicate
 }
 
 fn append_matches(
@@ -352,9 +354,29 @@ fn append_matches(
         .include_content
         .then(|| string_column(batch, "content"))
         .transpose()?;
+    enum DistanceValues<'a> {
+        F32(&'a Float32Array),
+        F64(&'a Float64Array),
+        Missing,
+    }
+    let distances = batch
+        .column_by_name("_distance")
+        .map_or(DistanceValues::Missing, |column| {
+            if let Some(values) = column.as_any().downcast_ref::<Float32Array>() {
+                DistanceValues::F32(values)
+            } else if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
+                DistanceValues::F64(values)
+            } else {
+                DistanceValues::Missing
+            }
+        });
 
     for row in 0..batch.num_rows() {
-        let score = distance_value(batch, row).unwrap_or(0.0);
+        let score = match &distances {
+            DistanceValues::F32(values) if !values.is_null(row) => values.value(row),
+            DistanceValues::F64(values) if !values.is_null(row) => values.value(row) as f32,
+            _ => 0.0,
+        };
         if filter.threshold.is_some_and(|threshold| score > threshold) {
             continue;
         }
@@ -388,9 +410,12 @@ struct BatchStringCapacities {
 }
 
 impl BatchStringCapacities {
-    fn for_records(records: &[StoredChunk]) -> Self {
+    fn for_records(records: &[StoredChunk], vector_dim: usize) -> Result<Self> {
         let mut capacities = Self::default();
         for record in records {
+            if record.embedding.len() != vector_dim {
+                return Err(anyhow!("semantic embedding dimensions are inconsistent"));
+            }
             capacities.chunk_ids += record.chunk.chunk_id.len();
             capacities.roots += record.root.len();
             capacities.paths += record.chunk.path.len();
@@ -407,7 +432,7 @@ impl BatchStringCapacities {
             capacities.model_ids += record.model_id.len();
             capacities.indexed_at += record.indexed_at.len();
         }
-        capacities
+        Ok(capacities)
     }
 }
 
@@ -427,17 +452,6 @@ fn uint64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Arr
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| anyhow!("semantic query result column '{name}' has unexpected type"))
-}
-
-fn distance_value(batch: &RecordBatch, row: usize) -> Option<f32> {
-    let column = batch.column_by_name("_distance")?;
-    if let Some(values) = column.as_any().downcast_ref::<Float32Array>() {
-        return (!values.is_null(row)).then(|| values.value(row));
-    }
-    if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
-        return (!values.is_null(row)).then(|| values.value(row) as f32);
-    }
-    None
 }
 
 #[cfg(test)]
@@ -469,7 +483,7 @@ mod tests {
             include_content: true,
         };
 
-        let predicate = build_filter_predicate(&filter).expect("predicate");
+        let predicate = build_filter_predicate(&filter);
         assert!(predicate.contains("root = 'C:/repo'"));
         assert!(predicate.contains("path >= 'src/'"));
         assert!(predicate.contains("path < 'src0'"));
