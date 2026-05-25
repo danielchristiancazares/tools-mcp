@@ -50,26 +50,25 @@ pub async fn read_to_end_limited<R>(mut reader: R, limit: usize) -> io::Result<(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    use tokio::io::AsyncReadExt as _;
+
     let mut out: Vec<u8> = Vec::with_capacity(limit.min(16 * 1024));
     let mut truncated = false;
+
+    if limit > 0 {
+        let mut limited_reader = (&mut reader).take(limit as u64);
+        limited_reader.read_to_end(&mut out).await?;
+    }
+
     let mut buf = [0u8; 16 * 1024];
 
     loop {
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+        let n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
         }
 
-        if out.len() < limit {
-            let remaining = limit - out.len();
-            let take = remaining.min(n);
-            out.extend_from_slice(&buf[..take]);
-            if take < n {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
+        truncated = true;
     }
 
     Ok((out, truncated))

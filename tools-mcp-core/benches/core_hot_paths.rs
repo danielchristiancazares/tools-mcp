@@ -3,6 +3,7 @@ use serde_json::json;
 use std::hint::black_box;
 use std::time::Duration;
 use tokio::io::BufReader;
+use tools_mcp_core::process::read_to_end_limited;
 use tools_mcp_core::text::{strip_ansi_codes, truncate_at_char_boundary};
 use tools_mcp_core::{RpcResponse, read_mcp_message, write_mcp_response_with_mode};
 
@@ -110,10 +111,47 @@ fn bench_text(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_process_capture(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let under_limit = vec![b'a'; 8 * 1024];
+    let over_limit = vec![b'b'; 64 * 1024];
+    let mut group = c.benchmark_group("process");
+    group.warm_up_time(WARM_UP_TIME);
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
+
+    group.bench_function("read_to_end_limited_under_limit", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let (captured, truncated) =
+                    read_to_end_limited(black_box(under_limit.as_slice()), 16 * 1024)
+                        .await
+                        .expect("capture should succeed");
+                black_box((captured, truncated));
+            });
+        });
+    });
+
+    group.bench_function("read_to_end_limited_truncated", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let (captured, truncated) =
+                    read_to_end_limited(black_box(over_limit.as_slice()), 8 * 1024)
+                        .await
+                        .expect("capture should succeed");
+                black_box((captured, truncated));
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_protocol_read,
     bench_protocol_write,
-    bench_text
+    bench_text,
+    bench_process_capture
 );
 criterion_main!(benches);
