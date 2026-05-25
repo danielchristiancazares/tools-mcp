@@ -145,10 +145,12 @@ where
         let trimmed = trim_crlf_suffix(&line_bytes);
 
         // Auto-detect raw JSON mode (line starts with { or [)
-        if content_length.is_none() && !saw_non_empty_non_json_line && starts_with_raw_json(trimmed)
+        if content_length.is_none()
+            && !saw_non_empty_non_json_line
+            && let Some(body) = raw_json_line_body(trimmed)
         {
             return Ok(Some(McpMessage {
-                body: String::from_utf8_lossy(trimmed).into_owned(),
+                body,
                 has_headers: false,
             }));
         }
@@ -324,15 +326,23 @@ fn trim_crlf_suffix(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn starts_with_raw_json(bytes: &[u8]) -> bool {
+fn raw_json_line_body(bytes: &[u8]) -> Option<String> {
     match std::str::from_utf8(bytes) {
         Ok(line) => {
             let trimmed_start = line.trim_start();
-            trimmed_start.starts_with('{') || trimmed_start.starts_with('[')
+            if trimmed_start.starts_with('{') || trimmed_start.starts_with('[') {
+                Some(line.to_owned())
+            } else {
+                None
+            }
         }
         Err(_) => {
             let trimmed_start = trim_ascii_start(bytes);
-            matches!(trimmed_start.first(), Some(b'{' | b'['))
+            if matches!(trimmed_start.first(), Some(b'{' | b'[')) {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            } else {
+                None
+            }
         }
     }
 }
