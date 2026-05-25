@@ -327,21 +327,50 @@ fn fallback_line_chunks(
 }
 
 fn join_lines_trimmed(lines: &[&str]) -> String {
-    let capacity =
-        lines.iter().map(|line| line.len()).sum::<usize>() + lines.len().saturating_sub(1);
+    let Some(first_content_line) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let last_content_line = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(first_content_line);
+    let selected_lines = &lines[first_content_line..=last_content_line];
+    let last_selected_line = selected_lines.len().saturating_sub(1);
+
+    let capacity = selected_lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let trimmed = if index == 0 && index == last_selected_line {
+                line.trim()
+            } else if index == 0 {
+                line.trim_start()
+            } else if index == last_selected_line {
+                line.trim_end()
+            } else {
+                line
+            };
+            trimmed.len()
+        })
+        .sum::<usize>()
+        + selected_lines.len().saturating_sub(1);
     let mut content = String::with_capacity(capacity);
-    for (index, line) in lines.iter().enumerate() {
+    for (index, line) in selected_lines.iter().enumerate() {
         if index > 0 {
             content.push('\n');
         }
-        content.push_str(line);
+        let trimmed = if index == 0 && index == last_selected_line {
+            line.trim()
+        } else if index == 0 {
+            line.trim_start()
+        } else if index == last_selected_line {
+            line.trim_end()
+        } else {
+            line
+        };
+        content.push_str(trimmed);
     }
-
-    if content.len() == content.trim().len() {
-        content
-    } else {
-        content.trim().to_string()
-    }
+    content
 }
 
 fn build_chunk(
