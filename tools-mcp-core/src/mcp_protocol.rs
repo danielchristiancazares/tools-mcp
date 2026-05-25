@@ -109,12 +109,16 @@ where
     let mut saw_headers = false;
     let mut saw_non_empty_non_json_line = false;
     let mut header_section_bytes = 0usize;
+    let mut line_bytes = Vec::with_capacity(128);
 
     // Parse headers or detect raw JSON
     loop {
-        let line_bytes =
-            read_line_bytes_bounded(reader, saw_headers || saw_non_empty_non_json_line).await?;
-        let bytes_read = line_bytes.len();
+        let bytes_read = read_line_bytes_bounded(
+            reader,
+            saw_headers || saw_non_empty_non_json_line,
+            &mut line_bytes,
+        )
+        .await?;
 
         // Clean EOF - no more messages
         if bytes_read == 0 {
@@ -138,17 +142,13 @@ where
             return Ok(None);
         }
 
-        let line = String::from_utf8_lossy(&line_bytes).into_owned();
-        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+        let trimmed = trim_crlf_suffix(&line_bytes);
 
         // Auto-detect raw JSON mode (line starts with { or [)
-        let trimmed_start = trimmed.trim_start();
-        if content_length.is_none()
-            && !saw_non_empty_non_json_line
-            && (trimmed_start.starts_with('{') || trimmed_start.starts_with('['))
+        if content_length.is_none() && !saw_non_empty_non_json_line && starts_with_raw_json(trimmed)
         {
             return Ok(Some(McpMessage {
-                body: trimmed.to_owned(),
+                body: String::from_utf8_lossy(trimmed).into_owned(),
                 has_headers: false,
             }));
         }
@@ -184,9 +184,13 @@ where
         }
 
         // Parse Content-Length header (case-insensitive)
-        if let Some((name, value)) = trimmed.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
+        if let Some(colon_index) = memchr(b':', trimmed) {
+            let name = &trimmed[..colon_index];
+            if !header_name_eq_ignore_ascii_case(name, "content-length") {
+                saw_non_empty_non_json_line = true;
+                continue;
+            }
+
             if content_length.is_some() {
                 return Err(McpReadError {
                     error: io::Error::new(
@@ -197,6 +201,12 @@ where
                     should_continue: false,
                 });
             }
+            let value =
+                std::str::from_utf8(&trimmed[colon_index + 1..]).map_err(|_| McpReadError {
+                    error: io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header"),
+                    response_has_headers: true,
+                    should_continue: false,
+                })?;
             let len = value.trim().parse::<usize>().map_err(|_| McpReadError {
                 error: io::Error::new(ErrorKind::InvalidData, "invalid Content-Length header"),
                 response_has_headers: true,
@@ -264,13 +274,14 @@ where
 async fn read_line_bytes_bounded<R>(
     reader: &mut R,
     response_has_headers: bool,
-) -> std::result::Result<Vec<u8>, McpReadError>
+    line_bytes: &mut Vec<u8>,
+) -> std::result::Result<usize, McpReadError>
 where
     R: AsyncBufRead + Unpin,
 {
     use std::io::ErrorKind;
 
-    let mut line_bytes = Vec::new();
+    line_bytes.clear();
 
     loop {
         let available = reader.fill_buf().await.map_err(|err| McpReadError {
@@ -280,7 +291,7 @@ where
         })?;
 
         if available.is_empty() {
-            return Ok(line_bytes);
+            return Ok(line_bytes.len());
         }
 
         let take = memchr(b'\n', available).map_or(available.len(), |index| index + 1);
@@ -301,9 +312,40 @@ where
         reader.consume(take);
 
         if reached_newline {
-            return Ok(line_bytes);
+            return Ok(line_bytes.len());
         }
     }
+}
+
+fn trim_crlf_suffix(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.last(), Some(b'\r' | b'\n')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn starts_with_raw_json(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(line) => {
+            let trimmed_start = line.trim_start();
+            trimmed_start.starts_with('{') || trimmed_start.starts_with('[')
+        }
+        Err(_) => {
+            let trimmed_start = trim_ascii_start(bytes);
+            matches!(trimmed_start.first(), Some(b'{' | b'['))
+        }
+    }
+}
+
+fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.first(), Some(byte) if byte.is_ascii_whitespace()) {
+        bytes = &bytes[1..];
+    }
+    bytes
+}
+
+fn header_name_eq_ignore_ascii_case(actual: &[u8], expected: &str) -> bool {
+    std::str::from_utf8(actual).is_ok_and(|actual| actual.trim().eq_ignore_ascii_case(expected))
 }
 
 /// Writes an MCP response to the output stream.
@@ -417,6 +459,16 @@ mod tests {
         let mut reader = BufReader::new(&input[..]);
         let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
         assert_eq!(msg.body, "hi");
+        assert!(msg.has_headers);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_accepts_content_length_case_and_ascii_whitespace() {
+        let input = b"  content-length \t: \t 2 \r\n\r\nok\n";
+        let mut reader = BufReader::new(&input[..]);
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(msg.body, "ok");
         assert!(msg.has_headers);
     }
 

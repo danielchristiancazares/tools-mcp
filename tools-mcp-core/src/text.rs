@@ -113,6 +113,13 @@ pub fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
 
+    if s.as_bytes()[..max_chars].is_ascii() {
+        let mut truncated = String::with_capacity(max_chars + '…'.len_utf8());
+        truncated.push_str(&s[..max_chars]);
+        truncated.push('…');
+        return truncated;
+    }
+
     if let Some((truncation_byte_idx, _)) = s.char_indices().nth(max_chars) {
         let mut truncated = String::with_capacity(truncation_byte_idx + '…'.len_utf8());
         truncated.push_str(&s[..truncation_byte_idx]);
@@ -226,5 +233,14 @@ mod tests {
         assert!(result.ends_with('…'));
         assert!(result.contains('€'));
         assert_eq!(result.chars().count(), 1201); // 1200 + ellipsis
+    }
+
+    #[test]
+    fn truncates_long_ascii_prefix_before_multibyte_tail() {
+        let input = "a".repeat(1200) + "€tail";
+
+        let result = truncate_at_char_boundary(&input, 1200);
+
+        assert_eq!(result, format!("{}…", "a".repeat(1200)));
     }
 }
