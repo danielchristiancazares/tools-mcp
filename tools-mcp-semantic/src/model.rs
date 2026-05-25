@@ -1,12 +1,14 @@
+use crate::backend::{SemanticBackend, SemanticStore};
 use crate::chunking::{CodeChunk, chunk_source, hash_bytes};
 use crate::discovery::{
-    DiscoveryOptions, WorkspaceScope, discover_files, discovered_path_set, storage_relative_path,
+    DiscoveryOptions, PathFilter, WorkspaceScope, discover_files, discovered_path_set,
+    storage_relative_path,
 };
 use crate::embedding::{
     FastEmbedProvider, default_embedding_batch_size, default_model_id, default_model_slug,
 };
 use crate::manifest::{IndexManifest, ManifestFile};
-use crate::store::{LanceDbStore, SearchFilter, SemanticMatch, StoredChunk, table_name};
+use crate::store::{SearchFilter, SemanticMatch, StoredChunk};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::Serialize;
@@ -40,6 +42,8 @@ pub(crate) struct SearchOptions {
 pub(crate) struct IndexSummary {
     pub(crate) indexed_files: usize,
     pub(crate) indexed_chunks: usize,
+    pub(crate) updated_files: usize,
+    pub(crate) updated_chunks: usize,
     pub(crate) skipped_files: usize,
     pub(crate) deleted_chunks: usize,
     pub(crate) model: String,
@@ -53,14 +57,20 @@ pub(crate) struct IndexSummary {
 impl IndexSummary {
     pub(crate) fn into_payload(self) -> Value {
         let text = format!(
-            "Indexed {} file(s), {} chunk(s); skipped {} file(s), removed {} stale file entry(s).",
-            self.indexed_files, self.indexed_chunks, self.skipped_files, self.deleted_chunks
+            "Indexed {} file(s), updated {} file(s); {} chunk(s) indexed, {} chunk(s) written; removed {} stale/replaced chunk(s).",
+            self.indexed_files,
+            self.updated_files,
+            self.indexed_chunks,
+            self.updated_chunks,
+            self.deleted_chunks
         );
         json!({
             "content": [{"type": "text", "text": text}],
             "isError": false,
             "indexed_files": self.indexed_files,
             "indexed_chunks": self.indexed_chunks,
+            "updated_files": self.updated_files,
+            "updated_chunks": self.updated_chunks,
             "skipped_files": self.skipped_files,
             "deleted_chunks": self.deleted_chunks,
             "model": self.model,
@@ -154,8 +164,16 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
     let scope = discovery.scope;
     let model_id = default_model_id();
     let model_slug = default_model_slug();
-    let mut manifest =
-        IndexManifest::load_or_new(&scope.index_dir, model_slug, &scope.workspace, model_id)?;
+    let backend = SemanticBackend::from_env()?;
+    let manifest_file = backend.manifest_file();
+    let mut manifest = load_manifest(
+        backend,
+        &scope.index_dir,
+        model_slug,
+        manifest_file,
+        &scope.workspace,
+        model_id,
+    )?;
     let discovered = discovered_path_set(&discovery.files);
     let stale_paths = manifest.stale_paths_under(&scope.target_filter, &discovered);
 
@@ -168,7 +186,6 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
             .with_context(|| format!("failed to read {}", file.absolute_path.display()))?;
         let file_hash = hash_bytes(&bytes);
         if !options.force && manifest.is_current(&file.relative_path, &file_hash) {
-            skipped_files = skipped_files.saturating_add(1);
             continue;
         }
         let source = match String::from_utf8(bytes) {
@@ -191,27 +208,42 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
         .map(|(_, _, chunks)| chunks.len())
         .sum::<usize>();
 
-    let mut indexed_files = 0usize;
-    let mut indexed_chunks = 0usize;
+    let mut updated_files = 0usize;
+    let mut updated_chunks = 0usize;
     let mut deleted_chunks = manifest.chunk_count_for_paths(stale_paths.iter());
 
     if total_chunks == 0 {
         if let (Some(table), Some(dim)) = (manifest.table_name.clone(), manifest.vector_dim) {
-            let store = LanceDbStore::open_existing(&scope.index_dir, &table, dim).await?;
+            let store =
+                SemanticStore::open_existing(backend, &scope.index_dir, &table, dim).await?;
             store
                 .delete_paths(&workspace_key(&scope), &stale_paths)
                 .await
                 .context("failed to delete stale semantic chunks")?;
         }
         manifest.remove_paths(stale_paths);
-        manifest.save(&scope.index_dir, model_slug)?;
+        save_manifest(
+            &manifest,
+            backend,
+            &scope.index_dir,
+            model_slug,
+            manifest_file,
+        )?;
+        let (indexed_files, indexed_chunks) = indexed_counts_under(&manifest, &scope.target_filter);
+        let store_path = manifest
+            .table_name
+            .as_deref()
+            .map(|name| backend.store_location(&scope.index_dir, name))
+            .unwrap_or_else(|| backend.store_location(&scope.index_dir, ""));
         return Ok(IndexSummary {
             indexed_files,
             indexed_chunks,
+            updated_files,
+            updated_chunks,
             skipped_files,
             deleted_chunks,
             model: model_id.to_string(),
-            store_path: scope.index_dir.display().to_string(),
+            store_path,
             duration_ms: started.elapsed().as_millis(),
             incremental: !options.force,
             truncated: discovery.truncated,
@@ -227,9 +259,11 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
         .first()
         .map(Vec::len)
         .ok_or_else(|| anyhow!("FastEmbed returned no document embeddings"))?;
-    let table = table_name(provider.model_slug(), vector_dim);
+    let index_name = backend.index_name(provider.model_slug(), vector_dim);
     let store =
-        LanceDbStore::open_or_create(&scope.index_dir, provider.model_slug(), vector_dim).await?;
+        SemanticStore::open_or_create(backend, &scope.index_dir, provider.model_slug(), vector_dim)
+            .await?;
+    let root = workspace_key(&scope);
 
     let changed_paths = files_to_index
         .iter()
@@ -238,13 +272,12 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
         .collect::<Vec<_>>();
     deleted_chunks = manifest.chunk_count_for_paths(changed_paths.iter());
     store
-        .delete_paths(&workspace_key(&scope), &changed_paths)
+        .delete_paths(&root, &changed_paths)
         .await
         .context("failed to delete replaced semantic chunks")?;
 
     let indexed_at = Utc::now().to_rfc3339();
     let indexed_at_record = Arc::<str>::from(indexed_at.as_str());
-    let root = workspace_key(&scope);
     let root_record = Arc::<str>::from(root.as_str());
     let model_id_record = Arc::<str>::from(provider.model_id());
     let mut embedding_iter = embeddings.into_iter();
@@ -272,11 +305,11 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
     if embedding_iter.next().is_some() {
         bail!("FastEmbed returned more document embeddings than requested");
     }
-    indexed_chunks = records.len();
+    updated_chunks = records.len();
     store.add_chunks(records).await?;
 
     for (path, file_hash, chunk_ids) in manifest_updates {
-        indexed_files = indexed_files.saturating_add(1);
+        updated_files = updated_files.saturating_add(1);
         manifest.files.insert(
             path,
             ManifestFile {
@@ -287,17 +320,26 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
         );
     }
     manifest.remove_paths(stale_paths);
-    manifest.table_name = Some(table);
+    manifest.table_name = Some(index_name.clone());
     manifest.vector_dim = Some(vector_dim);
-    manifest.save(&scope.index_dir, provider.model_slug())?;
+    save_manifest(
+        &manifest,
+        backend,
+        &scope.index_dir,
+        provider.model_slug(),
+        manifest_file,
+    )?;
+    let (indexed_files, indexed_chunks) = indexed_counts_under(&manifest, &scope.target_filter);
 
     Ok(IndexSummary {
         indexed_files,
         indexed_chunks,
+        updated_files,
+        updated_chunks,
         skipped_files,
         deleted_chunks,
         model: provider.model_id().to_string(),
-        store_path: scope.index_dir.display().to_string(),
+        store_path: backend.store_location(&scope.index_dir, &index_name),
         duration_ms: started.elapsed().as_millis(),
         incremental: !options.force,
         truncated: discovery.truncated,
@@ -311,9 +353,17 @@ pub(crate) async fn search_workspace(options: SearchOptions) -> Result<SearchSum
     let scope = crate::discovery::resolve_scope(&options.path)?;
     let model_id = default_model_id();
     let model_slug = default_model_slug();
-    let manifest =
-        IndexManifest::load_or_new(&scope.index_dir, model_slug, &scope.workspace, model_id)?;
-    let table = manifest
+    let backend = SemanticBackend::from_env()?;
+    let manifest_file = backend.manifest_file();
+    let manifest = load_manifest(
+        backend,
+        &scope.index_dir,
+        model_slug,
+        manifest_file,
+        &scope.workspace,
+        model_id,
+    )?;
+    let index_name = manifest
         .table_name
         .clone()
         .ok_or_else(|| anyhow!("semantic index is empty for model {model_id}"))?;
@@ -333,7 +383,8 @@ pub(crate) async fn search_workspace(options: SearchOptions) -> Result<SearchSum
         );
     }
 
-    let store = LanceDbStore::open_existing(&scope.index_dir, &table, vector_dim).await?;
+    let store =
+        SemanticStore::open_existing(backend, &scope.index_dir, &index_name, vector_dim).await?;
     let matches = store
         .search(
             query_embedding,
@@ -477,6 +528,54 @@ fn workspace_key(scope: &WorkspaceScope) -> String {
     scope.workspace.display().to_string()
 }
 
+fn load_manifest(
+    backend: SemanticBackend,
+    index_dir: &std::path::Path,
+    model_slug: &str,
+    manifest_file: &str,
+    workspace: &std::path::Path,
+    model_id: &str,
+) -> Result<IndexManifest> {
+    match backend {
+        SemanticBackend::LanceDb => {
+            IndexManifest::load_or_new(index_dir, model_slug, workspace, model_id)
+        }
+        SemanticBackend::Qdrant => IndexManifest::load_or_new_named(
+            index_dir,
+            model_slug,
+            manifest_file,
+            workspace,
+            model_id,
+        ),
+    }
+}
+
+fn save_manifest(
+    manifest: &IndexManifest,
+    backend: SemanticBackend,
+    index_dir: &std::path::Path,
+    model_slug: &str,
+    manifest_file: &str,
+) -> Result<()> {
+    match backend {
+        SemanticBackend::LanceDb => manifest.save(index_dir, model_slug),
+        SemanticBackend::Qdrant => manifest.save_named(index_dir, model_slug, manifest_file),
+    }
+}
+
+fn indexed_counts_under(manifest: &IndexManifest, filter: &PathFilter) -> (usize, usize) {
+    manifest
+        .files
+        .iter()
+        .filter(|(path, _)| filter.contains(path.as_str()))
+        .fold((0usize, 0usize), |(files, chunks), (_, file)| {
+            (
+                files.saturating_add(1),
+                chunks.saturating_add(file.chunk_ids.len()),
+            )
+        })
+}
+
 fn ensure_deadline(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         bail!("semantic operation timed out");
@@ -506,8 +605,44 @@ fn _relative_target_for_tests(scope: &WorkspaceScope) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchResult, SearchSummary, embedding_document};
+    use super::{IndexSummary, SearchResult, SearchSummary, embedding_document};
     use crate::chunking::CodeChunk;
+
+    #[test]
+    fn index_payload_reports_indexed_and_updated_counts() {
+        let payload = IndexSummary {
+            indexed_files: 10,
+            indexed_chunks: 42,
+            updated_files: 2,
+            updated_chunks: 7,
+            skipped_files: 3,
+            deleted_chunks: 4,
+            model: "test-model".to_string(),
+            store_path: "C:/repo/.tools-mcp/semantic-index".to_string(),
+            duration_ms: 25,
+            incremental: true,
+            truncated: false,
+            timed_out: false,
+        }
+        .into_payload();
+
+        assert_eq!(payload["isError"], false);
+        assert_eq!(payload["indexed_files"], 10);
+        assert_eq!(payload["indexed_chunks"], 42);
+        assert_eq!(payload["updated_files"], 2);
+        assert_eq!(payload["updated_chunks"], 7);
+        assert_eq!(payload["skipped_files"], 3);
+        assert_eq!(
+            payload["content"][0]["text"],
+            "Indexed 10 file(s), updated 2 file(s); 42 chunk(s) indexed, 7 chunk(s) written; removed 4 stale/replaced chunk(s)."
+        );
+        assert!(
+            !payload["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("skipped")
+        );
+    }
 
     #[test]
     fn embedding_document_includes_stable_code_metadata() {

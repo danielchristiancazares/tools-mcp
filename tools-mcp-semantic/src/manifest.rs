@@ -6,6 +6,7 @@ use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 const MANIFEST_VERSION: u32 = 1;
+const DEFAULT_MANIFEST_FILE: &str = "manifest.json";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct IndexManifest {
@@ -31,7 +32,23 @@ impl IndexManifest {
         workspace: &Path,
         model_id: &str,
     ) -> Result<Self> {
-        let path = manifest_path(index_dir, model_slug);
+        Self::load_or_new_named(
+            index_dir,
+            model_slug,
+            DEFAULT_MANIFEST_FILE,
+            workspace,
+            model_id,
+        )
+    }
+
+    pub(crate) fn load_or_new_named(
+        index_dir: &Path,
+        model_slug: &str,
+        manifest_file: &str,
+        workspace: &Path,
+        model_id: &str,
+    ) -> Result<Self> {
+        let path = manifest_path_named(index_dir, model_slug, manifest_file);
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -55,7 +72,16 @@ impl IndexManifest {
     }
 
     pub(crate) fn save(&self, index_dir: &Path, model_slug: &str) -> Result<()> {
-        let path = manifest_path(index_dir, model_slug);
+        self.save_named(index_dir, model_slug, DEFAULT_MANIFEST_FILE)
+    }
+
+    pub(crate) fn save_named(
+        &self,
+        index_dir: &Path,
+        model_slug: &str,
+        manifest_file: &str,
+    ) -> Result<()> {
+        let path = manifest_path_named(index_dir, model_slug, manifest_file);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create manifest directory {}", parent.display())
@@ -127,8 +153,12 @@ impl IndexManifest {
     }
 }
 
-pub(crate) fn manifest_path(index_dir: &Path, model_slug: &str) -> PathBuf {
-    index_dir.join(model_slug).join("manifest.json")
+pub(crate) fn manifest_path_named(
+    index_dir: &Path,
+    model_slug: &str,
+    manifest_file: &str,
+) -> PathBuf {
+    index_dir.join(model_slug).join(manifest_file)
 }
 
 #[cfg(test)]

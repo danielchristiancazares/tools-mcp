@@ -120,6 +120,87 @@ fn test_tools_list() {
 }
 
 #[test]
+fn test_semantic_index_reports_indexed_and_updated_counts() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("semantic-index-response-")
+        .tempdir()
+        .expect("failed to create semantic index tempdir");
+    let src_dir = temp_dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("failed to create semantic source fixture");
+    std::fs::write(src_dir.join("lib.rs"), "pub fn existing() {}\n")
+        .expect("failed to write semantic source fixture");
+
+    let manifest_dir = temp_dir
+        .path()
+        .join(".tools-mcp")
+        .join("semantic-index")
+        .join("jina_embeddings_v2_base_code");
+    std::fs::create_dir_all(&manifest_dir).expect("failed to create semantic manifest fixture");
+    let manifest = json!({
+        "version": 1,
+        "workspace": temp_dir.path().display().to_string(),
+        "model_id": "jina-embeddings-v2-base-code",
+        "table_name": null,
+        "vector_dim": null,
+        "files": {
+            "src/lib.rs": {
+                // SHA-256 of "pub fn existing() {}\n"; matching the manifest keeps this
+                // test on the unchanged fast path without loading the embedding model.
+                "file_hash": "7ac40acbc4397427e64e103d0c196383179962a91119b69aa255c67aae5402b4",
+                "chunk_ids": ["src/lib.rs:1"],
+                "indexed_at": "2026-01-01T00:00:00Z"
+            }
+        }
+    });
+    std::fs::write(
+        manifest_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)
+            .expect("failed to serialize semantic manifest fixture"),
+    )
+    .expect("failed to write semantic manifest fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "SemanticIndex",
+            "arguments": {
+                "path": "src",
+                "no_ignore": true
+            }
+        }
+    });
+
+    let mut command = spawn_server();
+    command.current_dir(temp_dir.path());
+    let response = support::send_mcp_message_with_command(&request, command)
+        .expect("Failed to call SemanticIndex");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 30);
+    let result = &response["result"];
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["indexed_files"], 1);
+    assert_eq!(result["indexed_chunks"], 1);
+    assert_eq!(result["updated_files"], 0);
+    assert_eq!(result["updated_chunks"], 0);
+    assert_eq!(result["skipped_files"], 0);
+
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("missing SemanticIndex content text");
+    assert!(
+        text.contains("Indexed 1 file(s), updated 0 file(s)"),
+        "expected indexed/updated summary, got {text}"
+    );
+    assert!(
+        !text.contains("skipped"),
+        "summary text should not describe already-indexed files as skipped: {text}"
+    );
+}
+
+#[test]
 fn test_ping_tool_call() {
     let request = json!({
         "jsonrpc": "2.0",

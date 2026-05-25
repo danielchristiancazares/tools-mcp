@@ -53,8 +53,8 @@ The following invariants MUST hold on every invocation:
 - **Cancellation is observed** — When a `CancellationToken` is present in the task-local scope, the walker MUST bail with `"semantic indexing cancelled"` if cancellation has fired (`tools-mcp-semantic/src/discovery.rs:174-179`).
 - **Excluded directories never enter the index** — Walk entries whose file name matches `.git`, `.svn`, `.hg`, `target`, `node_modules`, `dist`, `build`, or `.tools-mcp` MUST be pruned and counted toward `skipped_files` (`tools-mcp-semantic/src/discovery.rs:160-166, 301-306, 205`).
 - **Per-file size cap** — Discovery MUST skip files larger than 1 MiB (`MAX_FILE_BYTES`, `tools-mcp-semantic/src/discovery.rs:15, 280-283`).
-- **Binary content is skipped, not failed** — Files whose contents are not valid UTF-8 MUST be counted as `skipped_files` and not embedded (`tools-mcp-semantic/src/model.rs:174-180`).
-- **Incremental by default** — Unless `force = true`, files whose stored `file_hash` (SHA-256 of the raw bytes; `tools-mcp-semantic/src/chunking.rs:106-110`) matches the manifest MUST be skipped (`tools-mcp-semantic/src/model.rs:170-173`).
+- **Binary content is skipped, not failed** — Files whose contents are not valid UTF-8 MUST be counted as `skipped_files` and not embedded (`tools-mcp-semantic/src/model.rs:182-188`).
+- **Incremental by default** — Unless `force = true`, files whose stored `file_hash` (SHA-256 of the raw bytes; `tools-mcp-semantic/src/chunking.rs:106-110`) matches the manifest MUST be left unchanged and omitted from `updated_files`; unchanged indexed files MUST NOT be counted as `skipped_files` (`tools-mcp-semantic/src/model.rs:173-180`).
 - **Stale rows are removed** — Manifest entries that fall under the target filter but are no longer present on disk MUST be removed from both LanceDB (`store.delete_paths`) and the manifest (`tools-mcp-semantic/src/model.rs:159-160, 196-207, 234-243, 289`).
 - **Vector dimensions are consistent** — All embeddings in a single index call MUST share a dimension; mixing dimensions MUST fail with `"FastEmbed returned inconsistent document dimensions"` (`tools-mcp-semantic/src/model.rs:226-229`, `tools-mcp-semantic/src/embedding.rs:107-131`, `tools-mcp-semantic/src/store.rs:218-225`).
 - **Manifest reflects only persisted state** — `IndexManifest::save` MUST run after `store.add_chunks` succeeds; `table_name` and `vector_dim` MUST be written so a subsequent `SemanticSearch` can locate the table (`tools-mcp-semantic/src/model.rs:276, 290-292`).
@@ -102,9 +102,9 @@ The schema sets `"additionalProperties": false` (`tools-mcp-semantic/src/tools.r
 3. **Open or initialize the manifest** — `IndexManifest::load_or_new` reads `<index_dir>/<model_slug>/manifest.json` if present or constructs a fresh manifest for the current workspace and model id (`tools-mcp-semantic/src/manifest.rs:27-55, 118-132`).
 4. **Discover candidate files** — `discover_files` walks the target with `ignore::WalkBuilder`, honoring `hidden`/`no_ignore` flags (`tools-mcp-semantic/src/discovery.rs:152-167`), pruning excluded directory names (`.git`, `.svn`, `.hg`, `target`, `node_modules`, `dist`, `build`, `.tools-mcp` — `discovery.rs:301-306`), and stopping at the deadline or `limit` (`discovery.rs:168-204`). Files larger than 1 MiB and files with unrecognized extensions are skipped (`discovery.rs:280-283, 297-346`).
 5. **Detect stale paths** — `stale_paths_under` returns manifest entries under the current filter that no longer appear on disk (`tools-mcp-semantic/src/manifest.rs:85-96`, `tools-mcp-semantic/src/model.rs:160`).
-6. **Hash and short-circuit unchanged files** — For each discovered file: read bytes, compute SHA-256 (`tools-mcp-semantic/src/chunking.rs:106-110`), and if `force = false` and the manifest's `file_hash` matches, count it as `skipped_files` and continue (`tools-mcp-semantic/src/model.rs:164-173`).
-7. **Chunk the source** — `chunk_source` dispatches by language: tree-sitter tag queries for Rust, TypeScript, TSX, JavaScript, Python, Go (`tools-mcp-semantic/src/chunking.rs:113-122, 130-213`); heading split for Markdown (`chunking.rs:240-284`); a 100-line / 15-line-overlap fallback for everything else (`chunking.rs:286-327`). Symbol chunks larger than 32 KiB are themselves broken down via the fallback (`chunking.rs:9, 188-191`). Empty chunk sets count the file as skipped (`model.rs:182-185`).
-8. **Early-exit when nothing changed** — If no files require embedding, the handler still deletes any stale rows (when a table already exists), persists the manifest, and returns the summary without spinning up the embedding model (`tools-mcp-semantic/src/model.rs:198-220`).
+6. **Hash and short-circuit unchanged files** — For each discovered file: read bytes, compute SHA-256 (`tools-mcp-semantic/src/chunking.rs:106-110`), and if `force = false` and the manifest's `file_hash` matches, leave the existing manifest entry untouched and continue without adding to `updated_files` or `skipped_files` (`tools-mcp-semantic/src/model.rs:173-180`).
+7. **Chunk the source** — `chunk_source` dispatches by language: tree-sitter tag queries for Rust, TypeScript, TSX, JavaScript, Python, Go (`tools-mcp-semantic/src/chunking.rs:113-122, 130-213`); heading split for Markdown (`chunking.rs:240-284`); a 100-line / 15-line-overlap fallback for everything else (`chunking.rs:286-327`). Symbol chunks larger than 32 KiB are themselves broken down via the fallback (`chunking.rs:9, 188-191`). Empty chunk sets count the file as skipped (`model.rs:189-193`).
+8. **Early-exit when nothing changed** — If no files require embedding, the handler still deletes any stale rows (when a table already exists), persists the manifest, and returns the summary without spinning up the embedding model (`tools-mcp-semantic/src/model.rs:206-230`).
 9. **Initialize the embedding provider** — `FastEmbedProvider::new` returns a cached `TextEmbedding` for `<index_dir>/models`, initializing it via `tokio::task::spawn_blocking` the first time (`tools-mcp-semantic/src/embedding.rs:24-53, 150-174`). Subsequent calls in the same process reuse the cached model (`embedding.rs:14, 29-35, 176-185`).
 10. **Embed in batches** — `embed_index_chunks` flushes batches of `default_embedding_batch_size()` (CPU = 32, CUDA = 128 when the `gpu-cuda` feature is enabled; `tools-mcp-semantic/src/embedding.rs:9-10, 142-148`). Each input is prefixed with `"passage: "` and structured with `path`, `language`, optional `symbol`, and `code` sections (`tools-mcp-semantic/src/model.rs:363-390`, `tools-mcp-semantic/src/embedding.rs:63-71, 107-131`). After every batch and around each blocking call the handler checks the deadline (`model.rs:407-431, 480-485`).
 11. **Open or create the LanceDB table** — Table name is `semantic_chunks_v1_{model_slug}_{vector_dim}` (`tools-mcp-semantic/src/store.rs:13, 173-175`); the LanceDB connection points at `<index_dir>/lancedb` (`store.rs:177-187`). Schema is fixed at 13 fields including the `FixedSizeList<f32, vector_dim>` vector column (`store.rs:189-211`).
@@ -116,19 +116,21 @@ The schema sets `"additionalProperties": false` (`tools-mcp-semantic/src/tools.r
 
 **Success (`isError: false`):**
 
-`IndexSummary::into_payload` serializes the result object directly into the MCP envelope (`tools-mcp-semantic/src/model.rs:53-73`):
+`IndexSummary::into_payload` serializes the result object directly into the MCP envelope (`tools-mcp-semantic/src/model.rs:57-82`):
 
 ```json
 {
   "content": [
     {
       "type": "text",
-      "text": "Indexed 12 file(s), 87 chunk(s); skipped 3 file(s), removed 1 stale file entry(s)."
+      "text": "Indexed 15 file(s), updated 12 file(s); 101 chunk(s) indexed, 87 chunk(s) written; removed 1 stale/replaced chunk(s)."
     }
   ],
   "isError": false,
-  "indexed_files": 12,
-  "indexed_chunks": 87,
+  "indexed_files": 15,
+  "indexed_chunks": 101,
+  "updated_files": 12,
+  "updated_chunks": 87,
   "skipped_files": 3,
   "deleted_chunks": 1,
   "model": "jina-embeddings-v2-base-code",
@@ -144,10 +146,12 @@ The schema sets `"additionalProperties": false` (`tools-mcp-semantic/src/tools.r
 |---|---|---|---|
 | `content[0].text` | string | Yes | Human-readable summary of the run. |
 | `isError` | boolean | Yes | Always `false` on success. |
-| `indexed_files` | integer | Yes | Files that had at least one chunk embedded this call. |
-| `indexed_chunks` | integer | Yes | Total chunks written to LanceDB this call. |
-| `skipped_files` | integer | Yes | Files skipped: unchanged hash, non-UTF-8, empty chunk set, oversize, excluded extension, or pruned directory entry. |
-| `deleted_chunks` | integer | Yes | Number of previously-stored chunks belonging to changed or stale files that were deleted before reindex. |
+| `indexed_files` | integer | Yes | Files currently indexed under the requested target after the call completes. |
+| `indexed_chunks` | integer | Yes | Chunks currently indexed under the requested target after the call completes. |
+| `updated_files` | integer | Yes | Files embedded and written during this call. |
+| `updated_chunks` | integer | Yes | Chunks written to LanceDB during this call. |
+| `skipped_files` | integer | Yes | Files skipped because they could not be indexed: non-UTF-8, empty chunk set, oversize, excluded extension, or pruned directory entry. Unchanged indexed files are not counted here. |
+| `deleted_chunks` | integer | Yes | Number of previously-stored chunks belonging to changed or stale files that were deleted before reindex/removal. |
 | `model` | string | Yes | Embedding model id (currently `jina-embeddings-v2-base-code`). |
 | `store_path` | string | Yes | Absolute path to `<workspace>/.tools-mcp/semantic-index`. |
 | `duration_ms` | integer | Yes | Total wall-clock duration of the call. |
@@ -210,7 +214,7 @@ The same envelope shape is returned by `ToolCallOutcome::err` when argument pars
 Indirect knobs:
 
 - **`gpu-cuda` Cargo feature** (build-time, not runtime). When enabled, the embedding provider initializes ONNX Runtime with the CUDA execution provider and raises the default batch size from 32 to 128 (`tools-mcp-semantic/src/embedding.rs:9-10, 142-148, 158-166`).
-- **`TOOLS_PRETTY_JSON`** (process-wide). Does NOT affect this tool, because `IndexSummary::into_payload` constructs the JSON value directly rather than routing through `ToolCallOutcome::ok_json_content` (`tools-mcp-semantic/src/model.rs:54-73`, `tools-mcp-core/src/tool_outcome.rs:98-118`).
+- **`TOOLS_PRETTY_JSON`** (process-wide). Does NOT affect this tool, because `IndexSummary::into_payload` constructs the JSON value directly rather than routing through `ToolCallOutcome::ok_json_content` (`tools-mcp-semantic/src/model.rs:57-82`, `tools-mcp-core/src/tool_outcome.rs:98-118`).
 
 ## 9. Code Anchors
 
@@ -310,12 +314,14 @@ Indirect knobs:
     "content": [
       {
         "type": "text",
-        "text": "Indexed 7 file(s), 41 chunk(s); skipped 12 file(s), removed 2 stale file entry(s)."
+        "text": "Indexed 9 file(s), updated 7 file(s); 53 chunk(s) indexed, 41 chunk(s) written; removed 2 stale/replaced chunk(s)."
       }
     ],
     "isError": false,
-    "indexed_files": 7,
-    "indexed_chunks": 41,
+    "indexed_files": 9,
+    "indexed_chunks": 53,
+    "updated_files": 7,
+    "updated_chunks": 41,
     "skipped_files": 12,
     "deleted_chunks": 2,
     "model": "jina-embeddings-v2-base-code",

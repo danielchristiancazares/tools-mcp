@@ -1,8 +1,10 @@
+mod backend;
 mod chunking;
 mod discovery;
 mod embedding;
 mod manifest;
 mod model;
+mod qdrant_store;
 mod store;
 mod tools;
 
