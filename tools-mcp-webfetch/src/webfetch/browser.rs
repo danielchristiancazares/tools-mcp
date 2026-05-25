@@ -52,7 +52,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use chromiumoxide::listeners::EventStream;
 use chromiumoxide::page::Page;
 use futures::StreamExt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -87,6 +87,8 @@ const PAGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Timeout for asking Chrome to close during managed browser restart.
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+static CHROME_BINARY: OnceLock<Option<String>> = OnceLock::new();
 
 /// Timeout for reaping the Chrome child process after a clean close.
 const BROWSER_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -363,7 +365,7 @@ impl BrowserPool {
     /// Call this before attempting browser rendering to provide graceful
     /// fallback to HTTP-only mode when Chrome is not installed.
     pub fn is_available() -> bool {
-        find_chrome_binary().is_some()
+        chrome_binary().is_some()
     }
 }
 
@@ -407,13 +409,13 @@ impl Drop for BrowserPool {
 ///
 /// Returns an error if Chrome binary is not found or fails to launch.
 async fn spawn_browser() -> Result<Browser> {
-    let chrome_path = find_chrome_binary()
+    let chrome_path = chrome_binary()
         .ok_or_else(|| anyhow!("Chrome/Chromium not found. Please install Chrome or Chromium."))?;
 
     debug!("Using Chrome binary at: {}", chrome_path);
 
     let config = BrowserConfig::builder()
-        .chrome_executable(&chrome_path)
+        .chrome_executable(chrome_path)
         .new_headless_mode()
         .no_sandbox()
         .incognito()
@@ -755,6 +757,10 @@ fn find_chrome_binary() -> Option<String> {
     }
 
     None
+}
+
+fn chrome_binary() -> Option<&'static str> {
+    CHROME_BINARY.get_or_init(find_chrome_binary).as_deref()
 }
 
 fn find_binary_in_path(bin: &str) -> Option<String> {
