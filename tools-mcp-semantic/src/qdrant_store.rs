@@ -2,12 +2,14 @@ use crate::discovery::PathFilter;
 use crate::store::{SearchFilter, SemanticMatch, StoredChunk};
 use anyhow::{Context, Result, anyhow, bail};
 use qdrant_client::qdrant::{
-    Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, PointStruct,
+    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
+    Distance, FieldType, Filter, PayloadSchemaInfo, PayloadSchemaType, PointStruct,
     QueryPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
 use url::Url;
@@ -19,6 +21,8 @@ const QDRANT_API_KEY_ENV: &str = "QDRANT_API_KEY";
 const DEFAULT_QDRANT_GRPC_PORT: u16 = 6334;
 const QDRANT_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const QDRANT_DELETE_PATH_BATCH_SIZE: usize = 128;
+const QDRANT_FIELD_INDEX_TIMEOUT_SECS: u64 = 30;
+const QDRANT_FILTER_INDEX_FIELDS: &[&str] = &["root", "path", "path_prefixes", "language"];
 const QDRANT_UPSERT_CHUNK_SIZE: usize = 128;
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,7 @@ impl QdrantStore {
                 .await
                 .with_context(|| format!("failed to create Qdrant collection {collection_name}"))?;
         }
+        ensure_filter_indexes(&client, collection_name.as_str()).await?;
 
         Ok(Self {
             client,
@@ -74,6 +79,7 @@ impl QdrantStore {
         {
             bail!("semantic Qdrant collection {collection_name} does not exist");
         }
+        ensure_filter_indexes(&client, collection_name.as_str()).await?;
 
         Ok(Self {
             client,
@@ -163,13 +169,67 @@ pub(crate) fn collection_name(model_slug: &str, vector_dim: usize) -> String {
 
 async fn connect() -> Result<Qdrant> {
     let url = configured_qdrant_url()?;
-    let mut builder = Qdrant::from_url(&url).timeout(QDRANT_CLIENT_TIMEOUT);
+    let mut builder = qdrant_builder(&url);
     if let Some(api_key) = configured_qdrant_api_key()? {
         builder = builder.api_key(api_key);
     }
     builder
         .build()
         .context("failed to create Qdrant semantic client")
+}
+
+fn qdrant_builder(url: &str) -> qdrant_client::QdrantBuilder {
+    Qdrant::from_url(url)
+        .timeout(QDRANT_CLIENT_TIMEOUT)
+        .skip_compatibility_check()
+}
+
+async fn ensure_filter_indexes(client: &Qdrant, collection_name: &str) -> Result<()> {
+    let response = client
+        .collection_info(collection_name)
+        .await
+        .with_context(|| format!("failed to inspect Qdrant collection {collection_name} schema"))?;
+    let collection_info = response
+        .result
+        .with_context(|| format!("Qdrant collection {collection_name} info response was empty"))?;
+
+    for field in missing_filter_index_fields(&collection_info.payload_schema)? {
+        client
+            .create_field_index(
+                CreateFieldIndexCollectionBuilder::new(collection_name, field, FieldType::Keyword)
+                    .wait(true)
+                    .timeout(QDRANT_FIELD_INDEX_TIMEOUT_SECS),
+            )
+            .await
+            .with_context(|| {
+                format!("failed to create Qdrant keyword payload index for {field:?}")
+            })?;
+    }
+
+    Ok(())
+}
+
+fn missing_filter_index_fields(
+    payload_schema: &HashMap<String, PayloadSchemaInfo>,
+) -> Result<Vec<&'static str>> {
+    let mut missing = Vec::new();
+    for field in QDRANT_FILTER_INDEX_FIELDS {
+        let Some(schema) = payload_schema.get(*field) else {
+            missing.push(*field);
+            continue;
+        };
+
+        let data_type =
+            PayloadSchemaType::try_from(schema.data_type).unwrap_or(PayloadSchemaType::UnknownType);
+        match data_type {
+            PayloadSchemaType::Keyword => {}
+            PayloadSchemaType::UnknownType => missing.push(*field),
+            _ => bail!(
+                "Qdrant payload index for {field:?} has incompatible type {data_type:?}; expected keyword"
+            ),
+        }
+    }
+    Ok(missing)
 }
 
 fn configured_qdrant_url() -> Result<String> {
@@ -347,9 +407,12 @@ fn qdrant_cosine_score_to_distance(score: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_name, normalize_qdrant_url, path_prefixes, qdrant_cosine_score_to_distance,
-        qdrant_point_id,
+        QDRANT_CLIENT_TIMEOUT, QDRANT_FILTER_INDEX_FIELDS, collection_name,
+        missing_filter_index_fields, normalize_qdrant_url, path_prefixes, qdrant_builder,
+        qdrant_cosine_score_to_distance, qdrant_point_id,
     };
+    use qdrant_client::qdrant::{PayloadSchemaInfo, PayloadSchemaType};
+    use std::collections::HashMap;
 
     #[test]
     fn qdrant_url_defaults_to_grpc_port() {
@@ -376,6 +439,58 @@ mod tests {
     }
 
     #[test]
+    fn qdrant_builder_disables_stdout_compatibility_check() {
+        let builder = qdrant_builder("https://example.cloud.qdrant.io:6334");
+
+        assert_eq!(builder.timeout, QDRANT_CLIENT_TIMEOUT);
+        assert!(!builder.check_compatibility);
+    }
+
+    #[test]
+    fn qdrant_filter_index_fields_cover_delete_and_search_filters() {
+        assert_eq!(
+            QDRANT_FILTER_INDEX_FIELDS,
+            &["root", "path", "path_prefixes", "language"]
+        );
+    }
+
+    #[test]
+    fn missing_filter_index_fields_reports_absent_indexes() {
+        let mut payload_schema = HashMap::new();
+        payload_schema.insert(
+            "root".to_string(),
+            payload_schema_info(PayloadSchemaType::Keyword),
+        );
+
+        assert_eq!(
+            missing_filter_index_fields(&payload_schema).expect("missing fields"),
+            vec!["path", "path_prefixes", "language"]
+        );
+    }
+
+    #[test]
+    fn missing_filter_index_fields_rejects_wrong_index_type() {
+        let mut payload_schema = HashMap::new();
+        for field in QDRANT_FILTER_INDEX_FIELDS {
+            payload_schema.insert(
+                (*field).to_string(),
+                payload_schema_info(PayloadSchemaType::Keyword),
+            );
+        }
+        payload_schema.insert(
+            "path".to_string(),
+            payload_schema_info(PayloadSchemaType::Text),
+        );
+
+        let err = missing_filter_index_fields(&payload_schema).expect_err("wrong index type");
+
+        assert!(
+            err.to_string()
+                .contains("Qdrant payload index for \"path\" has incompatible type Text")
+        );
+    }
+
+    #[test]
     fn qdrant_point_ids_are_deterministic_uuids() {
         assert_eq!(
             qdrant_point_id("00112233445566778899aabbccddeeff0011223344556677").expect("point id"),
@@ -394,5 +509,13 @@ mod tests {
     #[test]
     fn qdrant_scores_are_projected_as_distances() {
         assert_eq!(qdrant_cosine_score_to_distance(0.75), 0.25);
+    }
+
+    fn payload_schema_info(data_type: PayloadSchemaType) -> PayloadSchemaInfo {
+        PayloadSchemaInfo {
+            data_type: data_type as i32,
+            params: None,
+            points: None,
+        }
     }
 }
