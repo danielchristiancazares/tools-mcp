@@ -304,9 +304,12 @@ struct Postings {
 impl Postings {
     fn from_doc_ids(mut doc_ids: Vec<DocId>, deadline: Instant) -> Result<Self, MemoryError> {
         check_deadline(deadline)?;
-        doc_ids.sort_unstable();
+        if doc_ids.windows(2).any(|window| window[0] >= window[1]) {
+            doc_ids.sort_unstable();
+            check_deadline(deadline)?;
+            doc_ids.dedup();
+        }
         check_deadline(deadline)?;
-        doc_ids.dedup();
 
         let document_frequency = DocumentFrequency(doc_ids.len());
         let storage = match doc_ids.len() {
@@ -1074,7 +1077,8 @@ enum CandidateExpr {
 
 #[derive(Default)]
 struct CandidateEstimateCache {
-    literal_estimates: HashMap<(Vec<u8>, LiteralCase), usize>,
+    sensitive_literal_estimates: HashMap<Vec<u8>, usize>,
+    ascii_insensitive_literal_estimates: HashMap<Vec<u8>, usize>,
     expr_estimates: HashMap<CandidateExpr, usize>,
 }
 
@@ -2566,16 +2570,16 @@ fn build_index_with_selector(
     let cancel_token = current_cancellation_token();
     let cancel = cancel_token.as_ref();
 
-    let mut documents = Vec::new();
-    let mut indexed_bytes = 0_u64;
-    let mut all_content_utf8 = true;
-
     let discovered_scope = selector
         .discover_memory_scope(Some(deadline))
         .map_err(MemoryError::from)?;
+    let document_capacity = discovered_scope.files.len();
     let ignore_fingerprint = discovered_scope.ignore_fingerprint;
     let scope_fingerprint =
         ScopeFingerprint::from_directories(discovered_scope.directories, deadline)?;
+    let mut documents = Vec::with_capacity(document_capacity);
+    let mut indexed_bytes = 0_u64;
+    let mut all_content_utf8 = true;
 
     for path in discovered_scope.files {
         check_cancellation(cancel)?;
@@ -3416,10 +3420,6 @@ fn candidates_for_literal(
         return Ok(postings.to_vec());
     }
 
-    let posting_lists: Vec<&Postings> = posting_lists
-        .iter()
-        .map(|literal_posting| literal_posting.postings)
-        .collect();
     let candidates = intersect_postings(&posting_lists, deadline)?;
     ensure_candidate_limit(candidates.len(), max_candidates)?;
     Ok(candidates)
@@ -3444,21 +3444,36 @@ fn literal_candidate_estimate_with_cache(
     estimate_cache: &mut CandidateEstimateCache,
 ) -> Result<usize, MemoryError> {
     check_deadline(deadline)?;
-    let key = (literal.to_vec(), case);
-    if let Some(estimate) = estimate_cache.literal_estimates.get(&key) {
-        return Ok(*estimate);
+    {
+        let literal_estimates = match case {
+            LiteralCase::Sensitive => &estimate_cache.sensitive_literal_estimates,
+            LiteralCase::AsciiInsensitive => &estimate_cache.ascii_insensitive_literal_estimates,
+        };
+        if let Some(estimate) = literal_estimates.get(literal) {
+            return Ok(*estimate);
+        }
     }
 
     let Some(posting_lists) = literal_postings_by_selectivity(snapshot, literal, case, deadline)?
     else {
-        estimate_cache.literal_estimates.insert(key, 0);
+        let literal_estimates = match case {
+            LiteralCase::Sensitive => &mut estimate_cache.sensitive_literal_estimates,
+            LiteralCase::AsciiInsensitive => {
+                &mut estimate_cache.ascii_insensitive_literal_estimates
+            }
+        };
+        literal_estimates.insert(literal.to_vec(), 0);
         return Ok(0);
     };
     let estimate = posting_lists
         .first()
         .map(|literal_posting| literal_posting.postings.document_frequency().get())
         .unwrap_or(0);
-    estimate_cache.literal_estimates.insert(key, estimate);
+    let literal_estimates = match case {
+        LiteralCase::Sensitive => &mut estimate_cache.sensitive_literal_estimates,
+        LiteralCase::AsciiInsensitive => &mut estimate_cache.ascii_insensitive_literal_estimates,
+    };
+    literal_estimates.insert(literal.to_vec(), estimate);
     Ok(estimate)
 }
 
@@ -3944,12 +3959,23 @@ fn check_snapshot_fresh(
         full_scope_scans: 1,
         ..FreshnessValidationStats::default()
     };
-    let current_paths = discover_files_uncached(req, Some(deadline))?;
+    let mut current_paths = discover_files_uncached(req, Some(deadline))?;
     check_deadline(deadline)?;
-    let expected_paths: BTreeSet<PathBuf> =
-        snapshot.documents.iter().map(|d| d.path.clone()).collect();
-    let observed_paths: BTreeSet<PathBuf> = current_paths.into_iter().collect();
-    if expected_paths != observed_paths {
+    let mut expected_paths = snapshot
+        .documents
+        .iter()
+        .map(|document| document.path.as_path())
+        .collect::<Vec<_>>();
+    expected_paths.sort_unstable();
+    expected_paths.dedup();
+    current_paths.sort();
+    current_paths.dedup();
+    if expected_paths.len() != current_paths.len()
+        || expected_paths
+            .iter()
+            .zip(&current_paths)
+            .any(|(expected, observed)| *expected != observed.as_path())
+    {
         return Err(file_changed_error(
             "file set changed during memory search verification",
             "file_set_changed",
@@ -3981,8 +4007,9 @@ fn check_snapshot_fresh(
 }
 
 fn literal_trigrams(bytes: &[u8]) -> Vec<[u8; 3]> {
-    let mut trigrams = Vec::new();
-    let mut seen = HashSet::with_capacity(bytes.len().saturating_sub(2).min(256));
+    let trigram_capacity = bytes.len().saturating_sub(2).min(256);
+    let mut trigrams = Vec::with_capacity(trigram_capacity);
+    let mut seen = HashSet::with_capacity(trigram_capacity);
     for window in bytes.windows(3) {
         let trigram = [window[0], window[1], window[2]];
         if seen.insert(trigram) {
@@ -3997,8 +4024,9 @@ fn literal_trigrams_with_deadline(
     deadline: Instant,
 ) -> Result<Vec<[u8; 3]>, MemoryError> {
     check_deadline(deadline)?;
-    let mut trigrams = Vec::new();
-    let mut seen = HashSet::with_capacity(bytes.len().saturating_sub(2).min(256));
+    let trigram_capacity = bytes.len().saturating_sub(2).min(256);
+    let mut trigrams = Vec::with_capacity(trigram_capacity);
+    let mut seen = HashSet::with_capacity(trigram_capacity);
     for (index, window) in bytes.windows(3).enumerate() {
         if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
             check_deadline(deadline)?;
@@ -4036,24 +4064,35 @@ fn index_document_trigrams_with_deadline(
     deadline: Instant,
 ) -> Result<(), MemoryError> {
     check_deadline(deadline)?;
+    if content.len() < 3 {
+        check_deadline(deadline)?;
+        return Ok(());
+    }
+
     let dedupe_capacity = content.len().saturating_sub(2).min(4096);
     let mut sensitive_seen = HashSet::with_capacity(dedupe_capacity);
     let mut folded_seen = HashSet::with_capacity(dedupe_capacity);
-    for (index, window) in content.windows(3).enumerate() {
+    let mut folded = [
+        content[0].to_ascii_lowercase(),
+        content[1].to_ascii_lowercase(),
+        content[2].to_ascii_lowercase(),
+    ];
+
+    for index in 0..=content.len() - 3 {
         if index.is_multiple_of(TRIGRAM_DEADLINE_CHECK_STRIDE) {
             check_deadline(deadline)?;
         }
+        if index > 0 {
+            folded[0] = folded[1];
+            folded[1] = folded[2];
+            folded[2] = content[index + 2].to_ascii_lowercase();
+        }
 
-        let trigram = [window[0], window[1], window[2]];
+        let trigram = [content[index], content[index + 1], content[index + 2]];
         if sensitive_seen.insert(trigram) {
             postings.entry(trigram).or_default().push(doc_id);
         }
 
-        let folded = [
-            window[0].to_ascii_lowercase(),
-            window[1].to_ascii_lowercase(),
-            window[2].to_ascii_lowercase(),
-        ];
         if folded_seen.insert(folded) {
             ascii_folded_postings
                 .entry(folded)
@@ -4375,21 +4414,25 @@ fn dedup_candidate_exprs(exprs: &mut Vec<CandidateExpr>) {
 }
 
 fn intersect_postings(
-    posting_lists: &[&Postings],
+    posting_lists: &[LiteralPosting<'_>],
     deadline: Instant,
 ) -> Result<Vec<DocId>, MemoryError> {
     check_deadline(deadline)?;
     if posting_lists.is_empty() {
         return Ok(Vec::new());
     }
-    if posting_lists.iter().any(|postings| postings.len() == 0) {
+    if posting_lists
+        .iter()
+        .any(|literal_posting| literal_posting.postings.len() == 0)
+    {
         return Ok(Vec::new());
     }
 
     check_deadline(deadline)?;
-    let mut result = posting_lists[0].to_vec();
-    for postings in &posting_lists[1..] {
+    let mut result = posting_lists[0].postings.to_vec();
+    for literal_posting in &posting_lists[1..] {
         check_deadline(deadline)?;
+        let postings = literal_posting.postings;
         let mut left = 0;
         let mut right = 0;
         let mut write = 0;
@@ -4849,6 +4892,8 @@ fn fuzzy_line_matches_with_seeds(
 
     let min_len = pattern_chars.len().saturating_sub(distance);
     let max_len = pattern_chars.len().saturating_add(distance);
+    let mut previous = Vec::with_capacity(max_len.saturating_add(1));
+    let mut current = Vec::with_capacity(max_len.saturating_add(1));
 
     let mut checked_ranges = 0usize;
     for start in starts {
@@ -4864,8 +4909,15 @@ fn fuzzy_line_matches_with_seeds(
             }
             checked_ranges = checked_ranges.saturating_add(1);
             let end = start + len;
-            if bounded_edit_distance(pattern_chars, &line_chars[start..end], distance, deadline)?
-                .is_some()
+            if bounded_edit_distance(
+                pattern_chars,
+                &line_chars[start..end],
+                distance,
+                deadline,
+                &mut previous,
+                &mut current,
+            )?
+            .is_some()
             {
                 return Ok(true);
             }
@@ -4938,14 +4990,18 @@ fn bounded_edit_distance(
     right: &[char],
     max_distance: usize,
     deadline: Instant,
+    previous: &mut Vec<usize>,
+    current: &mut Vec<usize>,
 ) -> Result<Option<usize>, MemoryError> {
     if left.len().abs_diff(right.len()) > max_distance {
         return Ok(None);
     }
 
     let limit = max_distance.saturating_add(1);
-    let mut previous = vec![limit; right.len() + 1];
-    let mut current = vec![limit; right.len() + 1];
+    previous.clear();
+    previous.resize(right.len() + 1, limit);
+    current.clear();
+    current.resize(right.len() + 1, limit);
     for (column, value) in previous
         .iter_mut()
         .enumerate()
@@ -4986,7 +5042,7 @@ fn bounded_edit_distance(
         if row_min > max_distance {
             return Ok(None);
         }
-        std::mem::swap(&mut previous, &mut current);
+        std::mem::swap(previous, current);
     }
 
     Ok((previous[right.len()] <= max_distance).then_some(previous[right.len()]))
@@ -5808,12 +5864,23 @@ mod tests {
         let first = postings_for_test(&[1, 2, 4, 7]);
         let second = postings_for_test(&[2, 3, 4, 8]);
         let third = postings_for_test(&[0, 2, 4, 9]);
+        let postings = [
+            LiteralPosting {
+                trigram: *b"aaa",
+                postings: &first,
+            },
+            LiteralPosting {
+                trigram: *b"bbb",
+                postings: &second,
+            },
+            LiteralPosting {
+                trigram: *b"ccc",
+                postings: &third,
+            },
+        ];
         assert_eq!(
-            intersect_postings(
-                &[&first, &second, &third],
-                Instant::now() + Duration::from_secs(30)
-            )
-            .expect("intersect postings"),
+            intersect_postings(&postings, Instant::now() + Duration::from_secs(30))
+                .expect("intersect postings"),
             doc_ids(&[2, 4])
         );
     }
@@ -6053,7 +6120,12 @@ mod tests {
         )
         .expect("estimate");
         assert_eq!(estimate, 0);
-        assert_eq!(estimate_cache.literal_estimates.len(), 2);
+        assert_eq!(estimate_cache.sensitive_literal_estimates.len(), 2);
+        assert!(
+            estimate_cache
+                .ascii_insensitive_literal_estimates
+                .is_empty()
+        );
 
         let candidates = candidates_for_candidate_expr_with_cache(
             &snapshot,
@@ -6389,8 +6461,18 @@ mod tests {
 
         let first = postings_for_test(&[1, 2, 3]);
         let second = postings_for_test(&[2, 3, 4]);
+        let postings = [
+            LiteralPosting {
+                trigram: *b"aaa",
+                postings: &first,
+            },
+            LiteralPosting {
+                trigram: *b"bbb",
+                postings: &second,
+            },
+        ];
         assert_timeout(
-            intersect_postings(&[&first, &second], Instant::now())
+            intersect_postings(&postings, Instant::now())
                 .expect_err("postings intersection should time out"),
         );
     }

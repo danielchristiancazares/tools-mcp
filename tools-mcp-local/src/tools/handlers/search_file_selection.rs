@@ -171,7 +171,7 @@ impl FileSelector {
         // configuration below (see tools-mcp-local/src/tools/scope_cache.rs).
         let snapshot = self.scope_snapshot(deadline)?;
 
-        let mut files = Vec::new();
+        let mut files = Vec::with_capacity(snapshot.entries.len());
         let mut directories = Vec::with_capacity(snapshot.directories.len());
 
         // Mirror the existing walker: the root directory is always part of the
