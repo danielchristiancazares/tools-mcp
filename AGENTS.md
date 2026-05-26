@@ -36,6 +36,9 @@ Env vars:
 - `RUST_LOG=debug` — verbose logs.
 - `APP_VERSION=...` — baked into init responses.
 
+## Allowed Code Patterns
+- `bench-api` feature gates may expose unstable, doc-hidden APIs solely for Criterion benchmark targets with matching `required-features`; runtime code must not depend on this surface.
+
 ## Tool Preferences
 When agent tools are available, prefer them over Bash equivalents:
 - `Read` over `cat`, `head`, `tail` for reading files.
