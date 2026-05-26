@@ -3752,7 +3752,7 @@ impl<'a> SnapshotValidation<'a> {
             ));
         }
 
-        match check_targeted_snapshot_fresh(snapshot, &self.result_doc_ids, deadline)? {
+        match check_targeted_snapshot_fresh(self.req, snapshot, &self.result_doc_ids, deadline)? {
             TargetedFreshnessOutcome::Verified(stats) => {
                 Ok(FreshnessValidationResult::verified_targeted(stats))
             }
@@ -3841,6 +3841,7 @@ enum TargetedFreshnessOutcome {
 }
 
 fn check_targeted_snapshot_fresh(
+    req: &NormalizedSearchRequest,
     snapshot: &IndexSnapshot,
     result_doc_ids: &BTreeSet<DocId>,
     deadline: Instant,
@@ -3852,18 +3853,27 @@ fn check_targeted_snapshot_fresh(
         return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
     }
 
-    for (doc_index, doc) in snapshot.documents.iter().enumerate() {
+    if Path::new(req.root()).is_dir()
+        && let Some(reason) = check_snapshot_file_set(req, snapshot, deadline)?
+    {
+        return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
+    }
+
+    for doc_id in result_doc_ids {
         check_deadline(deadline)?;
-        let doc_id = DocId::from_index(doc_index)?;
-        let is_result_file = result_doc_ids.contains(&doc_id);
+        let doc = snapshot.documents.get(doc_id.to_index()).ok_or_else(|| {
+            MemoryError::new(
+                "search_index_incomplete",
+                "invalid_doc_id",
+                "memory search result referenced a missing indexed document",
+            )
+        })?;
         stats.indexed_files_checked = stats.indexed_files_checked.saturating_add(1);
-        if is_result_file {
-            stats.result_files_checked = stats.result_files_checked.saturating_add(1);
-        }
+        stats.result_files_checked = stats.result_files_checked.saturating_add(1);
 
         let metadata = match fs::metadata(&doc.path) {
             Ok(metadata) => metadata,
-            Err(err) if is_result_file => {
+            Err(err) => {
                 return Err(file_changed_error(
                     format!(
                         "failed to re-read metadata for result file {}: {err}",
@@ -3872,23 +3882,10 @@ fn check_targeted_snapshot_fresh(
                     "file_changed_during_verification",
                 ));
             }
-            Err(_) => {
-                return Ok(TargetedFreshnessOutcome::NeedsFullScope {
-                    reason: "indexed_file_missing",
-                    stats,
-                });
-            }
         };
         check_deadline(deadline)?;
         if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
             continue;
-        }
-
-        if !is_result_file {
-            return Ok(TargetedFreshnessOutcome::NeedsFullScope {
-                reason: "indexed_file_metadata_changed",
-                stats,
-            });
         }
 
         validate_result_file_content_matches(doc, &metadata, deadline)?;
@@ -3959,26 +3956,10 @@ fn check_snapshot_fresh(
         full_scope_scans: 1,
         ..FreshnessValidationStats::default()
     };
-    let mut current_paths = discover_files_uncached(req, Some(deadline))?;
-    check_deadline(deadline)?;
-    let mut expected_paths = snapshot
-        .documents
-        .iter()
-        .map(|document| document.path.as_path())
-        .collect::<Vec<_>>();
-    expected_paths.sort_unstable();
-    expected_paths.dedup();
-    current_paths.sort();
-    current_paths.dedup();
-    if expected_paths.len() != current_paths.len()
-        || expected_paths
-            .iter()
-            .zip(&current_paths)
-            .any(|(expected, observed)| *expected != observed.as_path())
-    {
+    if let Some(reason) = check_snapshot_file_set(req, snapshot, deadline)? {
         return Err(file_changed_error(
-            "file set changed during memory search verification",
-            "file_set_changed",
+            format!("file set changed during memory search verification: {reason}"),
+            reason,
         ));
     }
 
@@ -4004,6 +3985,34 @@ fn check_snapshot_fresh(
     }
 
     Ok(stats)
+}
+
+fn check_snapshot_file_set(
+    req: &NormalizedSearchRequest,
+    snapshot: &IndexSnapshot,
+    deadline: Instant,
+) -> Result<Option<&'static str>, MemoryError> {
+    let mut current_paths = discover_files_uncached(req, Some(deadline))?;
+    check_deadline(deadline)?;
+    let mut expected_paths = snapshot
+        .documents
+        .iter()
+        .map(|document| document.path.as_path())
+        .collect::<Vec<_>>();
+    expected_paths.sort_unstable();
+    expected_paths.dedup();
+    current_paths.sort();
+    current_paths.dedup();
+    if expected_paths.len() != current_paths.len()
+        || expected_paths
+            .iter()
+            .zip(&current_paths)
+            .any(|(expected, observed)| *expected != observed.as_path())
+    {
+        return Ok(Some("file_set_changed"));
+    }
+
+    Ok(None)
 }
 
 fn literal_trigrams(bytes: &[u8]) -> Vec<[u8; 3]> {
