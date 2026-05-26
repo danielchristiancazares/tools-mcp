@@ -296,8 +296,6 @@ Environment variables read by this tool at runtime. None are required; all have 
 | `TOOLS_SEARCH_INDEX_WARM_GIT_TIMEOUT_MS` | `2000` (clamped to `[100, 30000]`) | `git rev-parse` timeout used by the warmer (`search_memory.rs:916-921,43`). |
 | `TOOLS_SEARCH_INDEX_WARM_TIMEOUT_MS` | `300000` | Per-key timeout for the warm-up probe call (`search_memory.rs:2087-2090,38`). |
 
-Process-wide variables that affect responses indirectly: `TOOLS_PRETTY_JSON` does **not** affect this tool's response shape because the handler builds the response object directly with `ToolCallOutcome::ok` rather than `ok_json_content`.
-
 ## 9. Code Anchors
 
 | Claim | File | Line(s) |

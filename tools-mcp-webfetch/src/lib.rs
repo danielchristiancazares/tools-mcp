@@ -25,3 +25,16 @@ pub fn benchmark_chunk_markdown(markdown: &str, max_tokens: usize) -> usize {
         .map(|(_, _, token_count)| token_count)
         .sum()
 }
+
+#[doc(hidden)]
+pub fn benchmark_extract_text_len(bytes: &[u8]) -> usize {
+    webfetch::extract::extract(bytes, Some("text/plain"), "benchmark://text")
+        .expect("benchmark text extraction should succeed")
+        .markdown
+        .len()
+}
+
+#[doc(hidden)]
+pub fn benchmark_clean_markdown_len(html: &str) -> usize {
+    webfetch::extract::benchmark_clean_markdown_len(html)
+}

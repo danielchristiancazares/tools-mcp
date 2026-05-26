@@ -221,8 +221,6 @@ Match rules (`whitelist.rs:118`): an entry without leading `*.` matches the exac
 | `CHROMIUM_PATH` | unset | Same as above; checked after `CHROME_PATH`. |
 | `CHROME_EXECUTABLE` | unset | Same as above; checked after `CHROMIUM_PATH`. |
 
-`TOOLS_PRETTY_JSON` (process-wide; see `docs/configuration.md`) does NOT affect the `WebFetch` response shape because the handler builds the response object directly rather than using `ToolCallOutcome::ok_json_content`.
-
 ## 9. Code Anchors
 
 | Claim | File | Line(s) |

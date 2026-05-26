@@ -314,23 +314,31 @@ impl<'a> RenderedSearchEvent<'a> {
             (false, false) => 2,
         });
         if include_path {
-            data.insert("path".to_string(), json!({"text": self.event.path.clone()}));
+            data.insert("path".to_string(), text_value(self.event.path.as_str()));
         }
         data.insert("line_number".to_string(), json!(self.event.line_number));
-        data.insert(
-            "lines".to_string(),
-            json!({"text": self.snippet.text.as_ref()}),
-        );
+        data.insert("lines".to_string(), text_value(self.snippet.text.as_ref()));
         if self.snippet.truncated {
             data.insert("snippet_truncated".to_string(), json!(true));
             data.insert("line_length".to_string(), json!(self.snippet.line_length));
         }
 
-        json!({
-            "type": if self.event.is_match { "match" } else { "context" },
-            "data": data,
-        })
+        let event_type = if self.event.is_match {
+            "match"
+        } else {
+            "context"
+        };
+        let mut event = Map::with_capacity(2);
+        event.insert("type".to_string(), Value::String(event_type.to_owned()));
+        event.insert("data".to_string(), Value::Object(data));
+        Value::Object(event)
     }
+}
+
+fn text_value(text: &str) -> Value {
+    let mut value = Map::with_capacity(1);
+    value.insert("text".to_string(), Value::String(text.to_owned()));
+    Value::Object(value)
 }
 
 fn decimal_digits(value: u64) -> usize {
@@ -431,12 +439,15 @@ impl SearchPayloadBuilder {
 
     fn finish_current_file(&mut self) {
         if let Some(path) = self.current_path.take() {
-            self.parts.files.push(json!({
-                "path": path,
-                "match_count": self.current_match_count,
-                "event_count": self.current_event_count,
-                "events": std::mem::take(&mut self.current_events),
-            }));
+            let mut file = Map::with_capacity(4);
+            file.insert("path".to_string(), Value::String(path));
+            file.insert("match_count".to_string(), json!(self.current_match_count));
+            file.insert("event_count".to_string(), json!(self.current_event_count));
+            file.insert(
+                "events".to_string(),
+                Value::Array(std::mem::take(&mut self.current_events)),
+            );
+            self.parts.files.push(Value::Object(file));
             self.current_match_count = 0;
             self.current_event_count = 0;
         }

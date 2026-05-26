@@ -43,23 +43,6 @@ impl PathFilter {
             }
         }
     }
-
-    pub(crate) fn to_sql(&self) -> Option<String> {
-        match self {
-            Self::Workspace => None,
-            Self::File(path) => Some(format!("path = '{}'", escape_sql_literal(path))),
-            Self::Directory(path) => {
-                let child_lower_bound = format!("{path}/");
-                let child_upper_bound = format!("{path}0");
-                Some(format!(
-                    "(path = '{}' OR (path >= '{}' AND path < '{}'))",
-                    escape_sql_literal(path),
-                    escape_sql_literal(&child_lower_bound),
-                    escape_sql_literal(&child_upper_bound)
-                ))
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -242,10 +225,6 @@ pub(crate) fn storage_relative_path(workspace: &Path, path: &Path) -> Result<Str
     Ok(normalized)
 }
 
-pub(crate) fn escape_sql_literal(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 fn resolve_existing_under_workspace(input: &Path, workspace: &Path) -> Result<PathBuf> {
     if input.as_os_str().is_empty() {
         bail!("path is required");
@@ -353,7 +332,7 @@ pub(crate) fn discovered_path_set(files: &[FileCandidate]) -> HashSet<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PathFilter, escape_sql_literal, language_for_path, should_skip_path};
+    use super::{PathFilter, language_for_path, should_skip_path};
     use std::path::Path;
 
     #[test]
@@ -363,23 +342,6 @@ mod tests {
         assert!(filter.contains("src/app"));
         assert!(filter.contains("src/app/main.rs"));
         assert!(!filter.contains("src/application/main.rs"));
-    }
-
-    #[test]
-    fn sql_literals_escape_single_quotes() {
-        assert_eq!(escape_sql_literal("src/it's.rs"), "src/it''s.rs");
-    }
-
-    #[test]
-    fn directory_filter_sql_treats_wildcards_literally() {
-        let filter = PathFilter::Directory("smart_file.edit".to_string());
-
-        assert_eq!(
-            filter.to_sql().as_deref(),
-            Some(
-                "(path = 'smart_file.edit' OR (path >= 'smart_file.edit/' AND path < 'smart_file.edit0'))"
-            )
-        );
     }
 
     #[test]

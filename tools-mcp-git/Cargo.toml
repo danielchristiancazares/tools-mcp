@@ -6,6 +6,10 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Re-exports internal parser APIs for Criterion benchmark targets. Not for downstream use.
+bench-api = []
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
@@ -14,3 +18,11 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tools-mcp-core = { path = "../tools-mcp-core" }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "git_diff_parsers"
+harness = false
+required-features = ["bench-api"]

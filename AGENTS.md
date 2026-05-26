@@ -1,43 +1,54 @@
 # Repository Guidelines
 
 ## Project Overview
-Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for local code search, web fetching, git operations, and newline-safe file editing.
+Rust Cargo workspace for an MCP server (JSON-RPC 2.0 over stdin/stdout) with tools for local and semantic code search, web fetching, git operations, and newline-safe file editing.
 
 ## Project Structure
 - `tools-mcp-server/` — binary crate with stdin/stdout loop, JSON-RPC routing, and feature-crate composition.
 - `tools-mcp-core/` — shared MCP/runtime support (`mcp_protocol`, `response`, `tool_registry`, `validation`, `process`, `text`, config). Provides `ToolRegistry`, `ToolCallOutcome`, validation helpers, shared constants, and the `define_mcp_tool!` macro.
 - `tools-mcp-webfetch/` — WebFetch pipeline and tool registration.
 - `tools-mcp-local/` — local file/search/edit tools, including `smart_file_edit`.
+- `tools-mcp-semantic/` — semantic indexing/search with discovery, chunking, embeddings, manifests, and vector stores.
 - `tools-mcp-git/` — git tool implementations.
 - `tools-mcp-server/tests/` — server integration and golden contract tests.
+- `docs/` — user-facing tool design/contract docs, especially `docs/tools/*.md`.
 - `target/` — build output (generated).
 
 Each feature crate exposes `register_tools(&mut ToolRegistry)`, called from `tools-mcp-server/src/composition.rs`. Add new tools by registering them in the owning crate; there is no central tool match statement.
 
 ## Architecture Notes
-- `tools-mcp-server/src/main.rs` implements JSON-RPC over stdin/stdout, including initialization, tool listing/calls, and protocol aliases such as `mcp/initialize`, `initialize`, and `server/initialize`. `read_mcp_message` accepts both Content-Length framed and raw JSON messages, handles CRLF and LF line endings, and consumes trailing newlines after the body.
+- `tools-mcp-server/src/main.rs` owns the stdin/stdout async read loop, JSON-RPC request parsing, response writing, batch handling, shutdown, and in-flight cancellation plumbing, including initialization, tool listing/calls, and protocol aliases such as `mcp/initialize`, `initialize`, and `server/initialize`.
+- `tools-mcp-core/src/mcp_protocol.rs` owns low-level MCP framing. `read_mcp_message` accepts both Content-Length framed and raw JSON messages, handles CRLF and LF line endings, and consumes trailing newlines after the body.
 - `tools-mcp-webfetch/src/webfetch/` uses HTTP-first fetching with optional Chrome/Chromium browser fallback, SSRF and robots.txt checks, HTML-to-Markdown conversion (`htmd`, with nav/footer/header/script/style filtering and inline `[text](url)` links), and `cl100k_base` token-aware chunking (`tiktoken-rs`). Responses are cached under `/tmp/tools-webfetch` with separate keys per rendering method; user agent is `tools-webfetch/0.1`.
   - Hybrid rendering: HTTP-first, with automatic browser fallback on JS-heavy heuristics (React/Vue/Angular patterns) and whitelisted domains (e.g., `medium.com`, `notion.so`). `force_browser=true` always uses the browser; if Chrome is missing, the tool falls back to HTTP-only and logs a warning.
   - Headless browser uses `chromiumoxide` v0.7 with Chrome DevTools Protocol, stealth configuration, a managed browser pool that restarts every 100 requests or 1 hour, a 15s navigation timeout, a 2s network-idle wait, and resource blocking for images, web fonts, and video/audio autoplay.
-- `tools-mcp-local/src/smart_file_edit/` preserves line endings (LF/CRLF/CR) by processing canonical LF text while retaining the original file format; supports snippet replacement and unified diff input.
+- `tools-mcp-local/` implements local file operations, `Read`, `Search`, `search_context`, `Outline`, gated `Pwsh`, and `smart_file_edit`. `smart_file_edit` preserves line endings (LF/CRLF/CR) by processing canonical LF text while retaining the original file format; supports snippet replacement and unified diff input.
+- `tools-mcp-semantic/` implements semantic indexing/search, including discovery, chunking, embedding, manifests, and vector-store-backed lookup.
 - `tools-mcp-git/src/tools.rs` and `tools-mcp-git/src/git/mod.rs` implement git tools (GitStatus, GitDiff, GitRestore, GitAdd, GitCommit) with porcelain parsing, timeout handling, and bounded output.
-- `tools-mcp-core/src/process.rs` and `tools-mcp-core/src/text.rs` provide bounded process capture, timeout-enforced child wait (`wait_with_limits`), and ANSI stripping (`text::strip_ansi_codes`). PowerShell execution lives in `tools-mcp-local/src/tools/pwsh.rs`.
+- `tools-mcp-core/` provides JSON-RPC response types, MCP content helpers, validation, cancellation support, `ToolRegistry`, `ToolCallOutcome`, and the `define_mcp_tool!` macro. `tools-mcp-core/src/process.rs` and `tools-mcp-core/src/text.rs` provide bounded process capture, timeout-enforced child wait (`wait_with_limits`), and ANSI stripping (`text::strip_ansi_codes`). PowerShell execution lives in `tools-mcp-local/src/tools/pwsh.rs`.
 - `build.rs` sets the `APP_VERSION` environment variable at compile time when provided.
 
 ## Commands
 - `cargo build --workspace --release` — build the full workspace.
 - `cargo run -p tools-mcp-server --release` — run the server locally.
 - `cargo test --workspace` — run tests (some are `#[ignore]`).
-- `cargo fmt --all` / `cargo clippy --workspace --all-targets` — format/lint.
+- `cargo test --workspace -- --ignored` — run ignored tests only when host/network prerequisites are available.
+- `cargo test -p tools-mcp-local --lib` — run one crate's unit tests.
+- `cargo test -p tools-mcp-server --test integration_test <test_name>` — run one server integration test by name.
+- `cargo fmt --all` / `cargo fmt --all -- --check` — format or check formatting.
+- `cargo clippy --workspace --all-targets` — lint the workspace.
+- `just build`, `just test`, `just lint`, `just fmt`, `just fmt-check`, and `just run` — convenience aliases in `justfile`.
 
 Env vars:
 - `MCP_SKIP_HEADERS=true` — no `Content-Length` framing.
 - `MCP_ENABLE_GIT=true` — register Git tools; omitted or any other value leaves Git tools disabled.
+- `MCP_ENABLE_PWSH_TOOL=true` — register the host PowerShell tool; omitted or any other value leaves `Pwsh` disabled.
 - `RUST_LOG=debug` — verbose logs.
 - `APP_VERSION=...` — baked into init responses.
 
 ## Allowed Code Patterns
 - `bench-api` feature gates may expose unstable, doc-hidden APIs solely for Criterion benchmark targets with matching `required-features`; runtime code must not depend on this surface.
+- Criterion benchmarks live in crate-local `benches/` directories.
 
 ## Tool Preferences
 When agent tools are available, prefer them over Bash equivalents:
@@ -55,11 +66,15 @@ When agent tools are available, prefer them over Bash equivalents:
 - Make focused changes only; avoid unrelated rewrites and never leave placeholder code in committed changes.
 - Keep changes `cargo fmt`-clean; follow standard Rust naming (`snake_case`, `CamelCase`).
 - Keep network-dependent tests ignored by default.
-- If you change tool schemas or response shapes, update `README.md` and `tools-mcp-server/tests/integration_test.rs`.
+- If you change tool schemas, tool names, response shapes, or documented behavior, update the relevant `docs/tools/*.md`, `README.md` when applicable, and server integration/golden tests.
+- `Search` has an in-memory path when eligible and `ugrep` as the external backend; do not replace it with ripgrep semantics without updating tests and docs.
 
 ## User-Facing MCP Tools
 - `WebFetch` — fetches and processes web content. Required: `url`. Optional: `max_chunk_tokens` (default `2000`), `no_cache` (default `false`), `force_browser` (default `false`). Returns `chunks[]`, `title`, `language`, `fetched_at`, `rendering_method` (`"http"` or `"browser"`), cache metadata, and `note`.
-- `Search` — local regex file search backed by `ugrep`. Required: `pattern`. Optional: `path`, `case`, `context`, `head_limit`, `include`.
+- `Search` — local regex file search with an in-memory fast path and `ugrep` fallback/backend. Required: `pattern`. Optional: `path`, `case`, `context`, `head_limit`, `include`.
+- `search_context` — local search returning merged, numbered file windows around matches.
+- `SemanticIndex` / `SemanticSearch` — local semantic code indexing and natural-language search.
+- `Pwsh` — host PowerShell execution, registered only when `MCP_ENABLE_PWSH_TOOL=true`.
 - `ping` — health check returning `pong`.
 
 Tool responses follow the MCP content format:
@@ -89,6 +104,7 @@ The `env` field supplies environment variables directly; no wrapper script is ne
 - **ugrep** — backend for the `Search` tool.
 - **protoc** (or `PROTOC` env var pointing at a protobuf compiler) — required by LanceDB/Lance for semantic-search dependencies.
 - **libssl-dev** — required on Linux for HTTPS support.
+- **PowerShell 7+** (optional) — required only for the gated `Pwsh` tool.
 - **Chrome or Chromium** (optional) — required only for WebFetch browser rendering. Common paths: `/usr/bin/google-chrome`, `/usr/bin/chromium`, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. Without it, WebFetch runs HTTP-only and logs a warning.
   - Ubuntu/Debian: `sudo apt install chromium-browser`
   - macOS: `brew install --cask google-chrome`

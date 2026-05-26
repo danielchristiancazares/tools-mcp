@@ -4,6 +4,8 @@ mod mutating;
 mod snapshot;
 mod status;
 
+#[cfg(feature = "bench-api")]
+pub(crate) use diff::benchmark_parse_diff_manifest;
 pub(crate) use diff::handle_git_diff;
 pub(crate) use inspect::{handle_git_blame, handle_git_log, handle_git_show};
 pub(crate) use mutating::{

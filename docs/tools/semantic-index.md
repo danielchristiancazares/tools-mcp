@@ -214,7 +214,6 @@ The same envelope shape is returned by `ToolCallOutcome::err` when argument pars
 Indirect knobs:
 
 - **`gpu-cuda` Cargo feature** (build-time, not runtime). When enabled, the embedding provider initializes ONNX Runtime with the CUDA execution provider and raises the default batch size from 32 to 128 (`tools-mcp-semantic/src/embedding.rs:9-10, 142-148, 158-166`).
-- **`TOOLS_PRETTY_JSON`** (process-wide). Does NOT affect this tool, because `IndexSummary::into_payload` constructs the JSON value directly rather than routing through `ToolCallOutcome::ok_json_content` (`tools-mcp-semantic/src/model.rs:57-82`, `tools-mcp-core/src/tool_outcome.rs:98-118`).
 
 ## 9. Code Anchors
 

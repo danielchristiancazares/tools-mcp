@@ -185,8 +185,6 @@ The handler MUST NOT panic; all failure paths return a `ToolCallOutcome` (`snaps
 |---|---|---|
 | `MCP_ENABLE_GIT` | unset (git tools disabled) | Hard registration gate. Only the literal value `"true"` registers the git tool family, including `git_snapshot` (`tools-mcp-git/src/lib.rs:7-10`). |
 
-`TOOLS_PRETTY_JSON` does not affect this tool's response because the handler builds the JSON payload directly via `ToolCallOutcome::ok`, not through `ok_json_content`.
-
 ## 9. Code Anchors
 
 | Claim | File | Line(s) |

@@ -173,8 +173,6 @@ The handler MUST NOT panic.
 |---|---|---|
 | `MCP_ENABLE_GIT` | unset (git tools disabled) | Hard registration gate; only the literal string `"true"` registers the git tool family. |
 
-`TOOLS_PRETTY_JSON` does not affect this tool's response shape because the handler builds the JSON directly.
-
 ## 9. Code Anchors
 
 | Claim | File | Line(s) |

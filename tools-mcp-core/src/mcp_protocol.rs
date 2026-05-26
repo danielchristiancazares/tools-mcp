@@ -25,7 +25,6 @@
 
 use anyhow::{Context, Result};
 use memchr::memchr;
-use std::io::Write as _;
 use std::sync::OnceLock;
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -46,6 +45,9 @@ pub const MAX_MCP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 /// requires a small `Content-Length` header. It prevents unbounded header
 /// preambles from consuming transport time before a body is read.
 pub const MAX_MCP_HEADER_BYTES: usize = 64 * 1024;
+
+const CONTENT_LENGTH_PREFIX: &[u8] = b"Content-Length: ";
+const CONTENT_LENGTH_SUFFIX: &[u8] = b"\r\n\r\n";
 
 /// Determines whether to skip Content-Length headers in responses.
 ///
@@ -142,18 +144,24 @@ where
             return Ok(None);
         }
 
-        let trimmed = trim_crlf_suffix(&line_bytes);
+        let trimmed_len = trim_crlf_suffix(&line_bytes).len();
+        line_bytes.truncate(trimmed_len);
 
         // Auto-detect raw JSON mode (line starts with { or [)
-        if content_length.is_none()
-            && !saw_non_empty_non_json_line
-            && let Some(body) = raw_json_line_body(trimmed)
-        {
-            return Ok(Some(McpMessage {
-                body,
-                has_headers: false,
-            }));
+        if content_length.is_none() && !saw_non_empty_non_json_line {
+            match raw_json_line_body(line_bytes) {
+                RawJsonLineBody::Body(body) => {
+                    return Ok(Some(McpMessage {
+                        body,
+                        has_headers: false,
+                    }));
+                }
+                RawJsonLineBody::NotRaw(bytes) => {
+                    line_bytes = bytes;
+                }
+            }
         }
+        let trimmed = line_bytes.as_slice();
 
         header_section_bytes = header_section_bytes.saturating_add(bytes_read);
         if header_section_bytes > MAX_MCP_HEADER_BYTES {
@@ -326,22 +334,28 @@ fn trim_crlf_suffix(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn raw_json_line_body(bytes: &[u8]) -> Option<String> {
-    match std::str::from_utf8(bytes) {
+enum RawJsonLineBody {
+    Body(String),
+    NotRaw(Vec<u8>),
+}
+
+fn raw_json_line_body(bytes: Vec<u8>) -> RawJsonLineBody {
+    match String::from_utf8(bytes) {
         Ok(line) => {
             let trimmed_start = line.trim_start();
             if trimmed_start.starts_with('{') || trimmed_start.starts_with('[') {
-                Some(line.to_owned())
+                RawJsonLineBody::Body(line)
             } else {
-                None
+                RawJsonLineBody::NotRaw(line.into_bytes())
             }
         }
-        Err(_) => {
-            let trimmed_start = trim_ascii_start(bytes);
+        Err(err) => {
+            let bytes = err.into_bytes();
+            let trimmed_start = trim_ascii_start(&bytes);
             if matches!(trimmed_start.first(), Some(b'{' | b'[')) {
-                Some(String::from_utf8_lossy(bytes).into_owned())
+                RawJsonLineBody::Body(String::from_utf8_lossy(&bytes).into_owned())
             } else {
-                None
+                RawJsonLineBody::NotRaw(bytes)
             }
         }
     }
@@ -401,12 +415,7 @@ where
     // Write Content-Length header unless in raw JSON mode
     if !skip_headers {
         let mut header = [0u8; 64];
-        let header_len = {
-            let mut cursor = std::io::Cursor::new(&mut header[..]);
-            write!(cursor, "Content-Length: {payload_len}\r\n\r\n")
-                .context("format Content-Length header")?;
-            cursor.position() as usize
-        };
+        let header_len = format_content_length_header(payload_len, &mut header);
         writer
             .write_all(&header[..header_len])
             .await
@@ -421,6 +430,37 @@ where
     // Flush immediately to ensure client receives the response
     writer.flush().await.context("flush stdout")?;
     Ok(())
+}
+
+fn format_content_length_header(payload_len: usize, header: &mut [u8; 64]) -> usize {
+    let mut cursor = 0usize;
+    header[cursor..cursor + CONTENT_LENGTH_PREFIX.len()].copy_from_slice(CONTENT_LENGTH_PREFIX);
+    cursor += CONTENT_LENGTH_PREFIX.len();
+
+    cursor += write_usize_decimal(payload_len, &mut header[cursor..]);
+
+    header[cursor..cursor + CONTENT_LENGTH_SUFFIX.len()].copy_from_slice(CONTENT_LENGTH_SUFFIX);
+    cursor + CONTENT_LENGTH_SUFFIX.len()
+}
+
+fn write_usize_decimal(mut value: usize, out: &mut [u8]) -> usize {
+    let mut digits = [0u8; std::mem::size_of::<usize>() * 3];
+    let mut len = 0usize;
+
+    loop {
+        let index = digits.len() - 1 - len;
+        digits[index] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+
+        if value == 0 {
+            break;
+        }
+    }
+
+    let start = digits.len() - len;
+    out[..len].copy_from_slice(&digits[start..]);
+    len
 }
 
 pub async fn write_mcp_response_with_mode<W>(
@@ -446,6 +486,36 @@ mod tests {
         let mut reader = BufReader::new(&input[..]);
         let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
         assert_eq!(msg.body, r#"{"jsonrpc":"2.0","id":1}"#);
+        assert!(!msg.has_headers);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_reads_raw_json_line_with_crlf_and_leading_space() {
+        let input = b"  {\"jsonrpc\":\"2.0\",\"id\":1}\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(msg.body, r#"  {"jsonrpc":"2.0","id":1}"#);
+        assert!(!msg.has_headers);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_reads_raw_json_array_line() {
+        let input = b"[{\"jsonrpc\":\"2.0\",\"id\":1}]\n";
+        let mut reader = BufReader::new(&input[..]);
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(msg.body, r#"[{"jsonrpc":"2.0","id":1}]"#);
+        assert!(!msg.has_headers);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_message_reads_invalid_utf8_raw_json_lossy() {
+        let input = b"{\"payload\":\"\xFF\"}\n";
+        let mut reader = BufReader::new(&input[..]);
+        let msg = read_mcp_message(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(msg.body, "{\"payload\":\"\u{FFFD}\"}");
         assert!(!msg.has_headers);
     }
 

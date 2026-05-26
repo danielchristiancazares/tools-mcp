@@ -371,8 +371,12 @@ fn render_numbered_range(
     resolved_end: usize,
 ) -> String {
     let selected_bytes = &bytes[selected_range];
-    let text = String::from_utf8_lossy(selected_bytes);
-    render_numbered_text(text.as_ref(), start_line, resolved_end)
+    if let Ok(text) = std::str::from_utf8(selected_bytes) {
+        render_numbered_text(text, start_line, resolved_end)
+    } else {
+        let text = String::from_utf8_lossy(selected_bytes);
+        render_numbered_text(text.as_ref(), start_line, resolved_end)
+    }
 }
 
 fn render_numbered_text(text: &str, start_line: usize, resolved_end: usize) -> String {

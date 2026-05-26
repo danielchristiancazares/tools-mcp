@@ -282,89 +282,196 @@ fn parse_name_status_z(stdout: &str) -> Result<Vec<DiffManifestEntry>, String> {
     Ok(entries)
 }
 
-fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<(), String> {
-    let mut entry_index: HashMap<(&str, Option<&str>), usize> =
-        HashMap::with_capacity(entries.len());
-    for (idx, entry) in entries.iter().enumerate() {
-        entry_index.insert((entry.path.as_str(), entry.old_path.as_deref()), idx);
+#[derive(Clone, Copy)]
+struct NumstatCounts {
+    insertions: u32,
+    deletions: u32,
+    binary: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NumstatUpdate<'a> {
+    path: &'a str,
+    old_path: Option<&'a str>,
+    counts: NumstatCounts,
+}
+
+struct NumstatFallback<'a> {
+    entry_index: HashMap<(&'a str, Option<&'a str>), usize>,
+    seen_entries: Vec<bool>,
+    indexed_updates: Vec<(usize, NumstatCounts)>,
+}
+
+impl<'a> NumstatFallback<'a> {
+    fn new(entries: &'a [DiffManifestEntry], ordered_counts: &[NumstatCounts]) -> Self {
+        let mut entry_index = HashMap::with_capacity(entries.len());
+        for (idx, entry) in entries.iter().enumerate() {
+            entry_index.insert((entry.path.as_str(), entry.old_path.as_deref()), idx);
+        }
+
+        let mut seen_entries = vec![false; entries.len()];
+        let mut indexed_updates = Vec::with_capacity(entries.len());
+        for (idx, counts) in ordered_counts.iter().copied().enumerate() {
+            seen_entries[idx] = true;
+            indexed_updates.push((idx, counts));
+        }
+
+        Self {
+            entry_index,
+            seen_entries,
+            indexed_updates,
+        }
     }
 
-    let mut seen_entries = vec![false; entries.len()];
-    let mut updates = Vec::with_capacity(entries.len());
-    let mut tokens = stdout.split('\0').filter(|token| !token.is_empty());
-
-    while let Some(stats) = tokens.next() {
-        let mut parts = stats.splitn(3, '\t');
-        let insertions_text = parts.next().unwrap_or_default();
-        let Some(deletions_text) = parts.next() else {
+    fn push(&mut self, update: NumstatUpdate<'_>) -> Result<(), String> {
+        let Some(&entry_pos) = self.entry_index.get(&(update.path, update.old_path)) else {
             return Err(format!(
-                "git diff --numstat returned malformed record: {stats:?}"
-            ));
-        };
-        let Some(raw_path) = parts.next() else {
-            return Err(format!(
-                "git diff --numstat returned malformed record: {stats:?}"
+                "git diff --numstat returned a path not present in --name-status: {}",
+                update.path
             ));
         };
 
-        let binary = insertions_text == "-" && deletions_text == "-";
-        let insertions = if binary {
-            0
-        } else {
-            insertions_text.parse::<u32>().map_err(|err| {
-                format!(
-                    "git diff --numstat invalid insertions value {:?}: {err}",
-                    insertions_text
-                )
-            })?
-        };
-        let deletions = if binary {
-            0
-        } else {
-            deletions_text.parse::<u32>().map_err(|err| {
-                format!(
-                    "git diff --numstat invalid deletions value {:?}: {err}",
-                    deletions_text
-                )
-            })?
-        };
-
-        let (path, old_path) = if raw_path.is_empty() {
-            let old_path = tokens.next().ok_or_else(|| {
-                "git diff --numstat missing old path for rename record".to_string()
-            })?;
-            let new_path = tokens.next().ok_or_else(|| {
-                "git diff --numstat missing new path for rename record".to_string()
-            })?;
-            (new_path, Some(old_path))
-        } else {
-            (raw_path, None)
-        };
-
-        let Some(&entry_pos) = entry_index.get(&(path, old_path)) else {
+        if self.seen_entries[entry_pos] {
             return Err(format!(
-                "git diff --numstat returned a path not present in --name-status: {path}"
-            ));
-        };
-
-        if seen_entries[entry_pos] {
-            return Err(format!(
-                "git diff --numstat returned a path not present in --name-status: {path}"
+                "git diff --numstat returned a path not present in --name-status: {}",
+                update.path
             ));
         }
 
-        seen_entries[entry_pos] = true;
-        updates.push((entry_pos, insertions, deletions, binary));
+        self.seen_entries[entry_pos] = true;
+        self.indexed_updates.push((entry_pos, update.counts));
+        Ok(())
     }
 
-    for (entry_pos, insertions, deletions, binary) in updates {
-        let entry = &mut entries[entry_pos];
-        entry.insertions = insertions;
-        entry.deletions = deletions;
-        entry.binary = binary;
+    fn into_updates(self) -> Vec<(usize, NumstatCounts)> {
+        self.indexed_updates
+    }
+}
+
+fn parse_numstat_update<'a>(
+    stats: &'a str,
+    tokens: &mut impl Iterator<Item = &'a str>,
+) -> Result<NumstatUpdate<'a>, String> {
+    let mut parts = stats.splitn(3, '\t');
+    let insertions_text = parts.next().unwrap_or_default();
+    let Some(deletions_text) = parts.next() else {
+        return Err(format!(
+            "git diff --numstat returned malformed record: {stats:?}"
+        ));
+    };
+    let Some(raw_path) = parts.next() else {
+        return Err(format!(
+            "git diff --numstat returned malformed record: {stats:?}"
+        ));
+    };
+
+    let binary = insertions_text == "-" && deletions_text == "-";
+    let insertions = if binary {
+        0
+    } else {
+        insertions_text.parse::<u32>().map_err(|err| {
+            format!(
+                "git diff --numstat invalid insertions value {:?}: {err}",
+                insertions_text
+            )
+        })?
+    };
+    let deletions = if binary {
+        0
+    } else {
+        deletions_text.parse::<u32>().map_err(|err| {
+            format!(
+                "git diff --numstat invalid deletions value {:?}: {err}",
+                deletions_text
+            )
+        })?
+    };
+
+    let (path, old_path) = if raw_path.is_empty() {
+        let old_path = tokens
+            .next()
+            .ok_or_else(|| "git diff --numstat missing old path for rename record".to_string())?;
+        let new_path = tokens
+            .next()
+            .ok_or_else(|| "git diff --numstat missing new path for rename record".to_string())?;
+        (new_path, Some(old_path))
+    } else {
+        (raw_path, None)
+    };
+
+    Ok(NumstatUpdate {
+        path,
+        old_path,
+        counts: NumstatCounts {
+            insertions,
+            deletions,
+            binary,
+        },
+    })
+}
+
+fn entry_matches_numstat(entry: &DiffManifestEntry, path: &str, old_path: Option<&str>) -> bool {
+    entry.path == path && entry.old_path.as_deref() == old_path
+}
+
+fn apply_numstat_counts(entry: &mut DiffManifestEntry, counts: NumstatCounts) {
+    entry.insertions = counts.insertions;
+    entry.deletions = counts.deletions;
+    entry.binary = counts.binary;
+}
+
+fn apply_numstat_z(entries: &mut [DiffManifestEntry], stdout: &str) -> Result<(), String> {
+    let mut ordered_counts = Vec::with_capacity(entries.len());
+    let mut fallback: Option<NumstatFallback<'_>> = None;
+    let mut tokens = stdout.split('\0').filter(|token| !token.is_empty());
+
+    while let Some(stats) = tokens.next() {
+        let update = parse_numstat_update(stats, &mut tokens)?;
+        if let Some(fallback) = fallback.as_mut() {
+            fallback.push(update)?;
+            continue;
+        }
+
+        let ordered_index = ordered_counts.len();
+        if entries
+            .get(ordered_index)
+            .is_some_and(|entry| entry_matches_numstat(entry, update.path, update.old_path))
+        {
+            ordered_counts.push(update.counts);
+        } else {
+            let mut fallback_state = NumstatFallback::new(entries, &ordered_counts);
+            fallback_state.push(update)?;
+            fallback = Some(fallback_state);
+        }
+    }
+
+    if let Some(fallback) = fallback {
+        for (entry_pos, counts) in fallback.into_updates() {
+            apply_numstat_counts(&mut entries[entry_pos], counts);
+        }
+    } else {
+        for (entry, counts) in entries.iter_mut().zip(ordered_counts) {
+            apply_numstat_counts(entry, counts);
+        }
     }
 
     Ok(())
+}
+
+#[cfg(feature = "bench-api")]
+pub(crate) fn benchmark_parse_diff_manifest(name_status: &str, numstat: &str) -> usize {
+    let mut entries =
+        parse_name_status_z(name_status).expect("benchmark name-status fixture should parse");
+    apply_numstat_z(&mut entries, numstat).expect("benchmark numstat fixture should parse");
+    entries.iter().fold(0usize, |total, entry| {
+        total
+            .wrapping_add(entry.path.len())
+            .wrapping_add(entry.old_path.as_ref().map_or(0, String::len))
+            .wrapping_add(entry.status.len())
+            .wrapping_add(entry.insertions as usize)
+            .wrapping_add(entry.deletions as usize)
+            .wrapping_add(usize::from(entry.binary))
+    })
 }
 
 async fn write_binary_placeholder_if_empty(patch_path: &Path, path: &str) -> Result<(), String> {
@@ -799,6 +906,25 @@ mod tests {
         assert_eq!(entries[0].insertions, 3);
         assert_eq!(entries[0].deletions, 2);
         assert_eq!(entries[0].path, "src/file\tname.txt");
+    }
+
+    #[test]
+    fn apply_numstat_z_matches_entries_when_records_are_out_of_order() {
+        let mut entries =
+            parse_name_status_z("M\0src/first.txt\0M\0src/second.txt\0M\0src/third.txt\0")
+                .expect("name-status entries should parse");
+        apply_numstat_z(
+            &mut entries,
+            concat!(
+                "30\t3\tsrc/third.txt\0",
+                "10\t1\tsrc/first.txt\0",
+                "20\t2\tsrc/second.txt\0"
+            ),
+        )
+        .expect("out-of-order numstat should parse");
+        assert_eq!((entries[0].insertions, entries[0].deletions), (10, 1));
+        assert_eq!((entries[1].insertions, entries[1].deletions), (20, 2));
+        assert_eq!((entries[2].insertions, entries[2].deletions), (30, 3));
     }
 
     #[test]

@@ -66,4 +66,16 @@ pub mod bench {
         let file_hash = hash_bytes(markdown.as_bytes());
         chunk_source(&file, markdown, &file_hash).len()
     }
+
+    pub fn delete_paths_predicate_len(root: &str, paths: &[String]) -> usize {
+        crate::store::benchmark_delete_paths_predicate_len(root, paths)
+    }
+
+    pub fn directory_filter_predicate_len(
+        root: &str,
+        directory: &str,
+        language: Option<&str>,
+    ) -> usize {
+        crate::store::benchmark_directory_filter_predicate_len(root, directory, language)
+    }
 }

@@ -252,6 +252,10 @@ fn clean_markdown(html: &str) -> String {
     result
 }
 
+pub(crate) fn benchmark_clean_markdown_len(html: &str) -> usize {
+    clean_markdown(html).len()
+}
+
 /// Extracts content from HTML bytes, producing metadata and Markdown.
 ///
 /// ## Process
@@ -293,7 +297,10 @@ fn extract_from_html(bytes: &[u8], _source_url: &str) -> ExtractedDocument {
 /// For non-HTML content, we simply convert bytes to UTF-8 (lossy) and
 /// return as-is. No metadata extraction is possible from plain text.
 fn extract_from_text(bytes: &[u8]) -> ExtractedDocument {
-    let text = String::from_utf8_lossy(bytes).to_string();
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    };
     ExtractedDocument {
         title: None,
         language: None,
@@ -398,6 +405,16 @@ mod tests {
         assert_eq!(doc.title, None);
         assert_eq!(doc.language, None);
         assert_eq!(doc.markdown, "plain text\nline 2\n");
+    }
+
+    #[test]
+    fn extract_text_fallback_replaces_invalid_utf8() {
+        let bytes = b"plain \xFF text\n";
+        let doc =
+            extract(bytes, Some("text/plain"), "https://example.com").expect("extract failed");
+        assert_eq!(doc.title, None);
+        assert_eq!(doc.language, None);
+        assert_eq!(doc.markdown, "plain \u{FFFD} text\n");
     }
 
     // BUG: clean_markdown's whitespace normalization drops the trailing newline

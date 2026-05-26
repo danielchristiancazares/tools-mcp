@@ -5,7 +5,9 @@ use std::time::Duration;
 use tokio::io::BufReader;
 use tools_mcp_core::process::read_to_end_limited;
 use tools_mcp_core::text::{strip_ansi_codes, truncate_at_char_boundary};
-use tools_mcp_core::{RpcResponse, read_mcp_message, write_mcp_response_with_mode};
+use tools_mcp_core::{
+    RpcResponse, ToolCallOutcome, read_mcp_message, write_mcp_response_with_mode,
+};
 
 const RAW_PING: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}
 "#;
@@ -147,11 +149,56 @@ fn bench_process_capture(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_tool_outcome(c: &mut Criterion) {
+    let large_text = "large tool payload line\n".repeat(1024);
+    let mut group = c.benchmark_group("tool_outcome");
+    group.warm_up_time(WARM_UP_TIME);
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
+
+    group.bench_function("tool_call_ok_text_with_large", |b| {
+        b.iter(|| {
+            black_box(ToolCallOutcome::ok_text_with(
+                black_box(large_text.as_str()),
+                std::iter::empty::<(&'static str, serde_json::Value)>(),
+            ));
+        });
+    });
+
+    group.bench_function("tool_call_err_large", |b| {
+        b.iter(|| {
+            black_box(ToolCallOutcome::err(black_box(large_text.as_str())));
+        });
+    });
+
+    group.bench_function("rpc_ok_text_with_large", |b| {
+        b.iter(|| {
+            black_box(RpcResponse::ok_text_with(
+                Some(json!(1)),
+                black_box(large_text.as_str()),
+                std::iter::empty::<(&'static str, serde_json::Value)>(),
+            ));
+        });
+    });
+
+    group.bench_function("rpc_err_large", |b| {
+        b.iter(|| {
+            black_box(RpcResponse::err(
+                Some(json!(1)),
+                black_box(large_text.as_str()),
+            ));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_protocol_read,
     bench_protocol_write,
     bench_text,
-    bench_process_capture
+    bench_process_capture,
+    bench_tool_outcome
 );
 criterion_main!(benches);

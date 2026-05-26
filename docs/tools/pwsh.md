@@ -117,7 +117,7 @@ Ordered execution steps. Each step is anchored to a code location.
 11. **Strip ANSI escapes** — Replace `result.stdout` and `result.stderr` with the output of `strip_ansi_codes(...)` (`tools-mcp-local/src/tools/pwsh.rs:101-102`). The stripper handles CSI sequences, OSC sequences (BEL or ESC\\-terminated), charset designation escapes, and single-character escapes (`tools-mcp-core/src/text.rs:21-96`).
 12. **Log non-success outcomes** — If `result.success` is false, emit `error!("Pwsh tool: command failed (exit_code={:?}, timed_out={})", result.exit_code, result.timed_out)` (`tools-mcp-local/src/tools/pwsh.rs:104-109`).
 13. **Build the JSON payload** — Construct `serde_json::json!({ "exit_code": ..., "success": ..., "timed_out": ..., "truncated_stdout": ..., "truncated_stderr": ..., "stdout": ..., "stderr": ... })` (`tools-mcp-local/src/tools/pwsh.rs:111-119`).
-14. **Wrap as MCP content** — Return `ToolCallOutcome::ok_json_content(&payload, !result.success)` (`tools-mcp-local/src/tools/pwsh.rs:120`). The payload is serialized as text content; `isError` is `true` when the command did not succeed (non-zero exit or timeout). The text serialization honors `TOOLS_PRETTY_JSON` (`tools-mcp-core/src/tool_outcome.rs:100-118`).
+14. **Wrap as MCP content** — Return `ToolCallOutcome::ok_json_content(&payload, !result.success)` (`tools-mcp-local/src/tools/pwsh.rs:120`). The payload is serialized as compact JSON text content; `isError` is `true` when the command did not succeed (non-zero exit or timeout).
 
 ### 6.3 Response Schema
 
@@ -218,7 +218,6 @@ This is the highest-impact tool in the registry. The threat model (`docs/tools-m
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_ENABLE_PWSH_TOOL` | unset | When the literal string `"true"`, the tool is registered. Any other value (including unset) leaves the tool out of the registry and emits a `warn!` log line at server startup (`tools-mcp-local/src/tools/mod.rs:30-36`). Read exactly once at registration time. |
-| `TOOLS_PRETTY_JSON` | unset | Process-wide. Read inside `ToolCallOutcome::ok_json_content` (`tools-mcp-core/src/tool_outcome.rs:100-118`). When `1`/`true`/`yes`/`on`, the JSON payload in `content[0].text` is pretty-printed; otherwise compact. Affects token counts and string lengths. |
 
 The handler itself does not read any other environment variables. The spawned child inherits the full parent environment.
 
@@ -256,7 +255,7 @@ Primary source locations for audit and review.
 | `validation::validate_non_empty` | `tools-mcp-core/src/validation.rs` | 11-22 |
 | `path_policy::resolve_existing_directory` | `tools-mcp-local/src/path_policy.rs` | 47-63 |
 | Workspace confinement check | `tools-mcp-local/src/path_policy.rs` | 303-322 |
-| `ToolCallOutcome::ok_json_content` (`TOOLS_PRETTY_JSON`) | `tools-mcp-core/src/tool_outcome.rs` | 100-118 |
+| `ToolCallOutcome::ok_json_content` | `tools-mcp-core/src/tool_outcome.rs` | 78-88 |
 | `ToolCallOutcome::parse_args` error wording | `tools-mcp-core/src/tool_outcome.rs` | 61-75 |
 | `ToolCallOutcome::err` | `tools-mcp-core/src/tool_outcome.rs` | 35-40 |
 

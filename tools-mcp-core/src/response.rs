@@ -19,7 +19,7 @@
 //! and "the request was malformed or the method doesn't exist".
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Outgoing JSON-RPC 2.0 response to an MCP client.
 ///
@@ -134,9 +134,7 @@ impl RpcResponse {
         RpcResponse {
             jsonrpc: "2.0",
             id,
-            result: Some(
-                serde_json::json!({"content":[{"type":"text","text": msg.to_string()}], "isError": true}),
-            ),
+            result: Some(text_content_result(msg.to_string(), true)),
             error: None,
         }
     }
@@ -151,15 +149,7 @@ impl RpcResponse {
         msg: impl Into<String>,
         extra: impl IntoIterator<Item = (&'static str, Value)>,
     ) -> RpcResponse {
-        let mut payload = serde_json::json!({
-            "content": [{"type": "text", "text": msg.into()}],
-            "isError": true
-        });
-        if let Some(obj) = payload.as_object_mut() {
-            for (k, v) in extra {
-                obj.insert(k.to_string(), v);
-            }
-        }
+        let payload = text_content_result_with_extra(msg.into(), true, extra);
         RpcResponse {
             jsonrpc: "2.0",
             id,
@@ -193,15 +183,7 @@ impl RpcResponse {
         text: impl Into<String>,
         extra: impl IntoIterator<Item = (&'static str, Value)>,
     ) -> RpcResponse {
-        let mut payload = serde_json::json!({
-            "content": [{"type": "text", "text": text.into()}],
-            "isError": false
-        });
-        if let Some(obj) = payload.as_object_mut() {
-            for (k, v) in extra {
-                obj.insert(k.to_string(), v);
-            }
-        }
+        let payload = text_content_result_with_extra(text.into(), false, extra);
         RpcResponse::ok(id, payload)
     }
 
@@ -286,6 +268,43 @@ impl RpcResponse {
     }
 }
 
+#[inline]
+pub(crate) fn text_content_result(text: String, is_error: bool) -> Value {
+    let mut result = Map::new();
+    result.insert(
+        "content".to_owned(),
+        Value::Array(vec![text_content_item(text)]),
+    );
+    result.insert("isError".to_owned(), Value::Bool(is_error));
+    Value::Object(result)
+}
+
+#[inline]
+pub(crate) fn text_content_result_with_extra(
+    text: String,
+    is_error: bool,
+    extra: impl IntoIterator<Item = (&'static str, Value)>,
+) -> Value {
+    let mut result = Map::new();
+    result.insert(
+        "content".to_owned(),
+        Value::Array(vec![text_content_item(text)]),
+    );
+    result.insert("isError".to_owned(), Value::Bool(is_error));
+    for (key, value) in extra {
+        result.insert(key.to_owned(), value);
+    }
+    Value::Object(result)
+}
+
+#[inline]
+fn text_content_item(text: String) -> Value {
+    let mut content = Map::new();
+    content.insert("type".to_owned(), Value::String("text".to_owned()));
+    content.insert("text".to_owned(), Value::String(text));
+    Value::Object(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::RpcResponse;
@@ -329,5 +348,18 @@ mod tests {
 
         assert!(message.contains("invalid arguments: unknown field"));
         assert!(message.contains("Unknown fields are not allowed"));
+    }
+
+    #[test]
+    fn ok_text_with_preserves_extra_field_overwrites() {
+        let response = RpcResponse::ok_text_with(
+            Some(json!(1)),
+            "hello",
+            [("content", json!([])), ("isError", json!(true))],
+        );
+        let result = response.result.expect("tool result");
+
+        assert_eq!(result["content"], json!([]));
+        assert_eq!(result["isError"], json!(true));
     }
 }

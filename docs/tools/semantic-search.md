@@ -222,7 +222,6 @@ The same envelope shape is returned by `ToolCallOutcome::err` when argument pars
 Indirect knobs:
 
 - **`gpu-cuda` Cargo feature** (build-time, not runtime). When enabled, the embedding provider initializes ONNX Runtime with the CUDA execution provider for query embeddings as well (`tools-mcp-semantic/src/embedding.rs:158-166`).
-- **`TOOLS_PRETTY_JSON`** (process-wide). Does NOT affect this tool, because `SearchSummary::into_payload` constructs the JSON value directly rather than routing through `ToolCallOutcome::ok_json_content` (`tools-mcp-semantic/src/model.rs:87-128`, `tools-mcp-core/src/tool_outcome.rs:98-118`).
 
 ## 9. Code Anchors
 

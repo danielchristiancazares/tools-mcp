@@ -1,5 +1,5 @@
 use crate::chunking::CodeChunk;
-use crate::discovery::{PathFilter, escape_sql_literal};
+use crate::discovery::PathFilter;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, StringBuilder, UInt64Builder};
 use arrow_array::{Array, Float32Array, Float64Array, RecordBatch, StringArray, UInt64Array};
@@ -281,22 +281,36 @@ fn records_to_batch(records: &[StoredChunk], schema: SchemaRef) -> Result<Record
 }
 
 fn delete_paths_predicate(root: &str, paths: &[String]) -> String {
-    let root = escape_sql_literal(root);
+    let root_len = escaped_sql_literal_len(root);
     if let [path] = paths {
-        return format!("root = '{root}' AND path = '{}'", escape_sql_literal(path));
+        let mut predicate = String::with_capacity(
+            "root = '' AND path = ''".len() + root_len + escaped_sql_literal_len(path),
+        );
+        predicate.push_str("root = '");
+        push_escaped_sql_literal(&mut predicate, root);
+        predicate.push_str("' AND path = '");
+        push_escaped_sql_literal(&mut predicate, path);
+        predicate.push('\'');
+        return predicate;
     }
 
-    let path_literals_len = paths.iter().map(|path| path.len() + 4).sum::<usize>();
-    let mut predicate = String::with_capacity(root.len() + path_literals_len + 32);
+    let path_literals_len = paths
+        .iter()
+        .map(|path| escaped_sql_literal_len(path) + 2)
+        .sum::<usize>();
+    let separators_len = paths.len().saturating_sub(1) * ", ".len();
+    let mut predicate = String::with_capacity(
+        "root = '' AND path IN ()".len() + root_len + path_literals_len + separators_len,
+    );
     predicate.push_str("root = '");
-    predicate.push_str(&root);
+    push_escaped_sql_literal(&mut predicate, root);
     predicate.push_str("' AND path IN (");
     for (index, path) in paths.iter().enumerate() {
         if index > 0 {
             predicate.push_str(", ");
         }
         predicate.push('\'');
-        predicate.push_str(&escape_sql_literal(path));
+        push_escaped_sql_literal(&mut predicate, path);
         predicate.push('\'');
     }
     predicate.push(')');
@@ -312,31 +326,107 @@ fn search_projection(include_content: bool) -> Select {
 }
 
 fn build_filter_predicate(filter: &SearchFilter) -> String {
-    let root = escape_sql_literal(&filter.root);
-    let mut predicate = String::with_capacity(root.len() + "root = ''".len());
-    predicate.push_str("root = '");
-    predicate.push_str(&root);
-    predicate.push('\'');
-
-    if let Some(path_filter) = filter.path_filter.to_sql() {
-        predicate.reserve(path_filter.len() + " AND ".len());
-        predicate.push_str(" AND ");
-        predicate.push_str(&path_filter);
-    }
-
-    if let Some(language) = filter
+    let root_len = escaped_sql_literal_len(&filter.root);
+    let path_filter_len = path_filter_sql_len(&filter.path_filter);
+    let language = filter
         .language
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let language = escape_sql_literal(language.trim());
-        predicate.reserve(language.len() + " AND language = ''".len());
-        predicate.push_str(" AND language = '");
-        predicate.push_str(&language);
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let language_len = language.map_or(0, escaped_sql_literal_len);
+    let mut predicate = String::with_capacity(
+        "root = ''".len()
+            + root_len
+            + path_filter_len.map_or(0, |len| " AND ".len() + len)
+            + language.map_or(0, |_| " AND language = ''".len() + language_len),
+    );
+    predicate.push_str("root = '");
+    push_escaped_sql_literal(&mut predicate, &filter.root);
+    predicate.push('\'');
+
+    push_path_filter_sql(&mut predicate, &filter.path_filter);
+
+    if let Some(language) = language {
+        predicate.push_str(" AND ");
+        predicate.push_str("language = '");
+        push_escaped_sql_literal(&mut predicate, language);
         predicate.push('\'');
     }
 
     predicate
+}
+
+fn escaped_sql_literal_len(value: &str) -> usize {
+    value.len()
+        + value
+            .as_bytes()
+            .iter()
+            .filter(|&&byte| byte == b'\'')
+            .count()
+}
+
+fn push_escaped_sql_literal(output: &mut String, value: &str) {
+    let mut remainder = value;
+    while let Some(index) = remainder.find('\'') {
+        output.push_str(&remainder[..index]);
+        output.push_str("''");
+        remainder = &remainder[index + 1..];
+    }
+    output.push_str(remainder);
+}
+
+fn path_filter_sql_len(path_filter: &PathFilter) -> Option<usize> {
+    match path_filter {
+        PathFilter::Workspace => None,
+        PathFilter::File(path) => Some("path = ''".len() + escaped_sql_literal_len(path)),
+        PathFilter::Directory(path) => Some(
+            "(path = '' OR (path >= '' AND path < ''))".len()
+                + escaped_sql_literal_len(path) * 3
+                + "/0".len(),
+        ),
+    }
+}
+
+fn push_path_filter_sql(predicate: &mut String, path_filter: &PathFilter) {
+    match path_filter {
+        PathFilter::Workspace => {}
+        PathFilter::File(path) => {
+            predicate.push_str(" AND path = '");
+            push_escaped_sql_literal(predicate, path);
+            predicate.push('\'');
+        }
+        PathFilter::Directory(path) => {
+            predicate.push_str(" AND (path = '");
+            push_escaped_sql_literal(predicate, path);
+            predicate.push_str("' OR (path >= '");
+            push_escaped_sql_literal(predicate, path);
+            predicate.push_str("/' AND path < '");
+            push_escaped_sql_literal(predicate, path);
+            predicate.push_str("0'))");
+        }
+    }
+}
+
+#[cfg(feature = "bench-api")]
+pub(crate) fn benchmark_delete_paths_predicate_len(root: &str, paths: &[String]) -> usize {
+    delete_paths_predicate(root, paths).len()
+}
+
+#[cfg(feature = "bench-api")]
+pub(crate) fn benchmark_directory_filter_predicate_len(
+    root: &str,
+    directory: &str,
+    language: Option<&str>,
+) -> usize {
+    let filter = SearchFilter {
+        root: root.to_owned(),
+        path_filter: PathFilter::Directory(directory.to_owned()),
+        language: language.map(str::to_owned),
+        limit: 20,
+        threshold: None,
+        include_content: false,
+    };
+    build_filter_predicate(&filter).len()
 }
 
 fn append_matches(
@@ -490,6 +580,48 @@ mod tests {
         assert!(predicate.contains("language = 'rust'"));
     }
 
+    #[test]
+    fn search_filter_predicate_escapes_literals_exactly() {
+        let filter = SearchFilter {
+            root: "C:/repo's".to_string(),
+            path_filter: PathFilter::Directory("src/it's".to_string()),
+            language: Some("rust's".to_string()),
+            limit: 10,
+            threshold: None,
+            include_content: true,
+        };
+
+        assert_eq!(
+            build_filter_predicate(&filter),
+            concat!(
+                "root = 'C:/repo''s' AND ",
+                "(path = 'src/it''s' OR (path >= 'src/it''s/' AND path < 'src/it''s0')) ",
+                "AND language = 'rust''s'"
+            )
+        );
+    }
+
+    #[test]
+    fn search_filter_predicate_treats_directory_punctuation_literally() {
+        let filter = SearchFilter {
+            root: "repo".to_string(),
+            path_filter: PathFilter::Directory("smart_file.edit".to_string()),
+            language: None,
+            limit: 10,
+            threshold: None,
+            include_content: true,
+        };
+
+        assert_eq!(
+            build_filter_predicate(&filter),
+            concat!(
+                "root = 'repo' AND ",
+                "(path = 'smart_file.edit' OR ",
+                "(path >= 'smart_file.edit/' AND path < 'smart_file.edit0'))"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn directory_filter_matches_underscore_paths_literally() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -535,6 +667,14 @@ mod tests {
                 &["src/it_was.rs".to_string(), "src/it's.rs".to_string()]
             ),
             "root = 'repo''s' AND path IN ('src/it_was.rs', 'src/it''s.rs')"
+        );
+    }
+
+    #[test]
+    fn delete_paths_predicate_escapes_single_literal() {
+        assert_eq!(
+            delete_paths_predicate("repo's", &["src/it's.rs".to_string()]),
+            "root = 'repo''s' AND path = 'src/it''s.rs'"
         );
     }
 

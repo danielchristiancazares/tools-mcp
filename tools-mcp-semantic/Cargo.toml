@@ -67,3 +67,8 @@ name = "semantic_gpu"
 path = "benches/semantic.rs"
 harness = false
 required-features = ["bench-api", "gpu-cuda"]
+
+[[bench]]
+name = "semantic_predicates"
+harness = false
+required-features = ["bench-api"]

@@ -115,7 +115,7 @@ The schema sets `"additionalProperties": false` (`edit.rs:33`); the request type
 15. **Write file** — `fs::write(&path, &updated)` writes the new bytes (`edit.rs:125`). The file is replaced atomically at the OS level only insofar as `std::fs::write` provides; the tool does not stage to a temp file.
 16. **Compute new hash + line numbers** — SHA-256 of the new bytes; convert `canonical_start` and `canonical_end - 1` back to line numbers via `line_index_for_offset` (`edit.rs:128-136`).
 17. **Build success payload** — Return `SnippetStatusKind::Ok` with payload listed in §6.3 (`edit.rs:138-152`).
-18. **Wrap in MCP envelope** — `handle_edit` converts the payload into `ToolCallOutcome::ok_json_content(&result.payload, is_error)` where `is_error` is `false` for `Ok` and `true` for `NoMatch` / `StaleFile` (`mod.rs:77-79`). `ok_json_content` honors `TOOLS_PRETTY_JSON` (`tool_outcome.rs:100-118`).
+18. **Wrap in MCP envelope** — `handle_edit` converts the payload into `ToolCallOutcome::ok_json_content(&result.payload, is_error)` where `is_error` is `false` for `Ok` and `true` for `NoMatch` / `StaleFile` (`mod.rs:77-79`). `ok_json_content` serializes the payload as compact JSON text.
 
 ### 6.3 Response Schema
 
@@ -219,11 +219,7 @@ Errors use `ToolCallOutcome::err` (`tools-mcp-core/src/tool_outcome.rs:35`). The
 
 ## 8. Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `TOOLS_PRETTY_JSON` | unset (compact) | When `1`, `true`, `yes`, or `on` (case-insensitive), the JSON payload inside `content[0].text` is pretty-printed. Read once per process (`tool_outcome.rs:101-106`). |
-
-The path-policy enforcement uses `std::env::current_dir()` (`path_policy.rs:84`) to determine the workspace root; this is the server process's CWD at startup and is not configurable through an env var.
+This tool does not read environment variables directly. The path-policy enforcement uses `std::env::current_dir()` (`path_policy.rs:84`) to determine the workspace root; this is the server process's CWD at startup and is not configurable through an env var.
 
 ## 9. Code Anchors
 
