@@ -17,6 +17,7 @@ mod search_memory;
 #[cfg(test)]
 mod search_parity;
 
+pub(crate) use read_file::benchmark_render_numbered_range;
 pub use read_file::handle_read_file;
 pub use ripgrep::handle_search;
 pub use search_context::handle_search_context;

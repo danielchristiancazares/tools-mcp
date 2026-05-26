@@ -35,3 +35,7 @@ tempfile.workspace = true
 [[bench]]
 name = "search_memory"
 harness = false
+
+[[bench]]
+name = "read_file_memory"
+harness = false

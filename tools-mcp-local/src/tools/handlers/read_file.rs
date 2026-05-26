@@ -3,7 +3,6 @@
 use memchr::memchr2;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -372,19 +371,68 @@ fn render_numbered_range(
     resolved_end: usize,
 ) -> String {
     let selected_bytes = &bytes[selected_range];
-    let width = resolved_end.max(1).to_string().len();
+    let text = String::from_utf8_lossy(selected_bytes);
+    render_numbered_text(text.as_ref(), start_line, resolved_end)
+}
+
+fn render_numbered_text(text: &str, start_line: usize, resolved_end: usize) -> String {
+    let width = decimal_width(resolved_end.max(1));
     let line_count = resolved_end - start_line + 1;
     let prefix_capacity = line_count.saturating_mul(width + 1);
-    let mut body = String::with_capacity(selected_bytes.len().saturating_add(prefix_capacity));
+    let mut body = String::with_capacity(text.len().saturating_add(prefix_capacity));
     let mut line_no = start_line;
 
-    for_each_line_with_endings(selected_bytes, |_, line_start, line_end| {
-        let line = String::from_utf8_lossy(&selected_bytes[line_start..line_end]);
-        let _ = write!(body, "{line_no:>width$}\t{line}");
+    for_each_line_with_endings(text.as_bytes(), |_, line_start, line_end| {
+        push_number_prefix(&mut body, line_no, width);
+        body.push_str(&text[line_start..line_end]);
         line_no += 1;
     });
 
     body
+}
+
+fn decimal_width(mut value: usize) -> usize {
+    let mut width = 1;
+
+    while value >= 10 {
+        value /= 10;
+        width += 1;
+    }
+
+    width
+}
+
+fn push_number_prefix(body: &mut String, line_no: usize, width: usize) {
+    let mut digits = [0_u8; std::mem::size_of::<usize>() * 3];
+    let mut value = line_no;
+    let mut len = 0;
+
+    loop {
+        let index = digits.len() - 1 - len;
+        digits[index] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+
+        if value == 0 {
+            break;
+        }
+    }
+
+    for _ in len..width {
+        body.push(' ');
+    }
+
+    let start = digits.len() - len;
+    body.push_str(std::str::from_utf8(&digits[start..]).expect("decimal digits are valid utf-8"));
+    body.push('\t');
+}
+
+pub(crate) fn benchmark_render_numbered_range(
+    bytes: &[u8],
+    start_line: usize,
+    resolved_end: usize,
+) -> usize {
+    render_numbered_range(bytes, 0..bytes.len(), start_line, resolved_end).len()
 }
 
 fn for_each_line_with_endings(bytes: &[u8], mut visit: impl FnMut(usize, usize, usize)) -> usize {
@@ -827,5 +875,20 @@ mod tests {
         assert_eq!(outcome.0["start_line"], 9);
         assert_eq!(outcome.0["end_line"], 10);
         assert_eq!(outcome.0["total_lines"], 10);
+    }
+
+    #[test]
+    fn render_numbered_range_preserves_invalid_utf8_replacement() {
+        let bytes = b"valid\n\xFFbad\nlast\n";
+        let rendered = super::render_numbered_range(bytes, 0..bytes.len(), 1, 3);
+
+        assert_eq!(rendered, "1\tvalid\n2\t\u{FFFD}bad\n3\tlast\n");
+    }
+
+    #[test]
+    fn render_numbered_text_preserves_mixed_newlines_without_final_newline() {
+        let rendered = super::render_numbered_text("a\r\nb\nc\rd", 1, 4);
+
+        assert_eq!(rendered, "1\ta\r\n2\tb\n3\tc\r4\td");
     }
 }

@@ -42,3 +42,12 @@ pub fn register_tools(registry: &mut ToolRegistry) {
 pub fn start_search_cache_warmer() {
     handlers::start_search_cache_warmer();
 }
+
+#[doc(hidden)]
+pub(crate) fn benchmark_render_numbered_range(
+    bytes: &[u8],
+    start_line: usize,
+    resolved_end: usize,
+) -> usize {
+    handlers::benchmark_render_numbered_range(bytes, start_line, resolved_end)
+}
