@@ -57,7 +57,11 @@ where
 
     if limit > 0 {
         let mut limited_reader = (&mut reader).take(limit as u64);
-        limited_reader.read_to_end(&mut out).await?;
+        let read = limited_reader.read_to_end(&mut out).await?;
+
+        if read < limit {
+            return Ok((out, false));
+        }
     }
 
     let mut buf = [0u8; 16 * 1024];
@@ -235,12 +239,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_to_end_limited_exact_limit_is_not_truncated() {
+        let input = b"hello";
+        let (captured, truncated) = read_to_end_limited(&input[..], input.len()).await.unwrap();
+
+        assert_eq!(captured, input);
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
     async fn read_to_end_limited_zero_limit_marks_nonempty_input_truncated() {
         let input = b"hello";
         let (captured, truncated) = read_to_end_limited(&input[..], 0).await.unwrap();
 
         assert!(captured.is_empty());
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_to_end_limited_zero_limit_empty_input_is_not_truncated() {
+        let input = b"";
+        let (captured, truncated) = read_to_end_limited(&input[..], 0).await.unwrap();
+
+        assert!(captured.is_empty());
+        assert!(!truncated);
     }
 
     #[tokio::test]
