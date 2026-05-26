@@ -88,6 +88,7 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use std::fs;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -554,6 +555,24 @@ fn bench_embed_documents_batch_size(c: &mut Criterion, runtime: &Runtime) {
     group.finish();
 }
 
+fn bench_markdown_chunking(c: &mut Criterion) {
+    let markdown = markdown_many_headings_fixture();
+    let mut group = c.benchmark_group("semantic_chunking");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_millis(300));
+    group.warm_up_time(Duration::from_millis(100));
+
+    group.bench_function("markdown_many_headings", |b| {
+        b.iter(|| {
+            black_box(tools_mcp_semantic::bench::chunk_markdown(black_box(
+                &markdown,
+            )));
+        });
+    });
+
+    group.finish();
+}
+
 fn synthesize_embedding_corpus(count: usize) -> Vec<String> {
     (0..count)
         .map(|index| {
@@ -572,6 +591,17 @@ fn synthesize_embedding_corpus(count: usize) -> Vec<String> {
             )
         })
         .collect()
+}
+
+fn markdown_many_headings_fixture() -> String {
+    let mut markdown = String::with_capacity(128 * 1024);
+    markdown.push_str("# Root\n\n");
+    for section in 0..1024 {
+        markdown.push_str(&format!("## Heading {section}\n"));
+        markdown.push_str("This section contains repeated prose that keeps the markdown chunker busy and produces a stable, heading-heavy corpus for the benchmark. ");
+        markdown.push_str("More content follows to ensure the section has enough material to exercise trimming and chunk assembly.\n\n");
+    }
+    markdown
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +637,7 @@ fn run_all(c: &mut Criterion) {
     bench_cold_index(c, &runtime, registry);
     bench_incremental_index(c, &runtime, registry);
     bench_warm_query(c, &runtime, registry);
+    bench_markdown_chunking(c);
     bench_search_during_background_index(c, &runtime, registry);
     bench_embed_documents_batch_size(c, &runtime);
 }

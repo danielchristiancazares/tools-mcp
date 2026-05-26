@@ -21,7 +21,10 @@ pub fn register_tools(registry: &mut ToolRegistry) {
 pub mod bench {
     use anyhow::Result;
     use std::path::Path;
+    use std::path::PathBuf;
 
+    use crate::chunking::{chunk_source, hash_bytes};
+    use crate::discovery::FileCandidate;
     use crate::embedding::FastEmbedProvider as InternalProvider;
 
     /// Public-for-bench wrapper around the internal FastEmbed provider. Mirrors only the methods
@@ -50,5 +53,17 @@ pub mod bench {
         pub fn model_id(&self) -> &str {
             self.0.model_id()
         }
+    }
+
+    /// Bench-only wrapper around Markdown chunking so we can isolate the hot path from discovery
+    /// and embedding overhead.
+    pub fn chunk_markdown(markdown: &str) -> usize {
+        let file = FileCandidate {
+            absolute_path: PathBuf::from("bench.md"),
+            relative_path: "bench.md".to_string(),
+            language: "markdown".to_string(),
+        };
+        let file_hash = hash_bytes(markdown.as_bytes());
+        chunk_source(&file, markdown, &file_hash).len()
     }
 }

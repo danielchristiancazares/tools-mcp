@@ -192,12 +192,14 @@ fn tags_query_chunks(
 
         let start_line = node.start_position().row as u64 + 1;
         let end_line = node.end_position().row as u64 + 1;
+        let content_hash = hash_bytes(content.as_bytes());
         chunks.push(build_chunk(
             file,
             symbol,
             start_line,
             end_line,
             content.to_string(),
+            content_hash,
             file_hash,
         ));
     }
@@ -262,10 +264,11 @@ fn markdown_chunks(file: &FileCandidate, source: &str, file_hash: &str) -> Vec<C
             .get(heading_index + 1)
             .copied()
             .unwrap_or(lines.len());
-        let content = join_lines_trimmed(&lines[start..end_exclusive]);
-        if content.is_empty() {
+        let Some((content, content_hash)) =
+            join_lines_trimmed_and_hash(&lines[start..end_exclusive])
+        else {
             continue;
-        }
+        };
         let symbol = lines[start]
             .trim_start_matches('#')
             .split_whitespace()
@@ -277,6 +280,7 @@ fn markdown_chunks(file: &FileCandidate, source: &str, file_hash: &str) -> Vec<C
             start as u64 + 1,
             end_exclusive as u64,
             content,
+            content_hash,
             file_hash,
         ));
     }
@@ -306,14 +310,14 @@ fn fallback_line_chunks(
     let mut start = 0usize;
     while start < lines.len() {
         let end = (start + FALLBACK_CHUNK_LINES).min(lines.len());
-        let content = join_lines_trimmed(&lines[start..end]);
-        if !content.is_empty() {
+        if let Some((content, content_hash)) = join_lines_trimmed_and_hash(&lines[start..end]) {
             chunks.push(build_chunk(
                 file,
                 symbol.clone(),
                 start as u64 + 1,
                 end as u64,
                 content,
+                content_hash,
                 file_hash,
             ));
         }
@@ -326,14 +330,17 @@ fn fallback_line_chunks(
     chunks
 }
 
-fn join_lines_trimmed(lines: &[&str]) -> String {
-    let Some(first_content_line) = lines.iter().position(|line| !line.trim().is_empty()) else {
-        return String::new();
-    };
-    let last_content_line = lines
-        .iter()
-        .rposition(|line| !line.trim().is_empty())
-        .unwrap_or(first_content_line);
+fn join_lines_trimmed_and_hash(lines: &[&str]) -> Option<(String, String)> {
+    let mut first_content_line = None;
+    let mut last_content_line = None;
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim().is_empty() {
+            first_content_line.get_or_insert(index);
+            last_content_line = Some(index);
+        }
+    }
+    let first_content_line = first_content_line?;
+    let last_content_line = last_content_line.unwrap_or(first_content_line);
     let selected_lines = &lines[first_content_line..=last_content_line];
     let last_selected_line = selected_lines.len().saturating_sub(1);
 
@@ -355,9 +362,11 @@ fn join_lines_trimmed(lines: &[&str]) -> String {
         .sum::<usize>()
         + selected_lines.len().saturating_sub(1);
     let mut content = String::with_capacity(capacity);
+    let mut hasher = Sha256::new();
     for (index, line) in selected_lines.iter().enumerate() {
         if index > 0 {
             content.push('\n');
+            hasher.update(b"\n");
         }
         let trimmed = if index == 0 && index == last_selected_line {
             line.trim()
@@ -369,8 +378,9 @@ fn join_lines_trimmed(lines: &[&str]) -> String {
             line
         };
         content.push_str(trimmed);
+        hasher.update(trimmed.as_bytes());
     }
-    content
+    Some((content, hex::encode(hasher.finalize())))
 }
 
 fn build_chunk(
@@ -379,9 +389,9 @@ fn build_chunk(
     start_line: u64,
     end_line: u64,
     content: String,
+    content_hash: String,
     file_hash: &str,
 ) -> CodeChunk {
-    let content_hash = hash_bytes(content.as_bytes());
     let mut id_hasher = Sha256::new();
     id_hasher.update(file.relative_path.as_bytes());
     id_hasher.update(start_line.to_le_bytes());
@@ -472,6 +482,36 @@ mod tests {
     }
 
     #[test]
+    fn chunks_markdown_trims_outer_blank_lines_and_keeps_internal_spacing() {
+        let source = "# One\n\nbody 1\n\nbody 2\n\n## Two\nline 2\n";
+        let chunks = chunk_source(
+            &file("README.md", "markdown"),
+            source,
+            &hash_bytes(source.as_bytes()),
+        );
+
+        assert_eq!(chunks.len(), 2);
+
+        let one = chunks
+            .iter()
+            .find(|chunk| chunk.symbol.as_deref() == Some("One"))
+            .expect("one chunk");
+        assert_eq!(one.start_line, 1);
+        assert_eq!(one.end_line, 6);
+        assert_eq!(one.content, "# One\n\nbody 1\n\nbody 2");
+        assert_eq!(one.content_hash, hash_bytes(one.content.as_bytes()));
+
+        let two = chunks
+            .iter()
+            .find(|chunk| chunk.symbol.as_deref() == Some("Two"))
+            .expect("two chunk");
+        assert_eq!(two.start_line, 7);
+        assert_eq!(two.end_line, 8);
+        assert_eq!(two.content, "## Two\nline 2");
+        assert_eq!(two.content_hash, hash_bytes(two.content.as_bytes()));
+    }
+
+    #[test]
     fn fallback_chunks_preserve_overlap_and_metadata() {
         let source = (1..=110)
             .map(|line| format!("line {line}"))
@@ -487,11 +527,19 @@ mod tests {
         assert_eq!(chunks[0].end_line, 100);
         assert!(chunks[0].content.starts_with("line 1\nline 2"));
         assert!(chunks[0].content.ends_with("line 100"));
+        assert_eq!(
+            chunks[0].content_hash,
+            hash_bytes(chunks[0].content.as_bytes())
+        );
         assert_eq!(chunks[0].file_hash, file_hash);
 
         assert_eq!(chunks[1].start_line, 86);
         assert_eq!(chunks[1].end_line, 110);
         assert!(chunks[1].content.starts_with("line 86\nline 87"));
         assert!(chunks[1].content.ends_with("line 110"));
+        assert_eq!(
+            chunks[1].content_hash,
+            hash_bytes(chunks[1].content.as_bytes())
+        );
     }
 }
