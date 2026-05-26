@@ -424,6 +424,44 @@ fn test_search_literal_default_options_uses_memory_backend() {
 }
 
 #[test]
+fn test_search_empty_results_render_zero_results_message() {
+    let dir = workspace_tempdir("search-empty-results");
+    std::fs::write(dir.path().join("notes.txt"), "intro\nunrelated line\n")
+        .expect("write empty-results fixture");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 410,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Search",
+            "arguments": {
+                "pattern": "definitely-missing-needle",
+                "path": dir.path().to_string_lossy().to_string(),
+                "fixed_strings": true,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 20000
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call empty-result Search tool");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 410);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["count"], 0);
+    assert_eq!(response["result"]["match_count"], 0);
+    assert_eq!(response["result"]["event_count"], 0);
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("missing Search content text");
+    assert_eq!(text, "0 results found");
+}
+
+#[test]
 fn test_search_context_returns_numbered_file_window() {
     let request = json!({
         "jsonrpc": "2.0",

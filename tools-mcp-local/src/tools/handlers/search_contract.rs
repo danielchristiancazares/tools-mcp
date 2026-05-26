@@ -5,6 +5,7 @@ use std::{borrow::Cow, fmt::Write as _};
 use tools_mcp_core::{ToolCallOutcome, validation};
 
 const SEARCH_SNIPPET_MAX_LINE_BYTES: usize = 200;
+const EMPTY_SEARCH_TEXT: &str = "0 results found";
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -247,6 +248,10 @@ fn render_search_snippet(text: &str) -> SearchSnippet<'_> {
     }
 }
 
+pub(super) fn render_search_empty_text() -> &'static str {
+    EMPTY_SEARCH_TEXT
+}
+
 impl SearchEvent {
     pub(super) fn new(is_match: bool, path: String, line_number: u64, text: String) -> Self {
         Self {
@@ -464,6 +469,9 @@ pub(super) fn render_search_events(events: &[SearchEvent]) -> Vec<RenderedSearch
 pub(super) fn render_search_text_capacity_from_rendered(
     rendered_events: &[RenderedSearchEvent<'_>],
 ) -> usize {
+    if rendered_events.is_empty() {
+        return render_search_empty_text().len();
+    }
     rendered_events.iter().fold(
         rendered_events.len().saturating_sub(1),
         |capacity, event| capacity.saturating_add(event.rendered_line_len()),
@@ -478,6 +486,9 @@ pub(super) fn render_search_text(events: &[SearchEvent]) -> String {
 pub(super) fn render_search_text_from_rendered(
     rendered_events: &[RenderedSearchEvent<'_>],
 ) -> String {
+    if rendered_events.is_empty() {
+        return render_search_empty_text().to_string();
+    }
     let mut output =
         String::with_capacity(render_search_text_capacity_from_rendered(rendered_events));
     for (index, event) in rendered_events.iter().enumerate() {
@@ -537,7 +548,8 @@ mod tests {
     use super::{
         NormalizedSearchRequest, SEARCH_SNIPPET_MAX_LINE_BYTES, SearchCaseMode, SearchEvent,
         SearchPayloadMeta, SearchRequest, build_search_payload, build_search_payload_from_rendered,
-        render_search_events, render_search_text, render_search_text_from_rendered,
+        render_search_events, render_search_text, render_search_text_capacity_from_rendered,
+        render_search_text_from_rendered,
     };
     use serde_json::{Value, json};
 
@@ -597,6 +609,15 @@ mod tests {
                 &rendered,
             ),
             build_success_payload(&req, "src", &events)
+        );
+    }
+
+    #[test]
+    fn empty_search_text_renders_zero_results_message() {
+        assert_eq!(render_search_text_from_rendered(&[]), "0 results found");
+        assert_eq!(
+            render_search_text_capacity_from_rendered(&[]),
+            "0 results found".len()
         );
     }
 

@@ -2,8 +2,8 @@
 
 use super::search_contract::{
     NormalizedSearchRequest, RenderedSearchEvent, SearchCaseMode, SearchEvent, SearchPayloadMeta,
-    SearchRequest, build_search_payload_from_rendered, render_search_events,
-    render_search_text_capacity_from_rendered,
+    SearchRequest, build_search_payload_from_rendered, render_search_empty_text,
+    render_search_events, render_search_text_capacity_from_rendered,
 };
 use super::search_file_selection::{FileSelectionError, FileSelector};
 use crate::tools::scope_cache::{IgnoreFingerprint, ignore_fingerprint_change_reason};
@@ -5220,6 +5220,10 @@ fn render_search_text_with_deadline(
     events: &[RenderedSearchEvent<'_>],
     deadline: Instant,
 ) -> Result<String, MemoryError> {
+    if events.is_empty() {
+        check_deadline(deadline)?;
+        return Ok(render_search_empty_text().to_string());
+    }
     let mut output = String::with_capacity(render_search_text_capacity_from_rendered(events));
     for (index, event) in events.iter().enumerate() {
         check_deadline(deadline)?;
@@ -5821,6 +5825,16 @@ mod tests {
             literal_trigrams(b"ababa"),
             vec![[b'a', b'b', b'a'], [b'b', b'a', b'b']]
         );
+    }
+
+    #[test]
+    fn render_empty_search_results_report_zero_results_found() {
+        let rendered = render_search_events(&[]);
+        let text =
+            render_search_text_with_deadline(&rendered, Instant::now() + Duration::from_secs(1))
+                .expect("render empty search results");
+
+        assert_eq!(text, "0 results found");
     }
 
     #[test]
