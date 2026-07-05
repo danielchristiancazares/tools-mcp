@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "tools-mcp-server",
+    "tools-mcp-ado",
     "tools-mcp-core",
     "tools-mcp-git",
     "tools-mcp-local",

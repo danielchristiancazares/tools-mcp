@@ -13,6 +13,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tools-mcp-core = { path = "../tools-mcp-core" }
+tools-mcp-ado = { path = "../tools-mcp-ado" }
 tools-mcp-git = { path = "../tools-mcp-git" }
 tools-mcp-local = { path = "../tools-mcp-local" }
 tools-mcp-semantic = { path = "../tools-mcp-semantic" }

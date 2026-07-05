@@ -14,6 +14,12 @@ The SDD template is at [`TEMPLATE_TOOL_SDD.md`](./TEMPLATE_TOOL_SDD.md).
 |---|---|---|
 | `WebFetch` | [tools/webfetch.md](./tools/webfetch.md) | Written |
 
+### Azure DevOps
+
+| Tool | Doc | Status |
+|---|---|---|
+| `AdoWorkItems` | [tools/ado-work-items.md](./tools/ado-work-items.md) | Written |
+
 ### Search
 
 | Tool | Doc | Status |

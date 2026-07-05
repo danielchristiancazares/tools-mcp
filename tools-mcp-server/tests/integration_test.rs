@@ -90,8 +90,8 @@ fn test_tools_list() {
     let tools = response["result"]["tools"].as_array().unwrap();
     // Tool inventory can grow over time; assert a minimum and validate key tools exist.
     assert!(
-        tools.len() >= 16,
-        "expected at least 16 tools, got {}",
+        tools.len() >= 17,
+        "expected at least 17 tools, got {}",
         tools.len()
     );
 
@@ -99,6 +99,7 @@ fn test_tools_list() {
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     assert!(tool_names.contains(&"Ping"));
+    assert!(tool_names.contains(&"AdoWorkItems"));
     assert!(tool_names.contains(&"WebFetch"));
     assert!(tool_names.contains(&"Search"));
     assert!(tool_names.contains(&"SemanticIndex"));
@@ -1383,6 +1384,59 @@ fn test_webfetch_blocks_localhost_ssrf() {
     );
 
     assert_eq!(response["result"]["error_type"], "ssrf_blocked");
+}
+
+#[test]
+fn test_ado_work_items_validates_arguments_before_network() {
+    // Organization and project are valid, but no lookup selector is provided, so the
+    // tool rejects the call during argument validation before any Azure CLI or network
+    // activity. This exercises tool registration and the request path deterministically.
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "AdoWorkItems",
+            "arguments": {
+                "organization": "contoso",
+                "project": "Tools"
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call AdoWorkItems");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 32);
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["error_type"], "selector_required");
+}
+
+#[test]
+fn test_ado_work_items_rejects_invalid_resource_argument() {
+    // A non-GUID, non-https `resource` is rejected before the Azure CLI is invoked, so a
+    // caller-influenced value cannot reach the token command.
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 33,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "AdoWorkItems",
+            "arguments": {
+                "organization": "contoso",
+                "project": "Tools",
+                "id": 123,
+                "resource": "--cloud-name=AzureUSGovernment"
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("Failed to call AdoWorkItems");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 33);
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["error_type"], "invalid_resource");
 }
 
 #[test]

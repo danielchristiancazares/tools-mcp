@@ -21,6 +21,7 @@ cargo run -p tools-mcp-server --release
 - `protoc` in `PATH`, or `PROTOC` set to a `protoc` executable, to build LanceDB/Lance for the semantic-search dependencies.
 - Linux only: `libssl-dev` for HTTPS support.
 - Optional: Chrome or Chromium for `WebFetch` browser rendering. Without it (or without setting `WEBFETCH_ENABLE_BROWSER_UNSAFE=true`), `WebFetch` runs HTTP-only.
+- Optional: Azure CLI for `AdoWorkItems`. Sign in with `az login`; the tool mints a short-lived Azure DevOps token via `az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv`. No PAT or token env vars are used; the token audience is overridable per call via the tool's `resource` argument.
 
 ### MCP Client Configuration
 
@@ -41,6 +42,7 @@ Each row links to the tool's design contract under [`docs/tools/`](./docs/README
 | Task | Tool | Spec |
 |---|---|---|
 | Health check | **Tool name**: `Ping` | [docs/tools/ping.md](./docs/tools/ping.md) |
+| Look up Azure DevOps work items by ID, keyword, or assignee | **Tool name**: `AdoWorkItems` | [docs/tools/ado-work-items.md](./docs/tools/ado-work-items.md) |
 | Fetch and chunk web content | **Tool name**: `WebFetch` | [docs/tools/webfetch.md](./docs/tools/webfetch.md) |
 | Search by regex / literal / fuzzy | **Tool name**: `Search` | [docs/tools/search.md](./docs/tools/search.md) |
 | Search and expand matches into file windows | **Tool name**: `search_context` | [docs/tools/search-context.md](./docs/tools/search-context.md) |
