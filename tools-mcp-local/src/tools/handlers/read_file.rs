@@ -1,8 +1,10 @@
 //! File reading handler implementation.
 
+use crate::edit_snapshot;
 use memchr::memchr2;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::ops::Range;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -68,6 +70,10 @@ pub async fn handle_read_file(_id: Option<Value>, args: Value) -> ToolCallOutcom
         Err(err) => return read_error(path, err),
     };
 
+    // Record what the agent has now seen so a later Edit can verify the file is unchanged
+    // without the caller copying any hash between tool calls.
+    edit_snapshot::record_bytes(path, &data);
+
     if data.is_empty() {
         return read_ok(path, String::new(), 0, 0, 0);
     }
@@ -120,8 +126,11 @@ async fn read_large_range(
     end_line: Option<usize>,
     show_line_numbers: bool,
 ) -> Result<ToolCallOutcome, std::io::Error> {
-    let scan = stream_line_range(path, start, end_line).await?;
+    let (scan, file_hash) = stream_line_range(path, start, end_line).await?;
     let line_count = scan.total_lines;
+
+    // Record what the agent has now seen so a later Edit can verify the file is unchanged.
+    edit_snapshot::record(path, file_hash);
 
     if line_count == 0 {
         return Ok(read_ok(path, String::new(), 0, 0, 0));
@@ -239,10 +248,11 @@ async fn stream_line_range(
     path: &Path,
     start_line: usize,
     end_line: Option<usize>,
-) -> Result<StreamedLineRange, std::io::Error> {
+) -> Result<(StreamedLineRange, String), std::io::Error> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut buffer = vec![0; STREAM_READ_BUFFER_SIZE];
     let mut scanner = StreamLineRangeScanner::new(start_line, end_line);
+    let mut hasher = Sha256::new();
 
     loop {
         let bytes_read = file.read(&mut buffer).await?;
@@ -250,10 +260,12 @@ async fn stream_line_range(
             break;
         }
 
+        hasher.update(&buffer[..bytes_read]);
         scanner.push(&buffer[..bytes_read]);
     }
 
-    Ok(scanner.finish())
+    let file_hash = format!("sha256:{:x}", hasher.finalize());
+    Ok((scanner.finish(), file_hash))
 }
 
 impl StreamLineRangeScanner {
@@ -697,6 +709,54 @@ mod tests {
         assert_eq!(outcome.0["start_line"], 2);
         assert_eq!(outcome.0["end_line"], 3);
         assert_eq!(outcome.0["total_lines"], 4);
+    }
+
+    #[tokio::test]
+    async fn read_file_records_edit_snapshot_of_full_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("snapshotted.txt");
+        let contents = b"alpha\nbeta\ngamma\n";
+        std::fs::write(&path, contents).expect("write");
+
+        // A ranged read still records the snapshot of the whole file, not just the range.
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 2,
+            "end_line": 2,
+        });
+        let outcome = super::handle_read_file(None, args).await;
+        assert!(!outcome.0["isError"].as_bool().unwrap());
+
+        assert_eq!(
+            crate::edit_snapshot::get(&path),
+            Some(crate::edit_snapshot::file_hash(contents)),
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_large_range_records_full_file_snapshot() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("large-snapshot.txt");
+        let (content, _lines) =
+            large_line_fixture(LARGE_FILE_STREAMING_THRESHOLD_BYTES as usize + 1);
+        std::fs::write(&path, &content).expect("write");
+
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "start_line": 10,
+            "end_line": 12,
+        });
+        let outcome = super::handle_read_file(None, args).await;
+        assert!(!outcome.0["isError"].as_bool().unwrap());
+
+        assert_eq!(
+            crate::edit_snapshot::get(&path),
+            Some(crate::edit_snapshot::file_hash(content.as_bytes())),
+        );
     }
 
     #[tokio::test]

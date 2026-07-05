@@ -36,8 +36,6 @@ struct SimpleEditRequest {
     #[serde(default)]
     match_hint: Option<MatchHint>,
     #[serde(default)]
-    file_hash: Option<String>,
-    #[serde(default)]
     region_id: Option<String>,
 }
 
@@ -64,18 +62,43 @@ pub async fn handle_edit(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         Err(err) => return ToolCallOutcome::err(err.to_string()),
     };
 
+    // Mandatory read-before-edit: the file must have been observed in this server session
+    // (via Read, or a prior successful Edit) so the server can verify it has not changed
+    // out from under the agent. The expected hash comes from the server's own snapshot,
+    // never from a value copied by the caller.
+    let Some(expected_hash) = crate::edit_snapshot::get(&path) else {
+        return ToolCallOutcome::ok_json_content(
+            &serde_json::json!({
+                "action": "apply_snippet_edit",
+                "status": "no_snapshot",
+                "message": "no read snapshot for this file. Remediation: Read the file before editing so the server can verify it has not changed since you last saw it.",
+            }),
+            true,
+        );
+    };
+
     let internal_req = ApplySnippetEditRequest {
         path: path.display().to_string(),
         old_snippet: req.old_snippet,
         new_snippet: req.new_snippet,
         match_hint: req.match_hint,
-        file_hash: req.file_hash,
+        file_hash: Some(expected_hash),
         region_id: req.region_id,
     };
 
     match apply_snippet_edit_impl(&internal_req) {
         Ok(result) => {
             let is_error = !matches!(result.status, SnippetStatusKind::Ok);
+            // A successful Edit knows exactly what it wrote, so refresh the snapshot to the
+            // new content. This lets a chain of edits proceed without re-reading.
+            if !is_error
+                && let Some(after) = result
+                    .payload
+                    .get("file_hash_after")
+                    .and_then(Value::as_str)
+            {
+                crate::edit_snapshot::record(&path, after.to_string());
+            }
             ToolCallOutcome::ok_json_content(&result.payload, is_error)
         }
         Err(err) => ToolCallOutcome::err(format!(
@@ -97,10 +120,17 @@ mod tests {
         serde_json::from_str(text).expect("edit payload json")
     }
 
+    /// Stand in for a prior `Read`: record the current file content as the server's
+    /// snapshot so an Edit is allowed to proceed.
+    fn seed_snapshot(path: &std::path::Path) {
+        let bytes = std::fs::read(path).expect("read for snapshot");
+        crate::edit_snapshot::record_bytes(path, &bytes);
+    }
+
     #[tokio::test]
-    async fn public_edit_rejects_stale_file_hash_without_modifying_file() {
-        let dir = tempdir_in_workspace("edit-stale-");
-        let path = dir.path().join("stale-public.txt");
+    async fn public_edit_without_snapshot_is_rejected() {
+        let dir = tempdir_in_workspace("edit-no-snapshot-");
+        let path = dir.path().join("no-snapshot.txt");
         std::fs::write(&path, "alpha\nbeta\n").expect("write");
 
         let outcome = handle_edit(
@@ -109,17 +139,43 @@ mod tests {
                 "path": path,
                 "old_snippet": "beta",
                 "new_snippet": "BETA",
-                "file_hash": "not-the-current-hash"
+            }),
+        )
+        .await;
+        let payload = edit_payload(outcome);
+
+        assert_eq!(payload["status"], "no_snapshot");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nbeta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_edit_rejects_stale_file_when_changed_after_read() {
+        let dir = tempdir_in_workspace("edit-stale-");
+        let path = dir.path().join("stale-public.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("write");
+        seed_snapshot(&path);
+
+        // The file changes on disk after the snapshot was taken (e.g. another process).
+        std::fs::write(&path, "alpha\nbeta\nCHANGED\n").expect("rewrite");
+
+        let outcome = handle_edit(
+            None,
+            json!({
+                "path": path,
+                "old_snippet": "beta",
+                "new_snippet": "BETA",
             }),
         )
         .await;
         let payload = edit_payload(outcome);
 
         assert_eq!(payload["status"], "stale_file");
-        assert_eq!(payload["expected_file_hash"], "not-the-current-hash");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
-            "alpha\nbeta\n"
+            "alpha\nbeta\nCHANGED\n"
         );
     }
 
@@ -128,6 +184,7 @@ mod tests {
         let dir = tempdir_in_workspace("edit-region-");
         let path = dir.path().join("region-public.txt");
         std::fs::write(&path, "alpha\nbeta\n").expect("write");
+        seed_snapshot(&path);
 
         let outcome = handle_edit(
             None,
@@ -146,6 +203,45 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
             "alpha\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_edit_refreshes_snapshot_for_chained_edits() {
+        let dir = tempdir_in_workspace("edit-chain-");
+        let path = dir.path().join("chain-public.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("write");
+        seed_snapshot(&path);
+
+        let first = edit_payload(
+            handle_edit(
+                None,
+                json!({
+                    "path": path,
+                    "old_snippet": "beta",
+                    "new_snippet": "BETA",
+                }),
+            )
+            .await,
+        );
+        assert_eq!(first["status"], "ok");
+
+        // No re-Read: the first edit refreshed the snapshot, so the second edit is allowed.
+        let second = edit_payload(
+            handle_edit(
+                None,
+                json!({
+                    "path": path,
+                    "old_snippet": "gamma",
+                    "new_snippet": "GAMMA",
+                }),
+            )
+            .await,
+        );
+        assert_eq!(second["status"], "ok");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nBETA\nGAMMA\n"
         );
     }
 
@@ -176,6 +272,7 @@ mod tests {
         let link = dir.path().join("link.txt");
         std::fs::write(&target, "alpha\nbeta\n").expect("write target");
         unix_fs::symlink(&target, &link).expect("symlink target");
+        seed_snapshot(&link);
 
         let outcome = handle_edit(
             None,

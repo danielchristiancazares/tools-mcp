@@ -346,3 +346,98 @@ fn golden_edit_invalid_args_returns_tool_error() {
     let result = response["result"].as_object().expect("tool result");
     assert_eq!(result["isError"], true);
 }
+
+#[test]
+fn golden_edit_requires_prior_read_snapshot() {
+    let dir = tempfile::Builder::new()
+        .prefix("golden-edit-no-read-")
+        .tempdir_in(workspace_root())
+        .expect("tempdir in workspace");
+    let path = dir.path().join("target.txt");
+    std::fs::write(&path, "alpha\nbeta\n").expect("write");
+    let path_arg = path.display().to_string();
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9101,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "Edit",
+            "arguments": {
+                "path": path_arg,
+                "old_snippet": "beta",
+                "new_snippet": "BETA"
+            }
+        }
+    });
+    let response = send_mcp_message(&request).expect("edit without read");
+    let result = &response["result"];
+    assert_eq!(result["isError"], true);
+    let payload: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().expect("payload"))
+            .expect("json payload");
+    assert_eq!(payload["status"], "no_snapshot");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "alpha\nbeta\n"
+    );
+}
+
+#[test]
+fn golden_read_then_edit_batch_applies_edit() {
+    // Read and Edit share one server process within a batch, so the Read snapshot lets the
+    // Edit proceed with nothing copied between the two calls.
+    let dir = tempfile::Builder::new()
+        .prefix("golden-read-edit-")
+        .tempdir_in(workspace_root())
+        .expect("tempdir in workspace");
+    let path = dir.path().join("target.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("write");
+    let path_arg = path.display().to_string();
+
+    let batch = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 9111,
+            "method": "mcp/tools/call",
+            "params": {
+                "name": "Read",
+                "arguments": { "path": path_arg.clone() }
+            }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 9112,
+            "method": "mcp/tools/call",
+            "params": {
+                "name": "Edit",
+                "arguments": {
+                    "path": path_arg,
+                    "old_snippet": "beta",
+                    "new_snippet": "BETA"
+                }
+            }
+        }
+    ]);
+
+    let response = send_mcp_message(&batch).expect("read+edit batch");
+    let responses = response.as_array().expect("batch response array");
+    assert_eq!(responses.len(), 2);
+
+    assert_eq!(responses[0]["id"], 9111);
+    assert_eq!(responses[0]["result"]["isError"], false);
+
+    assert_eq!(responses[1]["id"], 9112);
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let payload: Value = serde_json::from_str(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("payload"),
+    )
+    .expect("json payload");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "alpha\nBETA\ngamma\n"
+    );
+}

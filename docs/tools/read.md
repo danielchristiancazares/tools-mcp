@@ -73,6 +73,7 @@ Behavioral guarantees that MUST hold on every invocation:
 - **Predictable line semantics.** 1-indexed inclusive ranges with strict validation matches user mental models of editor line numbers and avoids the off-by-one ambiguity of 0-indexed exclusive ranges.
 - **Cheap for small files, bounded for large files.** Full-file reads use a single `tokio::fs::read`; ranged reads of large files use an O(range) streaming scanner so callers can target line 1,000,000 of a multi-GB log without OOM.
 - **Round-trippable bytes.** Preserving original line endings byte-for-byte lets `Read` cooperate safely with `Edit`, which writes back with the file's dominant newline style; if `Read` normalized newlines, downstream edits could corrupt mixed-ending files.
+- **Enables editing.** Every successful `Read` records an in-memory snapshot of the file's SHA-256 (keyed by canonical path, scoped to the server process). `Edit` requires this snapshot and refuses if the file was not read or has since changed, so the read-before-edit contract is enforced without the caller copying any hash between calls. The snapshot is computed from the same full-file bytes the read already scans, including on the large-file streaming path.
 - **No silent failure on bad UTF-8.** Returning U+FFFD lets the caller see the file's textual structure even when it contains stray bytes, instead of forcing the caller to handle a hard error for every binary-looking file.
 
 ## 6. Tool Specification
