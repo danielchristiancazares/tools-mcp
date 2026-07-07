@@ -55,9 +55,45 @@ pub struct GitExecResult {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+    pub stdout_bytes: Vec<u8>,
+    pub stderr_bytes: Vec<u8>,
     pub truncated_stdout: bool,
     pub truncated_stderr: bool,
     pub timed_out: bool,
+    pub stdin: GitStdinSummary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStdinSummary {
+    pub requested_bytes: Option<usize>,
+    pub written_bytes: Option<usize>,
+    pub fully_delivered: Option<bool>,
+    pub write_error: Option<String>,
+    pub broken_pipe: bool,
+}
+
+impl GitStdinSummary {
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn from_report(requested_bytes: usize, report: StdinWriteReport) -> Self {
+        Self {
+            requested_bytes: Some(requested_bytes),
+            written_bytes: Some(report.written_bytes),
+            fully_delivered: Some(report.fully_delivered),
+            write_error: report.write_error,
+            broken_pipe: report.broken_pipe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StdinWriteReport {
+    pub(crate) written_bytes: usize,
+    pub(crate) fully_delivered: bool,
+    pub(crate) write_error: Option<String>,
+    pub(crate) broken_pipe: bool,
 }
 
 pub(crate) fn trim_git_output(output: &str) -> &str {
@@ -125,7 +161,34 @@ where
     payload
 }
 
+pub(crate) fn build_git_response_with_is_error<K, I>(
+    exec: &GitExecResult,
+    text: &str,
+    is_error: bool,
+    extra_fields: I,
+) -> Value
+where
+    K: AsRef<str>,
+    I: IntoIterator<Item = (K, Value)>,
+{
+    let mut payload = base_git_response(exec, text);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("isError".to_string(), Value::Bool(is_error));
+    }
+    insert_extra_fields(&mut payload, extra_fields);
+    payload
+}
+
 fn base_git_response(exec: &GitExecResult, text: &str) -> Value {
+    debug_assert_eq!(
+        exec.stdout.as_str(),
+        String::from_utf8_lossy(&exec.stdout_bytes).as_ref()
+    );
+    debug_assert_eq!(
+        exec.stderr.as_str(),
+        String::from_utf8_lossy(&exec.stderr_bytes).as_ref()
+    );
+
     json!({
         "content": [{"type": "text", "text": text}],
         "isError": !exec.success,
@@ -170,9 +233,12 @@ mod tests {
             success,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
+            stdout_bytes: stdout.as_bytes().to_vec(),
+            stderr_bytes: stderr.as_bytes().to_vec(),
             truncated_stdout: false,
             truncated_stderr: false,
             timed_out: false,
+            stdin: super::GitStdinSummary::none(),
         }
     }
 

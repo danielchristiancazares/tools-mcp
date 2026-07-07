@@ -543,9 +543,53 @@ mod tests {
         RpcMethodKind, RpcRequest, ServerCapabilitiesTools, ServerInfo, StaticProtocolPayloads,
         dispatch_jsonrpc_request, parse_rpc_message,
     };
-    use crate::composition::InflightRegistry;
+    use crate::composition::{InflightRegistry, JsonRpcId};
     use serde_json::json;
-    use tools_mcp_core::{ToolDef, ToolRegistry};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+    use tools_mcp_core::{McpTool, ToolCallOutcome, ToolDef, ToolRegistry};
+
+    static CANCELLATION_PROBE_STARTED: OnceLock<Arc<Notify>> = OnceLock::new();
+    static CANCELLATION_PROBE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CancellationProbeTool;
+
+    impl McpTool for CancellationProbeTool {
+        const NAME: &'static str = "CancellationProbe";
+        const DESCRIPTION: &'static str = "test-only cancellation probe";
+
+        fn input_schema() -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn execute(
+            _id: Option<serde_json::Value>,
+            _args: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>> {
+            Box::pin(async {
+                if let Some(started) = CANCELLATION_PROBE_STARTED.get() {
+                    started.notify_one();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                CANCELLATION_PROBE_COMPLETIONS.fetch_add(1, Ordering::SeqCst);
+                ToolCallOutcome::ok(json!({
+                    "content": [{"type": "text", "text": "completed"}],
+                    "isError": false
+                }))
+            })
+        }
+    }
 
     fn request_with_id(id: usize) -> serde_json::Value {
         json!({
@@ -572,6 +616,16 @@ mod tests {
         RpcRequest {
             id: Some(id),
             is_notification: false,
+            method: method.to_string(),
+            method_kind: RpcMethodKind::from_name(method),
+            params,
+        }
+    }
+
+    fn rpc_notification(method: &str, params: serde_json::Value) -> RpcRequest {
+        RpcRequest {
+            id: None,
+            is_notification: true,
             method: method.to_string(),
             method_kind: RpcMethodKind::from_name(method),
             params,
@@ -774,5 +828,78 @@ mod tests {
             assert_eq!(response.result().cloned(), Some(json!({"ok": true})));
             assert!(response.error().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_notification_suppresses_response_after_tool_completes() {
+        let started = CANCELLATION_PROBE_STARTED
+            .get_or_init(|| Arc::new(Notify::new()))
+            .clone();
+        CANCELLATION_PROBE_COMPLETIONS.store(0, Ordering::SeqCst);
+
+        let mut registry = ToolRegistry::new();
+        registry.register::<CancellationProbeTool>();
+        let tools = registry.list();
+        let static_payloads =
+            StaticProtocolPayloads::new(&tools).expect("static payloads should serialize");
+        let inflight = InflightRegistry::default();
+
+        let request_id_value = json!(9001);
+        let request_id = JsonRpcId::from_value(&request_id_value).expect("valid request id");
+        let token = CancellationToken::new();
+        inflight.register(request_id.clone(), token.clone());
+        let inflight_guard = inflight.drop_on_completion(request_id);
+
+        let dispatch_inflight = inflight.clone();
+        let dispatch_task = tokio::spawn(async move {
+            let _guard = inflight_guard;
+            dispatch_jsonrpc_request(
+                rpc_request(
+                    "mcp/tools/call",
+                    request_id_value,
+                    json!({
+                        "name": "CancellationProbe",
+                        "arguments": {}
+                    }),
+                ),
+                &registry,
+                &static_payloads,
+                &dispatch_inflight,
+                Some(token),
+            )
+            .await
+            .is_none()
+        });
+
+        started.notified().await;
+
+        let empty_registry = ToolRegistry::new();
+        let empty_tools = Vec::<ToolDef>::new();
+        let empty_payloads =
+            StaticProtocolPayloads::new(&empty_tools).expect("static payloads should serialize");
+        let cancellation_response = dispatch_jsonrpc_request(
+            rpc_notification(
+                "notifications/cancelled",
+                json!({
+                    "requestId": 9001
+                }),
+            ),
+            &empty_registry,
+            &empty_payloads,
+            &inflight,
+            None,
+        )
+        .await;
+
+        assert!(cancellation_response.is_none());
+        assert!(
+            dispatch_task.await.expect("dispatch task should not panic"),
+            "cancelled tool call should suppress its terminal response"
+        );
+        assert_eq!(
+            CANCELLATION_PROBE_COMPLETIONS.load(Ordering::SeqCst),
+            1,
+            "cancellation should not imply rollback or stop the tool future"
+        );
     }
 }

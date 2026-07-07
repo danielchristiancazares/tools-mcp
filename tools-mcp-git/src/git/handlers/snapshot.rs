@@ -1,4 +1,5 @@
 use super::super::types::GitExecResult;
+use super::super::types::GitStdinSummary;
 use super::super::{build_git_args, run_git, trim_git_line_end};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -273,9 +274,12 @@ fn empty_diff_stat_exec(
         success: true,
         stdout: String::new(),
         stderr: String::new(),
+        stdout_bytes: Vec::new(),
+        stderr_bytes: Vec::new(),
         truncated_stdout: false,
         truncated_stderr: false,
         timed_out: false,
+        stdin: GitStdinSummary::none(),
     }
 }
 
@@ -430,7 +434,10 @@ fn command_summary(exec: &super::super::types::GitExecResult) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{build_git_args, types::GitExecResult};
+    use super::super::super::{
+        build_git_args,
+        types::{GitExecResult, GitStdinSummary},
+    };
     use super::{
         build_diff_stat_args, command_summary, count_status_entries, empty_diff_stat_exec,
         parse_porcelain_status, render_snapshot_text,
@@ -499,9 +506,12 @@ mod tests {
             success: true,
             stdout: "## main\n".to_string(),
             stderr: String::new(),
+            stdout_bytes: b"## main\n".to_vec(),
+            stderr_bytes: Vec::new(),
             truncated_stdout: false,
             truncated_stderr: false,
             timed_out: false,
+            stdin: GitStdinSummary::none(),
         };
 
         let diff_exec = empty_diff_stat_exec(&status_exec, true, &paths);

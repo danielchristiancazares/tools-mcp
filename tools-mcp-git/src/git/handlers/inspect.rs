@@ -279,7 +279,7 @@ pub async fn handle_git_blame(_id: Option<Value>, args: Value) -> ToolCallOutcom
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::types::GitExecResult;
+    use super::super::super::types::{GitExecResult, GitStdinSummary};
     use super::{handle_git_blame, handle_git_show, inspect_output_text};
     use serde_json::json;
 
@@ -292,9 +292,12 @@ mod tests {
             success,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
+            stdout_bytes: stdout.as_bytes().to_vec(),
+            stderr_bytes: stderr.as_bytes().to_vec(),
             truncated_stdout: false,
             truncated_stderr: false,
             timed_out: false,
+            stdin: GitStdinSummary::none(),
         }
     }
 

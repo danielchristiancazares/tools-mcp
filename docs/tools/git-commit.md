@@ -22,6 +22,8 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 
 `GitCommit` is a state-mutating MCP tool that creates a single Conventional Commit. The caller supplies `type`, optional `scope`, and `message`; the handler sanitizes each fragment, assembles the subject line `type(scope): message` (or `type: message` when scope is omitted/whitespace), and runs `git commit -m <subject>`. The tool is owned by the `tools-mcp-git` crate; the handler is `handle_git_commit` (`tools-mcp-git/src/git/handlers/mutating.rs:192`). It is registered via `GitCommitTool` (`tools-mcp-git/src/tools.rs:109-126`), and registration is gated by `MCP_ENABLE_GIT=true` (`tools-mcp-git/src/lib.rs:7-10`).
 
+When staging a subset of hunks for an atomic commit, use `GitHunks` and default `GitStageHunks action="prepare_commit"` before this tool. `GitCommit` commits all staged changes and still runs repository hooks.
+
 ### 3.2 Explicitly Out of Scope
 
 - Staging changes (see `docs/tools/git-add.md`).
@@ -306,8 +308,10 @@ Resulting commit subject (`commit_message` field): `"feat: add feature  Signed-o
 | `git_commit_message_sanitizes_newlines` | `tools-mcp-git/src/git/handlers/mutating.rs:620` | Collapses `\n`/`\r` in `type`, `scope`, `message` so the assembled subject is single-line and cannot inject trailers. |
 | `test_git_tools_disabled_by_default` | `tools-mcp-server/tests/integration_test.rs:1270` | `GitCommit` absent without `MCP_ENABLE_GIT=true`. |
 | `test_tools_list` | `tools-mcp-server/tests/integration_test.rs:115` | `GitCommit` present when registered. |
+| `test_git_commit_pre_commit_hook_observes_eof_on_stdin_while_protocol_stays_open` | `tools-mcp-server/tests/integration_test.rs` | Runs `GitCommit` through the MCP server with server stdin still open and proves a pre-commit hook that reads stdin observes EOF rather than blocking the protocol. |
+| `test_cancelled_git_commit_suppresses_response_but_does_not_rollback_mutation` | `tools-mcp-server/tests/integration_test.rs` | Cancels an in-flight `GitCommit` while a pre-commit hook is sleeping, proves the commit still lands, and proves the cancelled request's terminal response is suppressed. |
 
-No dedicated integration test exercises a successful commit end-to-end; coverage relies on the sanitization unit test and the shared `run_git` envelope tests.
+Successful commit coverage now includes hook-backed MCP integration paths plus the shared `run_git` envelope tests.
 
 ## 12. Open Questions
 

@@ -24,7 +24,7 @@ Each feature crate exposes `register_tools(&mut ToolRegistry)`, called from `too
   - Headless browser uses `chromiumoxide` v0.7 with Chrome DevTools Protocol, stealth configuration, a managed browser pool that restarts every 100 requests or 1 hour, a 15s navigation timeout, a 2s network-idle wait, and resource blocking for images, web fonts, and video/audio autoplay.
 - `tools-mcp-local/` implements local file operations, `Read`, `Search`, `search_context`, `Outline`, gated `Pwsh`, and `smart_file_edit`. `smart_file_edit` preserves line endings (LF/CRLF/CR) by processing canonical LF text while retaining the original file format; it performs snippet replacement and enforces a mandatory read-before-edit snapshot. `Read` records an in-memory SHA-256 snapshot per file (see `tools-mcp-local/src/edit_snapshot.rs`); `Edit` refuses with `no_snapshot` if the file was not read this session or `stale_file` if it changed since, and refreshes the snapshot after a successful write so chained edits need no re-read.
 - `tools-mcp-semantic/` implements semantic indexing/search, including discovery, chunking, embedding, manifests, and vector-store-backed lookup.
-- `tools-mcp-git/src/tools.rs` and `tools-mcp-git/src/git/mod.rs` implement git tools (GitStatus, GitDiff, GitRestore, GitAdd, GitCommit) with porcelain parsing, timeout handling, and bounded output.
+- `tools-mcp-git/src/tools.rs` and `tools-mcp-git/src/git/mod.rs` implement git tools (GitStatus, GitDiff, GitApply, GitHunks, GitStageHunks, GitRestore, GitAdd, GitCommit) with porcelain parsing, timeout handling, and bounded output.
 - `tools-mcp-core/` provides JSON-RPC response types, MCP content helpers, validation, cancellation support, `ToolRegistry`, `ToolCallOutcome`, and the `define_mcp_tool!` macro. `tools-mcp-core/src/process.rs` and `tools-mcp-core/src/text.rs` provide bounded process capture, timeout-enforced child wait (`wait_with_limits`), and ANSI stripping (`text::strip_ansi_codes`). PowerShell execution lives in `tools-mcp-local/src/tools/pwsh.rs`.
 - `build.rs` sets the `APP_VERSION` environment variable at compile time when provided.
 
@@ -59,13 +59,14 @@ When agent tools are available, prefer them over Bash equivalents:
 - `Write` over `echo >` or heredocs for creating new files.
 - `WebFetch` over `curl` for fetching URLs.
 - `Outline` for code structure questions.
-- `GitStatus`, `GitDiff`, `GitRestore`, `GitAdd`, `GitCommit` over raw `git` commands.
+- `GitStatus`, `GitDiff`, `GitApply`, `GitHunks`, `GitStageHunks`, `GitRestore`, `GitAdd`, `GitCommit` over raw `git` commands.
 - Fall back to shell commands only when no dedicated tool exists.
 
 ## Style & Testing
 - Make focused changes only; avoid unrelated rewrites and never leave placeholder code in committed changes.
 - Keep changes `cargo fmt`-clean; follow standard Rust naming (`snake_case`, `CamelCase`).
 - Keep network-dependent tests ignored by default.
+- For security-sensitive or contract-heavy plans, first decompose the plan into explicit, auditable invariants, then verify implementation and tests against that checklist instead of treating green tests alone as sufficient.
 - If you change tool schemas, tool names, response shapes, or documented behavior, update the relevant `docs/tools/*.md`, `README.md` when applicable, and server integration/golden tests.
 - `Search` has an in-memory path when eligible and `ugrep` as the external backend; do not replace it with ripgrep semantics without updating tests and docs.
 

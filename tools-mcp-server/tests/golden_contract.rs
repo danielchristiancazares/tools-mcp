@@ -22,6 +22,85 @@ fn documented_tool_names() -> BTreeSet<String> {
         .collect()
 }
 
+fn expected_tool_names_without_pwsh() -> BTreeSet<String> {
+    [
+        "Ping",
+        "AdoWorkItems",
+        "WebFetch",
+        "Search",
+        "search_context",
+        "SemanticIndex",
+        "SemanticSearch",
+        "Read",
+        "Edit",
+        "Write",
+        "Delete",
+        "Move",
+        "Copy",
+        "ListDir",
+        "Glob",
+        "Outline",
+        "git_snapshot",
+        "GitStatus",
+        "GitDiff",
+        "GitApply",
+        "GitHunks",
+        "GitStageHunks",
+        "GitRestore",
+        "GitAdd",
+        "GitCommit",
+        "GitLog",
+        "GitBranch",
+        "GitCheckout",
+        "GitStash",
+        "GitShow",
+        "GitBlame",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn served_tool_names(tools: &[Value]) -> BTreeSet<String> {
+    tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn served_tools_without_pwsh() -> Vec<Value> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9100,
+        "method": "mcp/tools/list",
+        "params": {}
+    });
+    let mut command = spawn_server();
+    command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    let response = send_mcp_message_with_command(&request, command).expect("tools list");
+    response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone()
+}
+
+fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+    tools
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("missing tool {name}"))
+        .get("inputSchema")
+        .expect("inputSchema")
+}
+
+fn schema_property<'a>(schema: &'a Value, name: &str) -> &'a Value {
+    schema
+        .get("properties")
+        .and_then(|properties| properties.get(name))
+        .unwrap_or_else(|| panic!("missing schema property {name}"))
+}
+
 fn readme_text() -> String {
     std::fs::read_to_string(workspace_root().join("README.md")).expect("README.md readable")
 }
@@ -34,7 +113,9 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
         "method": "mcp/initialize",
         "params": {}
     });
-    let response = send_mcp_message(&request).expect("initialize");
+    let mut command = spawn_server();
+    command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    let response = send_mcp_message_with_command(&request, command).expect("initialize");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9001);
     let result = response["result"].as_object().expect("result object");
@@ -45,17 +126,14 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
     assert_eq!(caps["tools"]["list"], true);
     assert_eq!(caps["tools"]["call"], true);
     let tools = result["tools"].as_array().expect("tools in init");
-    assert!(
-        tools.len() >= 17,
-        "initialize must embed full tool list (min 17), got {}",
-        tools.len()
+    let names = served_tool_names(tools);
+    assert_eq!(
+        tools.len(),
+        names.len(),
+        "initialize embedded tool list must not contain duplicate names"
     );
-    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(!names.contains(&"CodeQuery"));
-    assert!(names.contains(&"AdoWorkItems"));
-    assert!(names.contains(&"SemanticIndex"));
-    assert!(names.contains(&"SemanticSearch"));
-    assert!(names.contains(&"WebFetch"));
+    assert_eq!(names, expected_tool_names_without_pwsh());
+    assert!(!names.contains("CodeQuery"));
 }
 
 #[test]
@@ -221,19 +299,20 @@ fn golden_tools_list_returns_tools_array() {
         "method": "mcp/tools/list",
         "params": {}
     });
-    let response = send_mcp_message(&request).expect("tools list");
+    let mut command = spawn_server();
+    command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    let response = send_mcp_message_with_command(&request, command).expect("tools list");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9006);
     let tools = response["result"]["tools"].as_array().expect("tools array");
-    assert!(
-        tools.len() >= 17,
-        "tools/list must return full tool list, got {}",
-        tools.len()
+    let names = served_tool_names(tools);
+    assert_eq!(
+        tools.len(),
+        names.len(),
+        "tools/list must not contain duplicate names"
     );
-    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.contains(&"Ping"));
-    assert!(names.contains(&"AdoWorkItems"));
-    assert!(!names.contains(&"CodeQuery"));
+    assert_eq!(names, expected_tool_names_without_pwsh());
+    assert!(!names.contains("CodeQuery"));
 }
 
 #[test]
@@ -251,13 +330,13 @@ fn golden_readme_tool_inventory_matches_tools_list() {
     let mut command = spawn_server();
     command.env("MCP_ENABLE_PWSH_TOOL", "true");
     let response = send_mcp_message_with_command(&request, command).expect("tools list");
-    let actual: BTreeSet<String> = response["result"]["tools"]
-        .as_array()
-        .expect("tools array")
-        .iter()
-        .filter_map(|tool| tool["name"].as_str())
-        .map(ToOwned::to_owned)
-        .collect();
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let actual = served_tool_names(tools);
+    assert_eq!(
+        tools.len(),
+        actual.len(),
+        "README inventory comparison must use a duplicate-free served tool list"
+    );
 
     let documented = documented_tool_names();
     assert_eq!(
@@ -285,7 +364,9 @@ fn golden_all_object_tool_schemas_disallow_unknown_fields() {
         "method": "mcp/tools/list",
         "params": {}
     });
-    let response = send_mcp_message(&request).expect("tools list");
+    let mut command = spawn_server();
+    command.env("MCP_ENABLE_PWSH_TOOL", "true");
+    let response = send_mcp_message_with_command(&request, command).expect("tools list");
     let tools = response["result"]["tools"].as_array().expect("tools array");
 
     for tool in tools {
@@ -299,6 +380,63 @@ fn golden_all_object_tool_schemas_disallow_unknown_fields() {
             );
         }
     }
+}
+
+#[test]
+fn golden_git_hunk_tool_schemas_expose_selection_constraints() {
+    let tools = served_tools_without_pwsh();
+
+    let apply_schema = tool_schema(&tools, "GitApply");
+    assert_eq!(apply_schema["required"], json!(["patch"]));
+    let apply_patch = schema_property(apply_schema, "patch");
+    assert_eq!(apply_patch["minLength"], 1);
+    assert_eq!(apply_patch["maxLength"], 5_000_000);
+    assert_eq!(
+        schema_property(apply_schema, "target")["enum"],
+        json!(["cached", "index_worktree", "worktree"])
+    );
+    assert_eq!(
+        schema_property(apply_schema, "whitespace")["enum"],
+        json!(["nowarn", "warn", "fix", "error", "error-all"])
+    );
+
+    let hunks_schema = tool_schema(&tools, "GitHunks");
+    let hunks_paths = schema_property(hunks_schema, "paths");
+    assert_eq!(hunks_paths["maxItems"], 1_000);
+    assert_eq!(hunks_paths["items"]["minLength"], 1);
+    assert_eq!(schema_property(hunks_schema, "context")["minimum"], 0);
+    assert_eq!(schema_property(hunks_schema, "staged")["default"], false);
+    assert_eq!(
+        schema_property(hunks_schema, "include_advanced_templates")["default"],
+        false
+    );
+
+    let stage_schema = tool_schema(&tools, "GitStageHunks");
+    assert_eq!(stage_schema["required"], json!(["diff_id", "hunk_ids"]));
+    assert_eq!(
+        schema_property(stage_schema, "diff_id")["pattern"],
+        "^sha256:[0-9a-f]{64}$"
+    );
+    let hunk_ids = schema_property(stage_schema, "hunk_ids");
+    assert_eq!(hunk_ids["minItems"], 1);
+    assert_eq!(hunk_ids["maxItems"], 10_000);
+    assert_eq!(hunk_ids["uniqueItems"], true);
+    assert_eq!(hunk_ids["items"]["maxLength"], 96);
+    assert_eq!(
+        hunk_ids["items"]["pattern"],
+        "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.[0-9a-f]{64}$"
+    );
+    assert_eq!(
+        schema_property(stage_schema, "action")["enum"],
+        json!(["prepare_commit", "stage_only", "unstage"])
+    );
+    assert_eq!(
+        schema_property(stage_schema, "action")["default"],
+        "prepare_commit"
+    );
+    let stage_paths = schema_property(stage_schema, "paths");
+    assert_eq!(stage_paths["maxItems"], 1_000);
+    assert_eq!(stage_paths["items"]["minLength"], 1);
 }
 
 #[test]

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Hunk-level git staging workflow with gated `GitApply`, `GitHunks`, and `GitStageHunks` tools for supported tracked text modifications.
 - Headless browser rendering for JavaScript-heavy websites via chromiumoxide
 - 5-heuristic detection system for client-side rendered applications:
   - Empty SPA shell detection (React, Vue, Angular root divs)

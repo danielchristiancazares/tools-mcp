@@ -22,6 +22,8 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 
 `GitDiff` is an MCP tool that wraps `git diff` in two distinct modes:
 
+For selectable hunk IDs, use `GitHunks` rather than parsing `GitDiff` text output directly (`docs/tools/git-hunks.md`).
+
 1. **Worktree mode** (default) — diffs the working tree or staging area against `HEAD` (or against the index when `cached=true`), returning the unified-diff stdout in the response.
 2. **Ref-export mode** — when `from_ref`, `to_ref`, and `output_dir` are all supplied, the handler enumerates changed files via `git diff --name-status -z` + `git diff --numstat -z`, writes one `*.patch` file per changed path under `output_dir`, and emits a `_summary.json` manifest. The MCP response contains a structured summary rather than the patch text.
 

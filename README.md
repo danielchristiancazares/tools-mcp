@@ -61,6 +61,9 @@ Each row links to the tool's design contract under [`docs/tools/`](./docs/README
 | Read-only worktree snapshot **(gated: `MCP_ENABLE_GIT=true`)** | **Tool name**: `git_snapshot` | [docs/tools/git-snapshot.md](./docs/tools/git-snapshot.md) |
 | `git status` **(gated)** | **Tool name**: `GitStatus` | [docs/tools/git-status.md](./docs/tools/git-status.md) |
 | `git diff` **(gated)** | **Tool name**: `GitDiff` | [docs/tools/git-diff.md](./docs/tools/git-diff.md) |
+| `git apply` supported text patches **(gated)** | **Tool name**: `GitApply` | [docs/tools/git-apply.md](./docs/tools/git-apply.md) |
+| Enumerate selectable git diff hunks **(gated)** | **Tool name**: `GitHunks` | [docs/tools/git-hunks.md](./docs/tools/git-hunks.md) |
+| Stage or unstage selected git hunks **(gated)** | **Tool name**: `GitStageHunks` | [docs/tools/git-stage-hunks.md](./docs/tools/git-stage-hunks.md) |
 | `git restore` **(gated)** | **Tool name**: `GitRestore` | [docs/tools/git-restore.md](./docs/tools/git-restore.md) |
 | `git add` **(gated)** | **Tool name**: `GitAdd` | [docs/tools/git-add.md](./docs/tools/git-add.md) |
 | `git commit` (Conventional Commits) **(gated)** | **Tool name**: `GitCommit` | [docs/tools/git-commit.md](./docs/tools/git-commit.md) |

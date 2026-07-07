@@ -1,7 +1,7 @@
 use crate::cancellation::CURRENT_CANCEL_TOKEN;
 use crate::tool_outcome::{DispatchOutcome, ToolCallOutcome};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
@@ -56,7 +56,14 @@ impl ToolRegistry {
     }
 
     /// Register a tool type.
+    ///
+    /// Registration failures are startup-fatal panics. The registry validates
+    /// canonical names and aliases before mutating `definitions`, `executors`,
+    /// or `lookup`, so failed registration cannot leave a partially registered
+    /// tool behind.
     pub fn register<T: McpTool>(&mut self) {
+        self.assert_can_register::<T>();
+
         let index = self.definitions.len();
         self.lookup.reserve(1 + T::ALIASES.len());
 
@@ -68,13 +75,50 @@ impl ToolRegistry {
 
         let executor: ToolExecutor = T::execute;
 
-        self.lookup.entry(T::NAME).or_insert(index);
+        self.lookup.insert(T::NAME, index);
         for &alias in T::ALIASES {
-            self.lookup.entry(alias).or_insert(index);
+            self.lookup.insert(alias, index);
         }
 
         self.definitions.push(def);
         self.executors.push(executor);
+    }
+
+    fn assert_can_register<T: McpTool>(&self) {
+        assert!(
+            !T::NAME.is_empty(),
+            "cannot register MCP tool with an empty canonical name"
+        );
+        assert!(
+            !self.lookup.contains_key(T::NAME),
+            "duplicate MCP tool canonical name or alias collision: {}",
+            T::NAME
+        );
+
+        let mut aliases = HashSet::with_capacity(T::ALIASES.len());
+        for &alias in T::ALIASES {
+            assert!(
+                !alias.is_empty(),
+                "cannot register MCP tool {} with an empty alias",
+                T::NAME
+            );
+            assert!(
+                alias != T::NAME,
+                "cannot register MCP tool {} with an alias equal to its canonical name",
+                T::NAME
+            );
+            assert!(
+                aliases.insert(alias),
+                "cannot register MCP tool {} with duplicate alias {}",
+                T::NAME,
+                alias
+            );
+            assert!(
+                !self.lookup.contains_key(alias),
+                "duplicate MCP tool alias or canonical-name collision: {}",
+                alias
+            );
+        }
     }
 
     /// Get all tool definitions for protocol responses.
@@ -276,6 +320,69 @@ mod tests {
         handler: wait_for_cancellation_tool
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct RegistrySnapshot {
+        definitions: Vec<String>,
+        executors_len: usize,
+        lookup: Vec<(&'static str, usize)>,
+    }
+
+    fn registry_snapshot(reg: &ToolRegistry) -> RegistrySnapshot {
+        let mut lookup: Vec<_> = reg
+            .lookup
+            .iter()
+            .map(|(name, index)| (*name, *index))
+            .collect();
+        lookup.sort_unstable();
+        RegistrySnapshot {
+            definitions: reg
+                .definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect(),
+            executors_len: reg.executors.len(),
+            lookup,
+        }
+    }
+
+    fn assert_register_rejected_without_mutating<T: McpTool>(reg: &mut ToolRegistry) {
+        let before = registry_snapshot(reg);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reg.register::<T>();
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(registry_snapshot(reg), before);
+    }
+
+    macro_rules! alias_test_tool {
+        ($tool:ident, name: $name:expr, aliases: [$($alias:expr),* $(,)?]) => {
+            struct $tool;
+
+            impl McpTool for $tool {
+                const NAME: &'static str = $name;
+                const ALIASES: &'static [&'static str] = &[$($alias),*];
+                const DESCRIPTION: &'static str = "alias validation test tool";
+
+                fn input_schema() -> Value {
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    })
+                }
+
+                fn execute(
+                    id: Option<Value>,
+                    args: Value,
+                ) -> Pin<Box<dyn Future<Output = ToolCallOutcome> + Send>> {
+                    Box::pin(later_tool(id, args))
+                }
+            }
+        };
+    }
+
     #[tokio::test]
     async fn registry_dispatches_by_name() {
         let mut reg = ToolRegistry::new();
@@ -415,21 +522,89 @@ mod tests {
         handler: later_tool
     }
 
-    #[tokio::test]
-    async fn registry_lookup_preserves_first_match_for_alias_conflicts() {
+    define_mcp_tool! {
+        DuplicateDummyTool,
+        name: "Dummy",
+        description: "duplicate canonical name",
+        schema: {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        handler: later_tool
+    }
+
+    alias_test_tool!(
+        AliasToExistingCanonicalTool,
+        name: "OtherCanonical",
+        aliases: ["Dummy"]
+    );
+    alias_test_tool!(
+        AliasCollisionTool,
+        name: "OtherAliasCanonical",
+        aliases: ["alias"]
+    );
+    alias_test_tool!(EmptyAliasTool, name: "EmptyAlias", aliases: [""]);
+    alias_test_tool!(SelfAliasTool, name: "SelfAlias", aliases: ["SelfAlias"]);
+    alias_test_tool!(
+        DuplicateAliasWithinTool,
+        name: "DuplicateAliasWithin",
+        aliases: ["dup", "dup"]
+    );
+
+    #[test]
+    fn registry_rejects_canonical_name_collisions_before_mutating_state() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert_register_rejected_without_mutating::<DuplicateDummyTool>(&mut reg);
+    }
+
+    #[test]
+    fn registry_rejects_canonical_name_colliding_with_existing_alias() {
         let mut reg = ToolRegistry::new();
         reg.register::<AliasTool>();
-        reg.register::<AliasNamedTool>();
 
-        let response = reg
-            .call("alias", Some(json!(1)), json!({}))
-            .await
-            .expect("alias should resolve");
+        assert_register_rejected_without_mutating::<AliasNamedTool>(&mut reg);
+    }
 
-        assert_eq!(
-            response.result.unwrap()["content"][0]["text"],
-            json!("ok"),
-            "earlier aliases should keep the previous linear-search precedence"
-        );
+    #[test]
+    fn registry_rejects_alias_colliding_with_existing_canonical() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert_register_rejected_without_mutating::<AliasToExistingCanonicalTool>(&mut reg);
+    }
+
+    #[test]
+    fn registry_rejects_alias_colliding_with_existing_alias() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<AliasTool>();
+
+        assert_register_rejected_without_mutating::<AliasCollisionTool>(&mut reg);
+    }
+
+    #[test]
+    fn registry_rejects_empty_alias_before_mutating_state() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert_register_rejected_without_mutating::<EmptyAliasTool>(&mut reg);
+    }
+
+    #[test]
+    fn registry_rejects_self_alias_before_mutating_state() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert_register_rejected_without_mutating::<SelfAliasTool>(&mut reg);
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_alias_within_tool_before_mutating_state() {
+        let mut reg = ToolRegistry::new();
+        reg.register::<DummyTool>();
+
+        assert_register_rejected_without_mutating::<DuplicateAliasWithinTool>(&mut reg);
     }
 }

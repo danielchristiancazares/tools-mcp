@@ -22,6 +22,8 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 
 `GitAdd` is a state-mutating MCP tool that invokes `git add` to stage paths for the next commit. It supports stage-by-path (`paths`), stage-all (`all → -A`), and stage-modified-only (`update → -u`) modes. The tool is owned by the `tools-mcp-git` crate; the handler is `handle_git_add` (`tools-mcp-git/src/git/handlers/mutating.rs:118`). It is registered via `GitAddTool` (`tools-mcp-git/src/tools.rs:90-107`), and registration is gated by `MCP_ENABLE_GIT=true` (`tools-mcp-git/src/lib.rs:7-10`).
 
+For hunk-level commit preparation, prefer `GitHunks` followed by default `GitStageHunks action="prepare_commit"` (`docs/tools/git-hunks.md`, `docs/tools/git-stage-hunks.md`).
+
 ### 3.2 Explicitly Out of Scope
 
 - Discarding changes (see `docs/tools/git-restore.md`).

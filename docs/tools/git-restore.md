@@ -22,6 +22,8 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 
 `GitRestore` is a **destructive** MCP tool that invokes `git restore` to discard uncommitted changes. It accepts an explicit non-empty list of paths and the operator's choice of `--staged` and/or `--worktree` targets. The default target is the working tree (`worktree=true`, `staged=false`), which matches `git restore <paths>`. The tool is owned by the `tools-mcp-git` crate; the handler is `handle_git_restore` (`tools-mcp-git/src/git/handlers/mutating.rs:37`). It is registered via `GitRestoreTool` (`tools-mcp-git/src/tools.rs:71-88`), and registration is gated by `MCP_ENABLE_GIT=true` (`tools-mcp-git/src/lib.rs:7-10`).
 
+For reversing selected staged hunks without restoring whole files, use `GitHunks staged=true` followed by `GitStageHunks action="unstage"`.
+
 ### 3.2 Explicitly Out of Scope
 
 - Staging changes (see `docs/tools/git-add.md`).

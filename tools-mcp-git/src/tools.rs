@@ -1,9 +1,14 @@
 use crate::git::{
-    handle_git_add, handle_git_blame, handle_git_branch, handle_git_checkout, handle_git_commit,
-    handle_git_diff, handle_git_log, handle_git_restore, handle_git_show, handle_git_snapshot,
-    handle_git_stash, handle_git_status,
+    handle_git_add, handle_git_apply, handle_git_blame, handle_git_branch, handle_git_checkout,
+    handle_git_commit, handle_git_diff, handle_git_hunks, handle_git_log, handle_git_restore,
+    handle_git_show, handle_git_snapshot, handle_git_stage_hunks, handle_git_stash,
+    handle_git_status,
 };
-use tools_mcp_core::{ToolRegistry, define_mcp_tool};
+use tools_mcp_core::{
+    ToolRegistry,
+    config::{MAX_GIT_PATHSPECS, MAX_GIT_SELECTED_HUNKS, MAX_GIT_STDIN_BYTES},
+    define_mcp_tool,
+};
 
 define_mcp_tool! {
     GitSnapshotTool,
@@ -66,6 +71,76 @@ define_mcp_tool! {
         "additionalProperties": false
     },
     handler: handle_git_diff
+}
+
+define_mcp_tool! {
+    GitApplyTool,
+    name: "GitApply",
+    description: "Apply a supported tracked-file textual unified diff through git apply with explicit target and stdin-fed patch bytes.",
+    schema: {
+        "type": "object",
+        "properties": {
+            "patch": {"type": "string", "minLength": 1, "maxLength": MAX_GIT_STDIN_BYTES, "description": "Unified diff patch to feed to git apply on stdin"},
+            "target": {"type": "string", "enum": ["cached", "index_worktree", "worktree"], "default": "cached", "description": "Apply target: cached=index only, index_worktree=--index, worktree=working tree only"},
+            "check_only": {"type": "boolean", "default": false, "description": "Run git apply --check without mutating"},
+            "reverse": {"type": "boolean", "default": false, "description": "Reverse-apply the patch (-R)"},
+            "three_way": {"type": "boolean", "default": false, "description": "Use git apply --3way (valid only for cached and index_worktree)"},
+            "recount": {"type": "boolean", "default": true, "description": "Pass --recount"},
+            "unidiff_zero": {"type": "boolean", "default": false, "description": "Pass --unidiff-zero"},
+            "whitespace": {"type": "string", "enum": ["nowarn", "warn", "fix", "error", "error-all"], "default": "nowarn", "description": "git apply whitespace mode"},
+            "working_dir": {"type": "string", "description": "Repository root working directory"},
+            "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds"}
+        },
+        "required": ["patch"],
+        "additionalProperties": false
+    },
+    handler: handle_git_apply
+}
+
+define_mcp_tool! {
+    GitHunksTool,
+    name: "GitHunks",
+    description: "Enumerate staged or unstaged unified-diff hunks with snapshot-scoped IDs for supported tracked text modifications.",
+    schema: {
+        "type": "object",
+        "properties": {
+            "staged": {"type": "boolean", "default": false, "description": "Enumerate staged hunks with git diff --cached when true"},
+            "paths": {"type": "array", "maxItems": MAX_GIT_PATHSPECS, "items": {"type": "string", "minLength": 1}, "description": "Literal repo-relative POSIX path filters"},
+            "context": {"type": "integer", "minimum": 0, "default": 3, "description": "Unified diff context lines"},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "default": 200000, "description": "Maximum diff bytes captured before rejection"},
+            "working_dir": {"type": "string", "description": "Repository root working directory"},
+            "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds"},
+            "include_advanced_templates": {"type": "boolean", "default": false, "description": "Include the stage_only template in addition to the recommended default template"}
+        },
+        "required": [],
+        "additionalProperties": false
+    },
+    handler: handle_git_hunks
+}
+
+define_mcp_tool! {
+    GitStageHunksTool,
+    name: "GitStageHunks",
+    description: "Stage or unstage selected GitHunks hunk IDs; default action prepares a verified commit-ready staged group.",
+    schema: {
+        "type": "object",
+        "properties": {
+            "diff_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "diff_id returned by GitHunks"},
+            "hunk_ids": {"type": "array", "minItems": 1, "maxItems": MAX_GIT_SELECTED_HUNKS, "uniqueItems": true, "items": {"type": "string", "maxLength": 96, "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.[0-9a-f]{64}$"}, "description": "Hunk IDs returned by GitHunks"},
+            "action": {"type": "string", "enum": ["prepare_commit", "stage_only", "unstage"], "default": "prepare_commit", "description": "prepare_commit verifies a clean full index and returns a GitCommit template"},
+            "context": {"type": "integer", "minimum": 0, "default": 3, "description": "Context value used by GitHunks"},
+            "paths": {"type": "array", "maxItems": MAX_GIT_PATHSPECS, "items": {"type": "string", "minLength": 1}, "description": "Literal path scope used by GitHunks"},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "default": 200000, "description": "Maximum diff bytes captured during recompute"},
+            "working_dir": {"type": "string", "description": "Repository root working directory"},
+            "timeout_ms": {"type": "integer", "minimum": 100, "default": 30000, "description": "Timeout in milliseconds"},
+            "commit_type": {"type": "string", "description": "Optional GitCommit type for the returned template"},
+            "commit_scope": {"type": "string", "description": "Optional GitCommit scope for the returned template"},
+            "commit_message": {"type": "string", "description": "Optional GitCommit message for the returned template"}
+        },
+        "required": ["diff_id", "hunk_ids"],
+        "additionalProperties": false
+    },
+    handler: handle_git_stage_hunks
 }
 
 define_mcp_tool! {
@@ -259,6 +334,9 @@ pub fn register_tools(registry: &mut ToolRegistry) {
     registry.register::<GitSnapshotTool>();
     registry.register::<GitStatusTool>();
     registry.register::<GitDiffTool>();
+    registry.register::<GitApplyTool>();
+    registry.register::<GitHunksTool>();
+    registry.register::<GitStageHunksTool>();
     registry.register::<GitRestoreTool>();
     registry.register::<GitAddTool>();
     registry.register::<GitCommitTool>();

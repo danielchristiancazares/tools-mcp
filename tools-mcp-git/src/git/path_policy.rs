@@ -20,6 +20,10 @@ fn authority_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "failed to cache server working directory".to_string())
 }
 
+pub(crate) fn authority_root_path() -> Result<PathBuf, String> {
+    authority_root()
+}
+
 fn absolute_path(path: &Path, root: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()

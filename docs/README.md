@@ -56,6 +56,9 @@ The SDD template is at [`TEMPLATE_TOOL_SDD.md`](./TEMPLATE_TOOL_SDD.md).
 | `git_snapshot` | [tools/git-snapshot.md](./tools/git-snapshot.md) | Written |
 | `GitStatus` | [tools/git-status.md](./tools/git-status.md) | Written |
 | `GitDiff` | [tools/git-diff.md](./tools/git-diff.md) | Written |
+| `GitApply` | [tools/git-apply.md](./tools/git-apply.md) | Written |
+| `GitHunks` | [tools/git-hunks.md](./tools/git-hunks.md) | Written |
+| `GitStageHunks` | [tools/git-stage-hunks.md](./tools/git-stage-hunks.md) | Written |
 | `GitRestore` | [tools/git-restore.md](./tools/git-restore.md) | Written |
 | `GitAdd` | [tools/git-add.md](./tools/git-add.md) | Written |
 | `GitCommit` | [tools/git-commit.md](./tools/git-commit.md) | Written |
@@ -78,8 +81,8 @@ The SDD template is at [`TEMPLATE_TOOL_SDD.md`](./TEMPLATE_TOOL_SDD.md).
 |---|---|---|
 | Architecture | [architecture.md](./architecture.md) | Stub |
 | MCP protocol | [protocol.md](./protocol.md) | Stub |
-| Configuration | [configuration.md](./configuration.md) | Stub |
-| Security | [security.md](./security.md) | Stub |
+| Configuration | [configuration.md](./configuration.md) | Written |
+| Security | [security.md](./security.md) | Written |
 | Dependencies | [dependencies.md](./dependencies.md) | Stub |
 
 ## Pre-existing Documents
