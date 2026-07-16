@@ -50,6 +50,12 @@ const MAX_REGEX_FINITE_LITERAL_BYTES: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_REPEAT_COUNT: usize = 8;
 const MAX_FUZZY_SEED_PARTITION_PLANS: usize = 128;
 const TARGETED_FRESHNESS_FULL_SCAN_INTERVAL_QUERIES: u64 = 32;
+/// Minimum age a directory stamp must have (relative to the moment it is re-observed) before a
+/// matching stamp is trusted to prove the directory's direct-child membership is unchanged.
+/// Mirrors git's racy-timestamp rule: a membership change in the same coarse mtime granule as
+/// the recorded stamp can leave the stamp unchanged, so recently-modified directories are
+/// never used to certify the file set. 2 s covers the coarsest common filesystem granularity.
+const SCOPE_STAMP_RACY_SLACK: Duration = Duration::from_secs(2);
 const WARM_CACHE_PATTERN: &str = "__tools_mcp_search_warm_cache__";
 
 #[derive(Clone, Debug)]
@@ -209,6 +215,9 @@ struct Document {
 #[derive(Clone, Debug, Default)]
 struct ScopeFingerprint {
     directories: Vec<MetadataFingerprint>,
+    /// Latest `modified` time across all directory stamps; `None` when there are no
+    /// directories or any directory lacks a modified time (which disables certification).
+    latest_directory_modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +232,8 @@ impl ScopeFingerprint {
         I: IntoIterator<Item = PathBuf>,
     {
         let mut fingerprints = Vec::new();
+        let mut latest_directory_modified = None;
+        let mut all_directories_have_modified = true;
         for path in directories {
             check_deadline(deadline)?;
             let metadata = fs::metadata(&path).map_err(|err| {
@@ -235,15 +246,39 @@ impl ScopeFingerprint {
                     ),
                 )
             })?;
-            fingerprints.push(MetadataFingerprint {
-                path,
-                stamp: metadata_stamp_from_metadata(&metadata),
-            });
+            let stamp = metadata_stamp_from_metadata(&metadata);
+            match stamp.modified {
+                Some(modified) => {
+                    latest_directory_modified = Some(match latest_directory_modified {
+                        Some(latest) if latest >= modified => latest,
+                        _ => modified,
+                    });
+                }
+                None => all_directories_have_modified = false,
+            }
+            fingerprints.push(MetadataFingerprint { path, stamp });
         }
         check_deadline(deadline)?;
+        if !all_directories_have_modified {
+            latest_directory_modified = None;
+        }
         Ok(Self {
             directories: fingerprints,
+            latest_directory_modified,
         })
+    }
+
+    /// True when every directory stamp is old enough (relative to `observed_not_before`, a
+    /// time at or before the stamps were re-observed as matching) that any later change to a
+    /// directory's direct-child membership is guaranteed to produce a different stamp. See
+    /// `SCOPE_STAMP_RACY_SLACK`.
+    fn certifiable_at(&self, observed_not_before: SystemTime) -> bool {
+        !self.directories.is_empty()
+            && self.latest_directory_modified.is_some_and(|latest| {
+                latest
+                    .checked_add(SCOPE_STAMP_RACY_SLACK)
+                    .is_some_and(|threshold| threshold <= observed_not_before)
+            })
     }
 }
 
@@ -437,6 +472,13 @@ struct IndexEntry {
     last_error_type: Option<&'static str>,
     last_fallback_reason: Option<&'static str>,
     queries_since_full_validation: u64,
+    /// True once a targeted validation has (a) re-observed every scope directory stamp as
+    /// matching, (b) re-discovered the file set and found it identical to the snapshot's, and
+    /// (c) confirmed every directory stamp was non-racy at observation time
+    /// (`ScopeFingerprint::certifiable_at`). While this holds for the current snapshot,
+    /// matching directory stamps alone prove the file set is unchanged, so targeted
+    /// validation can skip the per-query rediscovery walk.
+    file_set_certified: bool,
 }
 
 impl IndexEntry {
@@ -449,6 +491,7 @@ impl IndexEntry {
             last_error_type: None,
             last_fallback_reason: None,
             queries_since_full_validation: 0,
+            file_set_certified: false,
         }
     }
 
@@ -462,6 +505,7 @@ impl IndexEntry {
             last_error_type: None,
             last_fallback_reason: None,
             queries_since_full_validation: 0,
+            file_set_certified: false,
         }
     }
 
@@ -473,6 +517,7 @@ impl IndexEntry {
         self.last_error_type = None;
         self.last_fallback_reason = None;
         self.queries_since_full_validation = 0;
+        self.file_set_certified = false;
     }
 
     fn publish(&mut self, snapshot: Arc<IndexSnapshot>) {
@@ -483,6 +528,7 @@ impl IndexEntry {
         self.last_error_type = None;
         self.last_fallback_reason = None;
         self.queries_since_full_validation = 0;
+        self.file_set_certified = false;
     }
 
     fn usable_snapshot(&self) -> Option<Arc<IndexSnapshot>> {
@@ -512,9 +558,17 @@ impl IndexEntry {
         self.queries_since_full_validation >= TARGETED_FRESHNESS_FULL_SCAN_INTERVAL_QUERIES
     }
 
-    fn mark_ready_after_validation(&mut self, snapshot: &Arc<IndexSnapshot>, full_scope_ran: bool) {
+    fn mark_ready_after_validation(
+        &mut self,
+        snapshot: &Arc<IndexSnapshot>,
+        full_scope_ran: bool,
+        file_set_newly_certified: bool,
+    ) {
         if self.current_snapshot_is(snapshot) {
             self.state = IndexEntryState::Ready;
+            if file_set_newly_certified {
+                self.file_set_certified = true;
+            }
             if full_scope_ran {
                 self.queries_since_full_validation = 0;
             } else {
@@ -531,6 +585,7 @@ impl IndexEntry {
         self.last_error_type = Some(err.error_type);
         self.last_fallback_reason = Some(err.fallback_reason);
         self.queries_since_full_validation = 0;
+        self.file_set_certified = false;
     }
 
     fn clear_failed_build(&mut self) {
@@ -541,6 +596,7 @@ impl IndexEntry {
         self.last_error_type = None;
         self.last_fallback_reason = None;
         self.queries_since_full_validation = 0;
+        self.file_set_certified = false;
     }
 }
 
@@ -833,15 +889,25 @@ impl IndexManager {
         }
     }
 
-    fn begin_validation(&mut self, key: &IndexKey, snapshot: &Arc<IndexSnapshot>) -> bool {
+    fn begin_validation(
+        &mut self,
+        key: &IndexKey,
+        snapshot: &Arc<IndexSnapshot>,
+    ) -> ValidationAdmission {
         if let Some(entry) = self.entries.get_mut(key)
             && entry.current_snapshot_is(snapshot)
         {
-            let full_validation_due = entry.full_validation_due();
+            let admission = ValidationAdmission {
+                force_full_scope: entry.full_validation_due(),
+                file_set_certified: entry.file_set_certified,
+            };
             entry.mark_refreshing();
-            return full_validation_due;
+            return admission;
         }
-        true
+        ValidationAdmission {
+            force_full_scope: true,
+            file_set_certified: false,
+        }
     }
 
     fn complete_validation(
@@ -849,9 +915,10 @@ impl IndexManager {
         key: &IndexKey,
         snapshot: &Arc<IndexSnapshot>,
         full_scope_ran: bool,
+        file_set_newly_certified: bool,
     ) -> IndexEntryState {
         if let Some(entry) = self.entries.get_mut(key) {
-            entry.mark_ready_after_validation(snapshot, full_scope_ran);
+            entry.mark_ready_after_validation(snapshot, full_scope_ran, file_set_newly_certified);
         }
         self.state_for(key)
     }
@@ -869,6 +936,13 @@ impl IndexManager {
             self.access_order.retain(|existing_key| existing_key != key);
         }
     }
+}
+
+/// Flags handed to a freshness validation when it is admitted by the index manager.
+#[derive(Clone, Copy, Debug)]
+struct ValidationAdmission {
+    force_full_scope: bool,
+    file_set_certified: bool,
 }
 
 #[derive(Debug)]
@@ -2726,10 +2800,19 @@ fn discover_files(
         .map_err(MemoryError::from)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of rediscovery walks, so tests can assert the certified fast path
+    /// skips `discover_files_uncached` (validation runs synchronously on the caller thread).
+    static UNCACHED_DISCOVERY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn discover_files_uncached(
     req: &NormalizedSearchRequest,
     deadline: Option<Instant>,
 ) -> Result<Vec<PathBuf>, MemoryError> {
+    #[cfg(test)]
+    UNCACHED_DISCOVERY_CALLS.with(|calls| calls.set(calls.get() + 1));
     FileSelector::for_memory(req)
         .map_err(MemoryError::from)?
         .discover_memory_files_uncached(deadline)
@@ -3718,10 +3801,10 @@ impl<'a> SnapshotValidation<'a> {
     fn validate(
         self,
         snapshot: &IndexSnapshot,
-        force_full_scope: bool,
+        admission: ValidationAdmission,
         deadline: Instant,
     ) -> Result<FreshnessValidationResult, MemoryError> {
-        let required_full_scope_reason = if force_full_scope {
+        let required_full_scope_reason = if admission.force_full_scope {
             Some("validation_interval")
         } else if !self.req.no_ignore() && force_full_scope_on_ignore_enabled() {
             Some("ignore_rules_forced_full_scope")
@@ -3752,10 +3835,20 @@ impl<'a> SnapshotValidation<'a> {
             ));
         }
 
-        match check_targeted_snapshot_fresh(self.req, snapshot, &self.result_doc_ids, deadline)? {
-            TargetedFreshnessOutcome::Verified(stats) => {
-                Ok(FreshnessValidationResult::verified_targeted(stats))
-            }
+        match check_targeted_snapshot_fresh(
+            self.req,
+            snapshot,
+            &self.result_doc_ids,
+            admission.file_set_certified,
+            deadline,
+        )? {
+            TargetedFreshnessOutcome::Verified {
+                stats,
+                file_set_newly_certified,
+            } => Ok(FreshnessValidationResult::verified_targeted(
+                stats,
+                file_set_newly_certified,
+            )),
             TargetedFreshnessOutcome::NeedsFullScope { reason, stats } => {
                 let full_stats = check_snapshot_fresh(self.req, snapshot, deadline)?;
                 Ok(FreshnessValidationResult::verified_full_scope(
@@ -3775,10 +3868,11 @@ struct FreshnessValidationResult {
     index_state: IndexEntryState,
     stats: FreshnessValidationStats,
     full_scan_reason: Option<&'static str>,
+    file_set_newly_certified: bool,
 }
 
 impl FreshnessValidationResult {
-    fn verified_targeted(stats: FreshnessValidationStats) -> Self {
+    fn verified_targeted(stats: FreshnessValidationStats, file_set_newly_certified: bool) -> Self {
         Self {
             status: "verified",
             scope: SnapshotValidationScope::TargetedResultFiles,
@@ -3786,6 +3880,7 @@ impl FreshnessValidationResult {
             index_state: IndexEntryState::Ready,
             stats,
             full_scan_reason: None,
+            file_set_newly_certified,
         }
     }
 
@@ -3800,6 +3895,7 @@ impl FreshnessValidationResult {
             index_state: IndexEntryState::Ready,
             stats,
             full_scan_reason,
+            file_set_newly_certified: false,
         }
     }
 
@@ -3814,15 +3910,19 @@ fn validate_cached_snapshot_fresh(
     validation: SnapshotValidation<'_>,
     deadline: Instant,
 ) -> Result<FreshnessValidationResult, MemoryError> {
-    let force_full_scope = {
+    let admission = {
         let mut manager = lock_index_manager();
         manager.begin_validation(key, snapshot)
     };
 
-    match validation.validate(snapshot, force_full_scope, deadline) {
+    match validation.validate(snapshot, admission, deadline) {
         Ok(mut result) => {
-            result.index_state =
-                lock_index_manager().complete_validation(key, snapshot, result.full_scope_ran());
+            result.index_state = lock_index_manager().complete_validation(
+                key,
+                snapshot,
+                result.full_scope_ran(),
+                result.file_set_newly_certified,
+            );
             Ok(result)
         }
         Err(err) => {
@@ -3833,7 +3933,10 @@ fn validate_cached_snapshot_fresh(
 }
 
 enum TargetedFreshnessOutcome {
-    Verified(FreshnessValidationStats),
+    Verified {
+        stats: FreshnessValidationStats,
+        file_set_newly_certified: bool,
+    },
     NeedsFullScope {
         reason: &'static str,
         stats: FreshnessValidationStats,
@@ -3844,19 +3947,35 @@ fn check_targeted_snapshot_fresh(
     req: &NormalizedSearchRequest,
     snapshot: &IndexSnapshot,
     result_doc_ids: &BTreeSet<DocId>,
+    file_set_certified: bool,
     deadline: Instant,
 ) -> Result<TargetedFreshnessOutcome, MemoryError> {
     let mut stats = FreshnessValidationStats::default();
+    // Observation floor for the racy-stamp rule: every directory stamp re-observed below is
+    // read at or after this instant.
+    let stamp_observation_floor = SystemTime::now();
     if let Some(reason) =
         check_scope_directory_fingerprints(&snapshot.scope_fingerprint, &mut stats, deadline)?
     {
         return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
     }
 
-    if Path::new(req.root()).is_dir()
-        && let Some(reason) = check_snapshot_file_set(req, snapshot, deadline)?
-    {
-        return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
+    // With every directory stamp re-verified as matching, a certified file set cannot have
+    // gained or lost entries: any direct-child add/remove/rename bumps its parent directory's
+    // stamp, and certification proved the recorded stamps were non-racy. Only uncertified
+    // snapshots pay the rediscovery walk, and a clean walk performed while all stamps are
+    // non-racy certifies the snapshot for subsequent queries. The periodic forced full-scope
+    // validation (`TARGETED_FRESHNESS_FULL_SCAN_INTERVAL_QUERIES`) still rediscovers
+    // unconditionally, bounding staleness on filesystems with unreliable directory mtimes and
+    // for walker-visibility-only changes (e.g. Windows hidden-attribute flips).
+    let mut file_set_newly_certified = false;
+    if !file_set_certified && Path::new(req.root()).is_dir() {
+        if let Some(reason) = check_snapshot_file_set(req, snapshot, deadline)? {
+            return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
+        }
+        file_set_newly_certified = snapshot
+            .scope_fingerprint
+            .certifiable_at(stamp_observation_floor);
     }
 
     for doc_id in result_doc_ids {
@@ -3891,7 +4010,10 @@ fn check_targeted_snapshot_fresh(
         validate_result_file_content_matches(doc, &metadata, deadline)?;
     }
 
-    Ok(TargetedFreshnessOutcome::Verified(stats))
+    Ok(TargetedFreshnessOutcome::Verified {
+        stats,
+        file_set_newly_certified,
+    })
 }
 
 fn check_scope_directory_fingerprints(
@@ -7853,7 +7975,11 @@ mod tests {
         file.sync_all().expect("sync");
 
         let err = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect_err("targeted freshness should fail");
         assert_eq!(err.error_type, "file_changed_during_verification");
 
@@ -7881,7 +8007,11 @@ mod tests {
         fs::remove_file(&file_path).expect("delete result file");
 
         let err = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect_err("targeted freshness should fail");
         assert_eq!(err.error_type, "file_changed_during_verification");
 
@@ -7908,12 +8038,209 @@ mod tests {
         fs::write(root.join("added.txt"), "needle added\n").expect("write added file");
 
         let err = SnapshotValidation::targeted(&req, BTreeSet::new())
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect_err("targeted freshness should fall back to full-scope failure");
         assert_eq!(err.error_type, "file_changed_during_verification");
         assert_eq!(err.fallback_reason, "file_set_changed");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scope_fingerprint_certifiable_only_when_stamps_are_stale_enough() {
+        let now = SystemTime::now();
+
+        // No directories: never certifiable (single-file scopes, test defaults).
+        assert!(!ScopeFingerprint::default().certifiable_at(now));
+
+        let stamped = |modified: Option<SystemTime>| ScopeFingerprint {
+            directories: vec![MetadataFingerprint {
+                path: PathBuf::from("dir"),
+                stamp: FileStamp {
+                    len: 0,
+                    modified,
+                    change_marker: None,
+                },
+            }],
+            latest_directory_modified: modified,
+        };
+
+        // Missing modified time: never certifiable.
+        assert!(!stamped(None).certifiable_at(now));
+        // Modified just now: racy, not certifiable.
+        assert!(!stamped(Some(now)).certifiable_at(now));
+        // Modified within the slack window: still racy.
+        assert!(!stamped(Some(now - Duration::from_secs(1))).certifiable_at(now));
+        // Exactly at the slack boundary: certifiable.
+        assert!(stamped(Some(now - SCOPE_STAMP_RACY_SLACK)).certifiable_at(now));
+        // Comfortably older than the slack: certifiable.
+        assert!(stamped(Some(now - Duration::from_secs(60))).certifiable_at(now));
+    }
+
+    #[test]
+    fn targeted_validation_certifies_only_after_clean_walk_with_non_racy_stamps() {
+        let root = workspace_test_dir("targeted_validation_certifies_after_clean_walk");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+
+        let req = memory_req(&root).normalize();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut snapshot = build_index(&req, &test_limits(), deadline, false, 1).expect("index");
+        assert!(
+            snapshot
+                .scope_fingerprint
+                .latest_directory_modified
+                .is_some(),
+            "directory scope should record a latest modified time"
+        );
+
+        // Deterministically racy: pretend a directory was modified in the future.
+        snapshot.scope_fingerprint.latest_directory_modified =
+            Some(SystemTime::now() + Duration::from_secs(60));
+        let result = SnapshotValidation::targeted(&req, BTreeSet::new())
+            .validate(&snapshot, uncertified_targeted_admission(), deadline)
+            .expect("validation should verify");
+        assert_eq!(result.state, "targeted_verified");
+        assert!(
+            !result.file_set_newly_certified,
+            "racy directory stamps must not certify the file set"
+        );
+
+        // Deterministically stale: stamps last changed well before this validation observed
+        // them, so a clean walk certifies the file set.
+        snapshot.scope_fingerprint.latest_directory_modified =
+            Some(SystemTime::now() - Duration::from_secs(600));
+        let result = SnapshotValidation::targeted(&req, BTreeSet::new())
+            .validate(&snapshot, uncertified_targeted_admission(), deadline)
+            .expect("validation should verify");
+        assert_eq!(result.state, "targeted_verified");
+        assert!(
+            result.file_set_newly_certified,
+            "clean walk with non-racy stamps should certify the file set"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn certified_admission_skips_rediscovery_walk_while_stamps_match() {
+        let root = workspace_test_dir("certified_admission_skips_rediscovery_walk");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write fixture");
+
+        let req = memory_req(&root).normalize();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let snapshot = build_index(&req, &test_limits(), deadline, false, 1).expect("index");
+
+        let walks_before = UNCACHED_DISCOVERY_CALLS.with(std::cell::Cell::get);
+        let result = SnapshotValidation::targeted(&req, BTreeSet::new())
+            .validate(
+                &snapshot,
+                ValidationAdmission {
+                    force_full_scope: false,
+                    file_set_certified: true,
+                },
+                deadline,
+            )
+            .expect("validation should verify");
+        assert_eq!(result.state, "targeted_verified");
+        assert_eq!(
+            UNCACHED_DISCOVERY_CALLS.with(std::cell::Cell::get),
+            walks_before,
+            "certified file set must skip the rediscovery walk"
+        );
+
+        let result = SnapshotValidation::targeted(&req, BTreeSet::new())
+            .validate(&snapshot, uncertified_targeted_admission(), deadline)
+            .expect("validation should verify");
+        assert_eq!(result.state, "targeted_verified");
+        assert_eq!(
+            UNCACHED_DISCOVERY_CALLS.with(std::cell::Cell::get),
+            walks_before + 1,
+            "uncertified file set must still run the rediscovery walk"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn certified_admission_still_detects_added_file_via_directory_stamp() {
+        let root = workspace_test_dir("certified_admission_detects_added_file");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("sample.txt"), "needle\n").expect("write initial file");
+
+        let req = memory_req(&root).normalize();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let snapshot = build_index(&req, &test_limits(), deadline, false, 1).expect("index");
+
+        fs::write(root.join("added.txt"), "needle added\n").expect("write added file");
+
+        // Even with a certified file set, the added file bumps the root directory stamp, which
+        // escalates to full-scope validation and fails on the changed file set.
+        let err = SnapshotValidation::targeted(&req, BTreeSet::new())
+            .validate(
+                &snapshot,
+                ValidationAdmission {
+                    force_full_scope: false,
+                    file_set_certified: true,
+                },
+                deadline,
+            )
+            .expect_err("certified validation must still detect the added file");
+        assert_eq!(err.error_type, "file_changed_during_verification");
+        assert_eq!(err.fallback_reason, "file_set_changed");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_manager_tracks_file_set_certification_per_snapshot() {
+        let mut manager = IndexManager::default();
+        let key = IndexKey {
+            root: "certification-root".to_string(),
+            hidden: false,
+            follow: false,
+            no_ignore: false,
+            globs: Vec::new(),
+        };
+        let snapshot = Arc::new(empty_snapshot(1));
+        manager.publish_snapshot_if_absent(key.clone(), snapshot.clone());
+
+        assert!(!manager.begin_validation(&key, &snapshot).file_set_certified);
+        manager.complete_validation(&key, &snapshot, false, true);
+        assert!(
+            manager.begin_validation(&key, &snapshot).file_set_certified,
+            "certification granted by a validation should persist for the snapshot"
+        );
+        manager.complete_validation(&key, &snapshot, false, false);
+        assert!(
+            manager.begin_validation(&key, &snapshot).file_set_certified,
+            "later validations without new certification must not clear it"
+        );
+        manager.complete_validation(&key, &snapshot, false, false);
+
+        // A different snapshot must not inherit certification.
+        let replacement = Arc::new(empty_snapshot(2));
+        assert!(
+            !manager
+                .begin_validation(&key, &replacement)
+                .file_set_certified,
+            "validation against a non-current snapshot must not see certification"
+        );
+
+        // Publishing a new snapshot resets certification.
+        let reservation = manager.begin_build(&key);
+        let _ = reservation;
+        let rebuilt = Arc::new(empty_snapshot(3));
+        manager.publish_snapshot_if_absent(key.clone(), rebuilt.clone());
+        assert!(!manager.begin_validation(&key, &rebuilt).file_set_certified);
     }
 
     #[test]
@@ -7939,7 +8266,11 @@ mod tests {
         .expect("index");
 
         let result = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect("targeted freshness");
 
         assert_eq!(result.scope, SnapshotValidationScope::TargetedResultFiles);
@@ -7973,7 +8304,11 @@ mod tests {
         fs::write(root.join(".gitignore"), "# after\n").expect("mutate gitignore");
 
         let result = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect("full-scope freshness");
 
         assert_eq!(result.scope, SnapshotValidationScope::FullScope);
@@ -8005,7 +8340,11 @@ mod tests {
         .expect("index");
 
         let result = SnapshotValidation::targeted(&req, BTreeSet::from([DocId(0)]))
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect("forced full-scope freshness");
 
         assert_eq!(result.scope, SnapshotValidationScope::FullScope);
@@ -8255,7 +8594,11 @@ mod tests {
         fs::set_permissions(&other_path, permissions).expect("toggle executable bit");
 
         let result = SnapshotValidation::targeted(&req, BTreeSet::from([result_doc_id]))
-            .validate(&snapshot, false, Instant::now() + Duration::from_secs(30))
+            .validate(
+                &snapshot,
+                uncertified_targeted_admission(),
+                Instant::now() + Duration::from_secs(30),
+            )
             .expect("same-content metadata change should full-scope validate");
 
         assert_eq!(result.scope, SnapshotValidationScope::FullScope);
@@ -8800,17 +9143,19 @@ mod tests {
         let snapshot = Arc::new(empty_snapshot(7));
         manager.publish_snapshot_if_absent(key.clone(), snapshot.clone());
 
-        assert!(!manager.begin_validation(&key, &snapshot));
+        let admission = manager.begin_validation(&key, &snapshot);
+        assert!(!admission.force_full_scope);
+        assert!(!admission.file_set_certified);
         assert_eq!(manager.state_for(&key), IndexEntryState::Refreshing);
         assert!(manager.cached_snapshot(&key).is_some());
 
         assert_eq!(
-            manager.complete_validation(&key, &snapshot, false),
+            manager.complete_validation(&key, &snapshot, false, false),
             IndexEntryState::Ready
         );
         assert_eq!(manager.state_for(&key), IndexEntryState::Ready);
 
-        assert!(!manager.begin_validation(&key, &snapshot));
+        assert!(!manager.begin_validation(&key, &snapshot).force_full_scope);
         let err = MemoryError::new(
             "file_changed_during_verification",
             "file_set_changed",
@@ -9268,6 +9613,15 @@ mod tests {
         assert_eq!(err.fallback_reason, "query_timeout");
         assert!(!err.fallback_allowed);
         assert!(err.timed_out);
+    }
+
+    /// Admission for a targeted validation with no prior file-set certification — the
+    /// conservative path that always runs the rediscovery walk.
+    fn uncertified_targeted_admission() -> ValidationAdmission {
+        ValidationAdmission {
+            force_full_scope: false,
+            file_set_certified: false,
+        }
     }
 
     fn workspace_test_dir(name: &str) -> PathBuf {
