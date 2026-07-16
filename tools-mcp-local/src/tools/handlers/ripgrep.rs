@@ -441,6 +441,19 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
         let cancel_token = current_cancellation_token();
 
         let mut reader = BufReader::new(stdout).lines();
+        // Construct the deadline and cancellation futures once and poll them
+        // by reference: rebuilding them inside the loop would register a fresh
+        // tokio timer (and cancellation waiter) for every output line.
+        let deadline_sleep = time::sleep_until(tokio_deadline);
+        tokio::pin!(deadline_sleep);
+        let cancelled_wait = async {
+            if let Some(token) = cancel_token.as_ref() {
+                token.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(cancelled_wait);
         loop {
             tokio::select! {
                 maybe_line = reader.next_line() => {
@@ -470,18 +483,12 @@ async fn handle_search_ugrep(req: NormalizedSearchRequest) -> ToolCallOutcome {
                         break;
                     }
                 }
-                () = time::sleep_until(tokio_deadline) => {
+                () = &mut deadline_sleep => {
                     timed_out = true;
                     let _ = child.kill().await;
                     break;
                 }
-                _ = async {
-                    if let Some(token) = cancel_token.as_ref() {
-                        token.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
+                () = &mut cancelled_wait => {
                     cancelled = true;
                     let _ = child.kill().await;
                     break;

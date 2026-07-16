@@ -538,20 +538,33 @@ fn build_search_payload_from_parts(
     // count is an alias for event_count and may be removed in a future release.
     let count = parts.event_count;
 
-    json!({
-        "content": [{"type": "text", "text": meta.text_view}],
-        "isError": meta.is_error,
-        "pattern": req.pattern().to_string(),
-        "path": meta.path,
-        "exit_code": meta.exit_code,
-        "truncated": meta.truncated,
-        "timed_out": meta.timed_out,
-        "match_count": parts.match_count,
-        "event_count": parts.event_count,
-        "count": count,
-        "matches": parts.matches,
-        "files": parts.files,
-    })
+    // Assemble by moving the already-materialized values; `json!` would
+    // deep-copy every nested node (its leaves expand to `to_value(&expr)`)
+    // and immediately drop the originals.
+    let mut content_entry = serde_json::Map::with_capacity(2);
+    content_entry.insert("type".to_string(), Value::String("text".to_string()));
+    content_entry.insert("text".to_string(), Value::String(meta.text_view));
+
+    let mut payload = serde_json::Map::with_capacity(12);
+    payload.insert(
+        "content".to_string(),
+        Value::Array(vec![Value::Object(content_entry)]),
+    );
+    payload.insert("isError".to_string(), Value::Bool(meta.is_error));
+    payload.insert(
+        "pattern".to_string(),
+        Value::String(req.pattern().to_string()),
+    );
+    payload.insert("path".to_string(), Value::String(meta.path));
+    payload.insert("exit_code".to_string(), meta.exit_code);
+    payload.insert("truncated".to_string(), Value::Bool(meta.truncated));
+    payload.insert("timed_out".to_string(), Value::Bool(meta.timed_out));
+    payload.insert("match_count".to_string(), Value::from(parts.match_count));
+    payload.insert("event_count".to_string(), Value::from(parts.event_count));
+    payload.insert("count".to_string(), Value::from(count));
+    payload.insert("matches".to_string(), Value::Array(parts.matches));
+    payload.insert("files".to_string(), Value::Array(parts.files));
+    Value::Object(payload)
 }
 
 #[cfg(test)]

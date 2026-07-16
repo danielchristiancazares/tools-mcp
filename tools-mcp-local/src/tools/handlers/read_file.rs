@@ -386,9 +386,37 @@ fn render_numbered_range(
     if let Ok(text) = std::str::from_utf8(selected_bytes) {
         render_numbered_text(text, start_line, resolved_end)
     } else {
-        let text = String::from_utf8_lossy(selected_bytes);
-        render_numbered_text(text.as_ref(), start_line, resolved_end)
+        render_numbered_bytes_lossy(selected_bytes, start_line, resolved_end)
     }
+}
+
+/// Lossy variant of [`render_numbered_text`] that converts one line at a time,
+/// avoiding a full-buffer lossy copy before rendering. Splitting at line
+/// breaks first is equivalent: `\n`/`\r` are ASCII, so they can neither
+/// continue a multi-byte sequence nor extend an invalid one, and U+FFFD
+/// substitution of maximal invalid subparts proceeds left to right.
+fn render_numbered_bytes_lossy(bytes: &[u8], start_line: usize, resolved_end: usize) -> String {
+    let width = decimal_width(resolved_end.max(1));
+    let line_count = resolved_end.saturating_sub(start_line) + 1;
+    let prefix_capacity = line_count.saturating_mul(width + 1);
+    let mut body = String::with_capacity(bytes.len().saturating_add(prefix_capacity));
+    let mut line_no = start_line;
+
+    for_each_line_with_endings(bytes, |_, line_start, line_end| {
+        push_number_prefix(&mut body, line_no, width);
+        // Equivalent to `String::from_utf8_lossy` (one U+FFFD per maximal
+        // invalid subpart) but streamed into `body` without intermediate
+        // allocations.
+        for chunk in bytes[line_start..line_end].utf8_chunks() {
+            body.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                body.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+        line_no += 1;
+    });
+
+    body
 }
 
 fn render_numbered_text(text: &str, start_line: usize, resolved_end: usize) -> String {

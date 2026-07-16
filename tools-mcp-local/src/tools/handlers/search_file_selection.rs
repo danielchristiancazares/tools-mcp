@@ -146,8 +146,11 @@ impl FileSelector {
         &self,
         deadline: Option<Instant>,
     ) -> Result<Vec<PathBuf>, FileSelectionError> {
-        self.discover_memory_scope_via_walker(deadline)
-            .map(|scope| scope.files)
+        // File-set verification only needs the walked paths; skip the ignore
+        // fingerprint (per-directory control stats plus hashing every ignore
+        // file) that `discover_memory_scope_via_walker` would build and the
+        // caller would discard.
+        self.walk_scope(deadline).map(|(files, _directories)| files)
     }
 
     pub(super) fn discover_memory_scope(
@@ -239,6 +242,32 @@ impl FileSelector {
         &self,
         deadline: Option<Instant>,
     ) -> Result<MemoryScopeDiscovery, FileSelectionError> {
+        let (files, directories) = self.walk_scope(deadline)?;
+        let fingerprint_root = self
+            .root
+            .parent()
+            .filter(|_| self.root.is_file())
+            .unwrap_or(&self.root);
+        let ignore_fingerprint = build_ignore_fingerprint(
+            fingerprint_root,
+            directories.iter().map(|path| path.as_path()),
+            self.no_ignore,
+            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+        )
+        .map_err(Self::scope_cache_error)?;
+        Ok(MemoryScopeDiscovery {
+            files,
+            directories,
+            ignore_fingerprint,
+        })
+    }
+
+    /// Walks the scope with `WalkBuilder`, returning sorted files (glob
+    /// filtered) and sorted, deduplicated directories.
+    fn walk_scope(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), FileSelectionError> {
         let cancel_token = current_cancellation_token();
         let cancel = cancel_token.as_ref();
 
@@ -288,23 +317,7 @@ impl FileSelector {
         files.sort();
         directories.sort();
         directories.dedup();
-        let fingerprint_root = self
-            .root
-            .parent()
-            .filter(|_| self.root.is_file())
-            .unwrap_or(&self.root);
-        let ignore_fingerprint = build_ignore_fingerprint(
-            fingerprint_root,
-            directories.iter().map(|path| path.as_path()),
-            self.no_ignore,
-            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
-        )
-        .map_err(Self::scope_cache_error)?;
-        Ok(MemoryScopeDiscovery {
-            files,
-            directories,
-            ignore_fingerprint,
-        })
+        Ok((files, directories))
     }
 
     /// Retrieve the cached `RecursiveScopeSnapshot` for this selector, building it on
@@ -478,15 +491,42 @@ impl SearchGlobFilter {
             });
         }
 
-        if let Some(rendered_path) = rendered_ugrep_path(root, path)
-            && compiled
+        // Slash globs match against the search-root-relative form of each
+        // path, regardless of whether the search root is `.`, a relative
+        // subdir, or an absolute path. This preserves the contract guarded by
+        // `tools-mcp-server/tests/integration_test.rs::
+        // test_search_ugrep_fallback_preserves_slash_glob_or_semantics`,
+        // where a glob like `tools-mcp-server/tests/integration_test.rs` must
+        // match `<search_root>/tools-mcp-server/tests/integration_test.rs`.
+        //
+        // Paths are matched directly (`matches_path_with` allocates nothing);
+        // the lossy rendered form is only consulted for non-UTF-8 paths,
+        // where direct matching cannot apply, mirroring the previous
+        // render-to-String behavior exactly without its per-file allocation.
+        if let Some(relative) = path_relative_to_root(root, path) {
+            if compiled
                 .pattern
-                .matches_path_with(Path::new(&rendered_path), self.match_options)
-        {
-            return true;
+                .matches_path_with(relative, self.match_options)
+            {
+                return true;
+            }
+            if relative.to_str().is_none()
+                && compiled
+                    .pattern
+                    .matches_with(&relative.display().to_string(), self.match_options)
+            {
+                return true;
+            }
+            compiled.pattern.matches_path_with(path, self.match_options)
+        } else {
+            if compiled.pattern.matches_path_with(path, self.match_options) {
+                return true;
+            }
+            path.to_str().is_none()
+                && compiled
+                    .pattern
+                    .matches_with(&path.display().to_string(), self.match_options)
         }
-
-        compiled.pattern.matches_path_with(path, self.match_options)
     }
 }
 
@@ -592,19 +632,6 @@ fn path_relative_to_root<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
     }
 
     None
-}
-
-fn rendered_ugrep_path(root: &Path, path: &Path) -> Option<String> {
-    // Slash globs match against the search-root-relative form of each path,
-    // regardless of whether the search root is `.`, a relative subdir, or an
-    // absolute path. This preserves the contract guarded by
-    // `tools-mcp-server/tests/integration_test.rs::
-    // test_search_ugrep_fallback_preserves_slash_glob_or_semantics`, where
-    // a glob like `tools-mcp-server/tests/integration_test.rs` must match
-    // `<search_root>/tools-mcp-server/tests/integration_test.rs`.
-    path_relative_to_root(root, path)
-        .map(|relative| relative.display().to_string())
-        .or_else(|| Some(path.display().to_string()))
 }
 
 fn is_current_dir_root_arg(root: &str) -> bool {

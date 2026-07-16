@@ -161,6 +161,15 @@ fn insert_if_some<T: serde::Serialize>(
 }
 
 fn extract_match_locations(search_payload: &Value, root: &str) -> Vec<MatchLocation> {
+    // The root is constant across every match and the same file repeats for
+    // each of its matching lines; canonicalize each exactly once instead of
+    // twice per match event.
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let root_is_file = canonical_root
+        .as_deref()
+        .is_some_and(std::path::Path::is_file);
+    let mut validated_by_path: HashMap<&str, Option<String>> = HashMap::new();
+
     search_payload["matches"]
         .as_array()
         .into_iter()
@@ -175,7 +184,13 @@ fn extract_match_locations(search_payload: &Value, root: &str) -> Vec<MatchLocat
                 .filter(|path| !path.trim().is_empty())?;
             let line_number = data.get("line_number")?.as_u64()?;
             let line_number = usize::try_from(line_number).ok()?;
-            let read_path = validate_match_path(path, root)?;
+            let read_path = validated_by_path
+                .entry(path)
+                .or_insert_with(|| {
+                    let canonical_root = canonical_root.as_deref()?;
+                    validate_match_path(path, canonical_root, root_is_file)
+                })
+                .clone()?;
             Some(MatchLocation {
                 path: path.to_string(),
                 read_path,
@@ -185,18 +200,21 @@ fn extract_match_locations(search_payload: &Value, root: &str) -> Vec<MatchLocat
         .collect()
 }
 
-fn validate_match_path(path: &str, root: &str) -> Option<String> {
+fn validate_match_path(
+    path: &str,
+    canonical_root: &std::path::Path,
+    root_is_file: bool,
+) -> Option<String> {
     let canonical_path = std::fs::canonicalize(path).ok()?;
-    let canonical_root = std::fs::canonicalize(root).ok()?;
 
-    if canonical_root.is_file() {
+    if root_is_file {
         if canonical_path == canonical_root {
             return canonical_path.to_str().map(ToOwned::to_owned);
         }
         return None;
     }
 
-    if canonical_path.starts_with(&canonical_root) {
+    if canonical_path.starts_with(canonical_root) {
         return canonical_path.to_str().map(ToOwned::to_owned);
     }
 
@@ -412,33 +430,85 @@ fn build_context_payload(
     windows: Vec<FileWindow>,
     text: String,
 ) -> Value {
-    json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": false,
-        "pattern": req.pattern,
-        "path": req.path.as_deref().unwrap_or("."),
-        "context_lines": validation::clamp_limit(req.context_lines, DEFAULT_CONTEXT_LINES, 0, MAX_CONTEXT_LINES),
-        "match_count": search_payload["match_count"].clone(),
-        "event_count": search_payload["event_count"].clone(),
-        "search_truncated": search_payload["truncated"].clone(),
-        "search_timed_out": search_payload["timed_out"].clone(),
-        "search_backend": search_payload.get("backend").cloned().unwrap_or(Value::Null),
-        "matches": matches
-            .into_iter()
-            .map(|m| json!({"path": m.path, "line_number": m.line_number}))
-            .collect::<Vec<_>>(),
-        "windows": windows
-            .into_iter()
-            .map(|window| json!({
-                "path": window.path,
-                "start_line": window.start_line,
-                "end_line": window.end_line,
-                "match_lines": window.match_lines,
-                "total_lines": window.total_lines,
-                "text": window.text,
-            }))
-            .collect::<Vec<_>>(),
-    })
+    // Assemble by moving the rendered text and window bodies; `json!` would
+    // deep-copy them (its leaves expand to `to_value(&expr)`) and drop the
+    // originals.
+    let matches = matches
+        .into_iter()
+        .map(|location| {
+            let mut entry = serde_json::Map::with_capacity(2);
+            entry.insert("path".to_string(), Value::String(location.path));
+            entry.insert("line_number".to_string(), Value::from(location.line_number));
+            Value::Object(entry)
+        })
+        .collect();
+    let windows = windows
+        .into_iter()
+        .map(|window| {
+            let mut entry = serde_json::Map::with_capacity(6);
+            entry.insert("path".to_string(), Value::String(window.path));
+            entry.insert("start_line".to_string(), Value::from(window.start_line));
+            entry.insert("end_line".to_string(), Value::from(window.end_line));
+            entry.insert(
+                "match_lines".to_string(),
+                Value::Array(window.match_lines.into_iter().map(Value::from).collect()),
+            );
+            entry.insert("total_lines".to_string(), Value::from(window.total_lines));
+            entry.insert("text".to_string(), Value::String(window.text));
+            Value::Object(entry)
+        })
+        .collect();
+
+    let mut content_entry = serde_json::Map::with_capacity(2);
+    content_entry.insert("type".to_string(), Value::String("text".to_string()));
+    content_entry.insert("text".to_string(), Value::String(text));
+
+    let mut payload = serde_json::Map::with_capacity(12);
+    payload.insert(
+        "content".to_string(),
+        Value::Array(vec![Value::Object(content_entry)]),
+    );
+    payload.insert("isError".to_string(), Value::Bool(false));
+    payload.insert("pattern".to_string(), Value::String(req.pattern.clone()));
+    payload.insert(
+        "path".to_string(),
+        Value::String(req.path.as_deref().unwrap_or(".").to_string()),
+    );
+    payload.insert(
+        "context_lines".to_string(),
+        Value::from(validation::clamp_limit(
+            req.context_lines,
+            DEFAULT_CONTEXT_LINES,
+            0,
+            MAX_CONTEXT_LINES,
+        )),
+    );
+    payload.insert(
+        "match_count".to_string(),
+        search_payload["match_count"].clone(),
+    );
+    payload.insert(
+        "event_count".to_string(),
+        search_payload["event_count"].clone(),
+    );
+    payload.insert(
+        "search_truncated".to_string(),
+        search_payload["truncated"].clone(),
+    );
+    payload.insert(
+        "search_timed_out".to_string(),
+        search_payload["timed_out"].clone(),
+    );
+    payload.insert(
+        "search_backend".to_string(),
+        search_payload
+            .get("backend")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    payload.insert("matches".to_string(), Value::Array(matches));
+    payload.insert("windows".to_string(), Value::Array(windows));
+    Value::Object(payload)
 }
 
 #[cfg(test)]
@@ -561,19 +631,12 @@ mod tests {
         fs::write(&in_root, "needle").expect("write in root");
         fs::write(&outside, "secret").expect("write outside");
 
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical root");
         assert!(
-            validate_match_path(
-                in_root.to_str().expect("utf8"),
-                root.path().to_str().expect("utf8")
-            )
-            .is_some()
+            validate_match_path(in_root.to_str().expect("utf8"), &canonical_root, false).is_some()
         );
         assert!(
-            validate_match_path(
-                outside.to_str().expect("utf8"),
-                root.path().to_str().expect("utf8")
-            )
-            .is_none()
+            validate_match_path(outside.to_str().expect("utf8"), &canonical_root, false).is_none()
         );
     }
 }
