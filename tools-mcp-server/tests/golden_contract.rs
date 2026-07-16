@@ -29,8 +29,6 @@ fn expected_tool_names_without_pwsh() -> BTreeSet<String> {
         "WebFetch",
         "Search",
         "search_context",
-        "SemanticIndex",
-        "SemanticSearch",
         "Read",
         "Edit",
         "Write",
@@ -78,6 +76,7 @@ fn served_tools_without_pwsh() -> Vec<Value> {
     });
     let mut command = spawn_server();
     command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    command.env_remove("MCP_SEMANTIC_BACKEND");
     let response = send_mcp_message_with_command(&request, command).expect("tools list");
     response["result"]["tools"]
         .as_array()
@@ -115,6 +114,7 @@ fn golden_initialize_has_tools_capabilities_and_protocol_version() {
     });
     let mut command = spawn_server();
     command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    command.env_remove("MCP_SEMANTIC_BACKEND");
     let response = send_mcp_message_with_command(&request, command).expect("initialize");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9001);
@@ -301,6 +301,7 @@ fn golden_tools_list_returns_tools_array() {
     });
     let mut command = spawn_server();
     command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    command.env_remove("MCP_SEMANTIC_BACKEND");
     let response = send_mcp_message_with_command(&request, command).expect("tools list");
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 9006);
@@ -317,10 +318,9 @@ fn golden_tools_list_returns_tools_array() {
 
 #[test]
 fn golden_readme_tool_inventory_matches_tools_list() {
-    // The README enumerates every documented tool, including ones that are
-    // gated behind opt-in env vars (e.g. Pwsh requires MCP_ENABLE_PWSH_TOOL).
-    // Enable those gates here so the README inventory and the live
-    // `tools/list` set are comparable.
+    // The README enumerates every documented tool, including ones gated behind
+    // opt-in env vars. Enable those gates here so the README inventory and the
+    // live `tools/list` set are comparable.
     let request = json!({
         "jsonrpc": "2.0",
         "id": 9010,
@@ -329,6 +329,7 @@ fn golden_readme_tool_inventory_matches_tools_list() {
     });
     let mut command = spawn_server();
     command.env("MCP_ENABLE_PWSH_TOOL", "true");
+    command.env("MCP_SEMANTIC_BACKEND", "lancedb");
     let response = send_mcp_message_with_command(&request, command).expect("tools list");
     let tools = response["result"]["tools"].as_array().expect("tools array");
     let actual = served_tool_names(tools);
@@ -366,6 +367,7 @@ fn golden_all_object_tool_schemas_disallow_unknown_fields() {
     });
     let mut command = spawn_server();
     command.env("MCP_ENABLE_PWSH_TOOL", "true");
+    command.env("MCP_SEMANTIC_BACKEND", "lancedb");
     let response = send_mcp_message_with_command(&request, command).expect("tools list");
     let tools = response["result"]["tools"].as_array().expect("tools array");
 

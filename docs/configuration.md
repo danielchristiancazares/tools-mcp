@@ -24,7 +24,7 @@ This document catalogs environment variables and host prerequisites used by `too
 
 | Variable | Values | Effect |
 |---|---|---|
-| `MCP_SEMANTIC_BACKEND` | unset, empty, `lancedb`, or `qdrant`; backend names are case-insensitive after trimming | Selects the semantic vector backend. Unset, empty, and `lancedb` use LanceDB. `qdrant` requires `QDRANT_URL`. |
+| `MCP_SEMANTIC_BACKEND` | absent, empty, `lancedb`, or `qdrant`; backend names are case-insensitive after trimming | Startup registration gate and backend selector. When absent, `SemanticIndex` and `SemanticSearch` are not registered. When present and empty or `lancedb`, calls use LanceDB. When present and `qdrant`, calls use Qdrant and require `QDRANT_URL`. Unsupported present values still register the semantic tools, but semantic calls fail with an unsupported-backend error. |
 | `QDRANT_URL` | absolute `http` or `https` URL with host and no path/query/fragment | Required when `MCP_SEMANTIC_BACKEND=qdrant`. If no port is present, the client adds Qdrant gRPC port `6334`. |
 | `QDRANT_API_KEY` | secret string | Optional Qdrant API key. Empty or unset means no API key. |
 

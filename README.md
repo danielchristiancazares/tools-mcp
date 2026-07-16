@@ -46,8 +46,8 @@ Each row links to the tool's design contract under [`docs/tools/`](./docs/README
 | Fetch and chunk web content | **Tool name**: `WebFetch` | [docs/tools/webfetch.md](./docs/tools/webfetch.md) |
 | Search by regex / literal / fuzzy | **Tool name**: `Search` | [docs/tools/search.md](./docs/tools/search.md) |
 | Search and expand matches into file windows | **Tool name**: `search_context` | [docs/tools/search-context.md](./docs/tools/search-context.md) |
-| Build or refresh semantic code index with indexed/updated counts | **Tool name**: `SemanticIndex` | [docs/tools/semantic-index.md](./docs/tools/semantic-index.md) |
-| Natural-language semantic code search | **Tool name**: `SemanticSearch` | [docs/tools/semantic-search.md](./docs/tools/semantic-search.md) |
+| Build or refresh semantic code index with indexed/updated counts **(gated: `MCP_SEMANTIC_BACKEND` set)** | **Tool name**: `SemanticIndex` | [docs/tools/semantic-index.md](./docs/tools/semantic-index.md) |
+| Natural-language semantic code search **(gated: `MCP_SEMANTIC_BACKEND` set)** | **Tool name**: `SemanticSearch` | [docs/tools/semantic-search.md](./docs/tools/semantic-search.md) |
 | Read a file (optionally a line range) | **Tool name**: `Read` | [docs/tools/read.md](./docs/tools/read.md) |
 | Edit a file by snippet replacement (preserves newlines) | **Tool name**: `Edit` | [docs/tools/edit.md](./docs/tools/edit.md) |
 | Create a new file | **Tool name**: `Write` | [docs/tools/write.md](./docs/tools/write.md) |

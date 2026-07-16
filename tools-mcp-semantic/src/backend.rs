@@ -3,7 +3,7 @@ use crate::store::{LanceDbStore, SearchFilter, SemanticMatch, StoredChunk, table
 use anyhow::{Result, bail};
 use std::path::Path;
 
-const BACKEND_ENV: &str = "MCP_SEMANTIC_BACKEND";
+pub(crate) const BACKEND_ENV: &str = "MCP_SEMANTIC_BACKEND";
 const QDRANT_MANIFEST_FILE: &str = "manifest.qdrant.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +27,7 @@ impl SemanticBackend {
                 Ok(Self::LanceDb)
             }
             Ok(value) => bail!(
-                "unsupported semantic backend {value:?}; expected unset, 'lancedb', or 'qdrant'"
+                "unsupported semantic backend {value:?}; expected empty, 'lancedb', or 'qdrant'"
             ),
             Err(std::env::VarError::NotPresent) => Ok(Self::LanceDb),
             Err(err) => Err(err.into()),

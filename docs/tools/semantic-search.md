@@ -37,11 +37,11 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 |---|---|
 | MCP tool name | `SemanticSearch` |
 | Aliases | None |
-| Registration gate | Always registered (no env gate) |
+| Registration gate | `MCP_SEMANTIC_BACKEND` must be present at server startup. When it is absent, `SemanticSearch` is not registered and does not appear in `mcp/tools/list`. |
 | Owning crate | `tools-mcp-semantic` |
 | Handler function | `handle_semantic_search` (`tools-mcp-semantic/src/tools.rs:77`) |
 | Schema definition | `tools-mcp-semantic/src/tools.rs:133-152` |
-| Registration call | `tools-mcp-semantic/src/tools.rs:42` invoked from `tools-mcp-semantic/src/lib.rs:11-13`, wired into the registry by `tools-mcp-server/src/composition.rs:89` |
+| Registration call | `tools-mcp-semantic/src/tools.rs:42` invoked from the startup gate in `tools-mcp-semantic/src/lib.rs:13-18`, wired into the registry by `tools-mcp-server/src/composition.rs:90` |
 
 ### 4.2 Invariants
 
@@ -217,7 +217,9 @@ The same envelope shape is returned by `ToolCallOutcome::err` when argument pars
 
 | Variable | Default | Description |
 |---|---|---|
-| _(none read directly by this tool)_ | — | The handler does not read environment variables; FastEmbed reads its own ORT configuration internally. |
+| `MCP_SEMANTIC_BACKEND` | absent | Startup registration gate and backend selector. When absent, this tool is not registered. When present and empty or `lancedb`, calls use LanceDB. When present and `qdrant`, calls use Qdrant and require `QDRANT_URL`. Unsupported present values still register the tool, but calls fail with an unsupported-backend error. |
+| `QDRANT_URL` | — | Required when `MCP_SEMANTIC_BACKEND=qdrant`. |
+| `QDRANT_API_KEY` | — | Optional Qdrant API key. |
 
 Indirect knobs:
 
@@ -228,8 +230,8 @@ Indirect knobs:
 | Claim | File | Line(s) |
 |---|---|---|
 | Tool registration | `tools-mcp-semantic/src/tools.rs` | 40-43 |
-| Module wiring | `tools-mcp-semantic/src/lib.rs` | 11-13 |
-| Composition root | `tools-mcp-server/src/composition.rs` | 89 |
+| Module wiring and startup gate | `tools-mcp-semantic/src/lib.rs` | 13-18 |
+| Composition root | `tools-mcp-server/src/composition.rs` | 90 |
 | Tool name + schema | `tools-mcp-semantic/src/tools.rs` | 133-152 |
 | Request type (`deny_unknown_fields`) | `tools-mcp-semantic/src/tools.rs` | 22-38 |
 | Handler entry | `tools-mcp-semantic/src/tools.rs` | 77-112 |
@@ -361,8 +363,9 @@ Indirect knobs:
 
 | Test | File | What it covers |
 |---|---|---|
-| `tools_list_contains_expected_set` | `tools-mcp-server/tests/integration_test.rs:105` | `SemanticSearch` appears in `mcp/tools/list`. |
-| `golden_contract_lists_expected_tools` | `tools-mcp-server/tests/golden_contract.rs:56` | Golden test pinning the `SemanticSearch` tool name. |
+| `test_semantic_tools_disabled_when_backend_env_missing` | `tools-mcp-server/tests/integration_test.rs` | `SemanticSearch` is absent from `mcp/tools/list` when `MCP_SEMANTIC_BACKEND` is missing. |
+| `test_semantic_tools_register_when_backend_env_present` | `tools-mcp-server/tests/integration_test.rs` | `SemanticSearch` appears in `mcp/tools/list` when `MCP_SEMANTIC_BACKEND` is present. |
+| `golden_readme_tool_inventory_matches_tools_list` | `tools-mcp-server/tests/golden_contract.rs` | Enables semantic registration and verifies the README inventory matches the served tool set. |
 | `search_payload_preserves_contract_without_content` | `tools-mcp-semantic/src/model.rs:533` | Response shape: `content[0].text` formatting, `isError: false`, `count`, and the omission of `content` when not requested. |
 | `embedding_document_includes_stable_code_metadata` | `tools-mcp-semantic/src/model.rs:513` | Document prefixing format used at index time (the matched search-time format). |
 | `search_filter_combines_root_path_and_language` | `tools-mcp-semantic/src/store.rs:462` | SQL predicate composes `root`, directory range, and `language` clauses. |
@@ -373,7 +376,7 @@ Indirect knobs:
 | `sql_literals_escape_single_quotes` | `tools-mcp-semantic/src/discovery.rs:369` | `escape_sql_literal` doubles single quotes. |
 | `directory_filter_includes_children_only` | `tools-mcp-semantic/src/discovery.rs:360` | `PathFilter::Directory::contains` matches the directory and its descendants only. |
 
-Coverage gap: there is no end-to-end test that exercises `SemanticSearch` through the JSON-RPC harness (only the `tools/list` golden assertion). The pipeline is exercised by the unit tests above plus the `semantic` benchmark harness (`tools-mcp-semantic/benches/semantic.rs`, behind the `bench-api` feature).
+Coverage gap: there is no end-to-end test that exercises a successful `SemanticSearch` call through the JSON-RPC harness. Registration is covered through `tools/list`; the pipeline is exercised by the unit tests above plus the `semantic` benchmark harness (`tools-mcp-semantic/benches/semantic.rs`, behind the `bench-api` feature).
 
 ## 12. Open Questions
 

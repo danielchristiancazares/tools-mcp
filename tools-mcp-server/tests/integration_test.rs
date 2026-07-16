@@ -104,8 +104,6 @@ fn expected_tool_names_without_pwsh() -> BTreeSet<&'static str> {
         "WebFetch",
         "Search",
         "search_context",
-        "SemanticIndex",
-        "SemanticSearch",
         "Read",
         "Edit",
         "Write",
@@ -133,6 +131,13 @@ fn expected_tool_names_without_pwsh() -> BTreeSet<&'static str> {
     ]
     .into_iter()
     .collect()
+}
+
+fn expected_tool_names_with_semantic_without_pwsh() -> BTreeSet<&'static str> {
+    let mut names = expected_tool_names_without_pwsh();
+    names.insert("SemanticIndex");
+    names.insert("SemanticSearch");
+    names
 }
 
 fn workspace_tempdir(prefix: &str) -> tempfile::TempDir {
@@ -238,6 +243,7 @@ fn test_tools_list() {
 
     let mut command = spawn_server();
     command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    command.env_remove("MCP_SEMANTIC_BACKEND");
     let response =
         support::send_mcp_message_with_command(&request, command).expect("Failed to list tools");
 
@@ -254,6 +260,56 @@ fn test_tools_list() {
     );
     assert_eq!(tool_names, expected_tool_names_without_pwsh());
     assert!(!tool_names.contains("CodeQuery"));
+}
+
+#[test]
+fn test_semantic_tools_disabled_when_backend_env_missing() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 300,
+        "method": "mcp/tools/list",
+        "params": {}
+    });
+
+    let mut command = spawn_server();
+    command.env_remove("MCP_ENABLE_PWSH_TOOL");
+    command.env_remove("MCP_SEMANTIC_BACKEND");
+    let response = support::send_mcp_message_with_command(&request, command)
+        .expect("Failed to list tools without semantic backend");
+
+    let tools = response["result"]["tools"].as_array().unwrap();
+    let tool_names: BTreeSet<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+    assert_eq!(tool_names, expected_tool_names_without_pwsh());
+    assert!(!tool_names.contains("SemanticIndex"));
+    assert!(!tool_names.contains("SemanticSearch"));
+}
+
+#[test]
+fn test_semantic_tools_register_when_backend_env_present() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 301,
+        "method": "mcp/tools/list",
+        "params": {}
+    });
+
+    for backend in ["", "lancedb", "qdrant", "none"] {
+        let mut command = spawn_server();
+        command.env_remove("MCP_ENABLE_PWSH_TOOL");
+        command.env("MCP_SEMANTIC_BACKEND", backend);
+        let response = support::send_mcp_message_with_command(&request, command)
+            .expect("Failed to list tools with semantic backend env present");
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let tool_names: BTreeSet<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+        assert_eq!(
+            tool_names,
+            expected_tool_names_with_semantic_without_pwsh(),
+            "semantic tools should register when MCP_SEMANTIC_BACKEND={backend:?} is present"
+        );
+    }
 }
 
 #[test]
@@ -311,6 +367,7 @@ fn test_semantic_index_reports_indexed_and_updated_counts() {
 
     let mut command = spawn_server();
     command.current_dir(temp_dir.path());
+    command.env("MCP_SEMANTIC_BACKEND", "lancedb");
     let response = support::send_mcp_message_with_command(&request, command)
         .expect("Failed to call SemanticIndex");
 

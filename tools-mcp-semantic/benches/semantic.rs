@@ -295,7 +295,7 @@ impl Container_{index} {{
 
 fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    tools_mcp_semantic::register_tools(&mut registry);
+    tools_mcp_semantic::bench::register_tools(&mut registry);
     registry
 }
 

@@ -43,6 +43,7 @@ Env vars:
 - `MCP_SKIP_HEADERS=true` — no `Content-Length` framing.
 - `MCP_ENABLE_GIT=true` — register Git tools; omitted or any other value leaves Git tools disabled.
 - `MCP_ENABLE_PWSH_TOOL=true` — register the host PowerShell tool; omitted or any other value leaves `Pwsh` disabled.
+- `MCP_SEMANTIC_BACKEND=lancedb|qdrant` — register `SemanticIndex` and `SemanticSearch`; omitted leaves semantic tools disabled, and an explicitly empty value selects LanceDB.
 - `RUST_LOG=debug` — verbose logs.
 - `APP_VERSION=...` — baked into init responses.
 
@@ -74,7 +75,7 @@ When agent tools are available, prefer them over Bash equivalents:
 - `WebFetch` — fetches and processes web content. Required: `url`. Optional: `max_chunk_tokens` (default `2000`), `no_cache` (default `false`), `force_browser` (default `false`). Returns `chunks[]`, `title`, `language`, `fetched_at`, `rendering_method` (`"http"` or `"browser"`), cache metadata, and `note`.
 - `Search` — local regex file search with an in-memory fast path and `ugrep` fallback/backend. Required: `pattern`. Optional: `path`, `case`, `context`, `head_limit`, `include`.
 - `search_context` — local search returning merged, numbered file windows around matches.
-- `SemanticIndex` / `SemanticSearch` — local semantic code indexing and natural-language search.
+- `SemanticIndex` / `SemanticSearch` — local semantic code indexing and natural-language search, registered only when `MCP_SEMANTIC_BACKEND` is set.
 - `Pwsh` — host PowerShell execution, registered only when `MCP_ENABLE_PWSH_TOOL=true`.
 - `ping` — health check returning `pong`.
 
