@@ -11,6 +11,10 @@ mod tools;
 use tools_mcp_core::ToolRegistry;
 
 pub fn register_tools(registry: &mut ToolRegistry) {
+    if std::env::var_os(backend::BACKEND_ENV).is_none() {
+        return;
+    }
+
     tools::register_tools(registry);
 }
 
@@ -22,10 +26,17 @@ pub mod bench {
     use anyhow::Result;
     use std::path::Path;
     use std::path::PathBuf;
+    use tools_mcp_core::ToolRegistry;
 
     use crate::chunking::{chunk_source, hash_bytes};
     use crate::discovery::FileCandidate;
     use crate::embedding::FastEmbedProvider as InternalProvider;
+
+    /// Bench-only tool registration bypasses the runtime `MCP_SEMANTIC_BACKEND` startup gate so
+    /// benchmark invocations keep measuring the semantic tools directly.
+    pub fn register_tools(registry: &mut ToolRegistry) {
+        crate::tools::register_tools(registry);
+    }
 
     /// Public-for-bench wrapper around the internal FastEmbed provider. Mirrors only the methods
     /// the bench harness needs; intentionally not a full re-export.
@@ -62,6 +73,8 @@ pub mod bench {
             absolute_path: PathBuf::from("bench.md"),
             relative_path: "bench.md".to_string(),
             language: "markdown".to_string(),
+            size: markdown.len() as u64,
+            modified: None,
         };
         let file_hash = hash_bytes(markdown.as_bytes());
         chunk_source(&file, markdown, &file_hash).len()

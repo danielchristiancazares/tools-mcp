@@ -15,7 +15,44 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Minimum age a file's mtime must have (relative to the moment discovery started observing
+/// metadata) before the size+mtime stamp is recorded in the manifest. A modification landing
+/// in the same coarse mtime granule as the recorded stamp could otherwise leave both size and
+/// mtime unchanged while the content differs (git's racy-timestamp problem). Entries recorded
+/// without a stamp simply fall back to the content-hash check on the next run.
+const STAMP_RACY_SLACK: Duration = Duration::from_secs(2);
+
+/// A changed file queued for embedding, with everything the manifest update needs.
+struct PendingFile {
+    relative_path: String,
+    file_hash: String,
+    size: u64,
+    mtime_unix_nanos: Option<u64>,
+    chunks: Vec<CodeChunk>,
+}
+
+fn mtime_unix_nanos(modified: SystemTime) -> Option<u64> {
+    modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .try_into()
+        .ok()
+}
+
+/// Stamp to persist for a file whose content hash was just recorded: the observed mtime, but
+/// only when it is race-free (at least `STAMP_RACY_SLACK` older than `observation_floor`, a
+/// time at or before the metadata was observed).
+fn recordable_stamp(modified: Option<SystemTime>, observation_floor: SystemTime) -> Option<u64> {
+    let modified = modified?;
+    if modified.checked_add(STAMP_RACY_SLACK)? <= observation_floor {
+        mtime_unix_nanos(modified)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct IndexOptions {
@@ -154,6 +191,9 @@ pub(crate) struct SearchResult {
 pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummary> {
     let started = Instant::now();
     let deadline = started + Duration::from_millis(options.timeout_ms);
+    // Captured before discovery so every file metadata observation happens at or after it;
+    // used as the observation floor for the racy-stamp rule.
+    let stamp_observation_floor = SystemTime::now();
     let discovery = discover_files(DiscoveryOptions {
         path: options.path,
         hidden: options.hidden,
@@ -179,13 +219,33 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
 
     let mut files_to_index = Vec::new();
     let mut skipped_files = discovery.skipped_files;
+    let mut manifest_stamps_refreshed = false;
     for file in discovery.files {
         ensure_deadline(deadline)?;
+        // Metadata fast-path: a race-free recorded stamp matching the observed size+mtime
+        // proves the recorded content hash is current without reading the file.
+        let observed_mtime_nanos = file.modified.and_then(mtime_unix_nanos);
+        if !options.force
+            && let Some(nanos) = observed_mtime_nanos
+            && manifest.is_current_by_stamp(&file.relative_path, file.size, nanos)
+        {
+            continue;
+        }
         let bytes = tokio::fs::read(&file.absolute_path)
             .await
             .with_context(|| format!("failed to read {}", file.absolute_path.display()))?;
         let file_hash = hash_bytes(&bytes);
         if !options.force && manifest.is_current(&file.relative_path, &file_hash) {
+            // Content unchanged but the stamp was missing or stale (e.g. a manifest written by
+            // an older build, or a touch without a content change): refresh it so future runs
+            // take the fast path instead of re-reading and re-hashing.
+            if manifest.refresh_stamp(
+                &file.relative_path,
+                Some(file.size),
+                recordable_stamp(file.modified, stamp_observation_floor),
+            ) {
+                manifest_stamps_refreshed = true;
+            }
             continue;
         }
         let source = match String::from_utf8(bytes) {
@@ -200,12 +260,18 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
             skipped_files = skipped_files.saturating_add(1);
             continue;
         }
-        files_to_index.push((file.relative_path, file_hash, chunks));
+        files_to_index.push(PendingFile {
+            relative_path: file.relative_path,
+            file_hash,
+            size: file.size,
+            mtime_unix_nanos: recordable_stamp(file.modified, stamp_observation_floor),
+            chunks,
+        });
     }
 
     let total_chunks = files_to_index
         .iter()
-        .map(|(_, _, chunks)| chunks.len())
+        .map(|file| file.chunks.len())
         .sum::<usize>();
 
     let mut updated_files = 0usize;
@@ -214,8 +280,10 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
 
     if total_chunks == 0 {
         // Nothing changed and nothing went stale: skip the store round trip and the manifest
-        // rewrite entirely. Both would be byte-identical no-ops.
-        if !stale_paths.is_empty() {
+        // rewrite entirely. Both would be byte-identical no-ops. Refreshed stamps still need
+        // persisting so future runs keep the metadata fast path.
+        let had_stale_paths = !stale_paths.is_empty();
+        if had_stale_paths {
             if let (Some(table), Some(dim)) = (manifest.table_name.clone(), manifest.vector_dim) {
                 let store =
                     SemanticStore::open_existing(backend, &scope.index_dir, &table, dim).await?;
@@ -225,6 +293,8 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
                     .context("failed to delete stale semantic chunks")?;
             }
             manifest.remove_paths(stale_paths);
+        }
+        if had_stale_paths || manifest_stamps_refreshed {
             save_manifest(
                 &manifest,
                 backend,
@@ -271,7 +341,7 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
 
     let changed_paths = files_to_index
         .iter()
-        .map(|(path, _, _)| path.clone())
+        .map(|file| file.relative_path.clone())
         .chain(stale_paths.iter().cloned())
         .collect::<Vec<_>>();
     deleted_chunks = manifest.chunk_count_for_paths(changed_paths.iter());
@@ -287,12 +357,13 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
     let mut embedding_iter = embeddings.into_iter();
     let mut records = Vec::with_capacity(total_chunks);
     let mut manifest_updates = Vec::with_capacity(files_to_index.len());
-    for (path, file_hash, chunks) in files_to_index {
-        let chunk_ids = chunks
+    for file in files_to_index {
+        let chunk_ids = file
+            .chunks
             .iter()
             .map(|chunk| chunk.chunk_id.clone())
             .collect::<Vec<_>>();
-        for chunk in chunks {
+        for chunk in file.chunks {
             let embedding = embedding_iter
                 .next()
                 .ok_or_else(|| anyhow!("missing semantic embedding for indexed chunk"))?;
@@ -304,7 +375,13 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
                 indexed_at: indexed_at_record.clone(),
             });
         }
-        manifest_updates.push((path, file_hash, chunk_ids));
+        manifest_updates.push((
+            file.relative_path,
+            file.file_hash,
+            file.size,
+            file.mtime_unix_nanos,
+            chunk_ids,
+        ));
     }
     if embedding_iter.next().is_some() {
         bail!("FastEmbed returned more document embeddings than requested");
@@ -312,7 +389,7 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
     updated_chunks = records.len();
     store.add_chunks(records).await?;
 
-    for (path, file_hash, chunk_ids) in manifest_updates {
+    for (path, file_hash, size, mtime_nanos, chunk_ids) in manifest_updates {
         updated_files = updated_files.saturating_add(1);
         manifest.files.insert(
             path,
@@ -320,6 +397,8 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
                 file_hash,
                 chunk_ids,
                 indexed_at: indexed_at.clone(),
+                size: Some(size),
+                mtime_unix_nanos: mtime_nanos,
             },
         );
     }
@@ -446,7 +525,7 @@ fn embedding_document(chunk: &CodeChunk) -> String {
 
 async fn embed_index_chunks(
     provider: &FastEmbedProvider,
-    files_to_index: &[(String, String, Vec<CodeChunk>)],
+    files_to_index: &[PendingFile],
     total_chunks: usize,
     deadline: Instant,
 ) -> Result<Vec<Vec<f32>>> {
@@ -455,10 +534,7 @@ async fn embed_index_chunks(
     let mut documents = Vec::with_capacity(batch_size);
     let mut vector_dim = None;
 
-    for chunk in files_to_index
-        .iter()
-        .flat_map(|(_, _, chunks)| chunks.iter())
-    {
+    for chunk in files_to_index.iter().flat_map(|file| file.chunks.iter()) {
         ensure_deadline(deadline)?;
         documents.push(embedding_document(chunk));
         if documents.len() >= batch_size {
@@ -609,8 +685,53 @@ fn _relative_target_for_tests(scope: &WorkspaceScope) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexSummary, SearchResult, SearchSummary, embedding_document};
+    use super::{
+        IndexSummary, STAMP_RACY_SLACK, SearchResult, SearchSummary, embedding_document,
+        mtime_unix_nanos, recordable_stamp,
+    };
     use crate::chunking::CodeChunk;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn recordable_stamp_rejects_racy_mtimes() {
+        let floor = SystemTime::now();
+
+        // No mtime at all: nothing to record.
+        assert_eq!(recordable_stamp(None, floor), None);
+        // Modified at the observation floor: racy.
+        assert_eq!(recordable_stamp(Some(floor), floor), None);
+        // Modified inside the slack window: racy.
+        assert_eq!(
+            recordable_stamp(Some(floor - Duration::from_secs(1)), floor),
+            None
+        );
+        // Modified in the future (clock skew): racy.
+        assert_eq!(
+            recordable_stamp(Some(floor + Duration::from_secs(60)), floor),
+            None
+        );
+
+        // Exactly at the slack boundary: recordable.
+        let boundary = floor - STAMP_RACY_SLACK;
+        assert_eq!(
+            recordable_stamp(Some(boundary), floor),
+            mtime_unix_nanos(boundary)
+        );
+        assert!(recordable_stamp(Some(boundary), floor).is_some());
+
+        // Comfortably old: recordable and equal to the raw conversion.
+        let old = floor - Duration::from_secs(3600);
+        assert_eq!(recordable_stamp(Some(old), floor), mtime_unix_nanos(old));
+    }
+
+    #[test]
+    fn mtime_unix_nanos_rejects_pre_epoch_times() {
+        assert_eq!(
+            mtime_unix_nanos(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
+            None
+        );
+        assert!(mtime_unix_nanos(SystemTime::UNIX_EPOCH + Duration::from_secs(1)).is_some());
+    }
 
     #[test]
     fn index_payload_reports_indexed_and_updated_counts() {

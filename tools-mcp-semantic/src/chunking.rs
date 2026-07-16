@@ -423,6 +423,8 @@ mod tests {
             absolute_path: PathBuf::from(path),
             relative_path: path.to_string(),
             language: language.to_string(),
+            size: 0,
+            modified: None,
         }
     }
 

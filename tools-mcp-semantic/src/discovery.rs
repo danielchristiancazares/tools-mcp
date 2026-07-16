@@ -50,6 +50,10 @@ pub(crate) struct FileCandidate {
     pub(crate) absolute_path: PathBuf,
     pub(crate) relative_path: String,
     pub(crate) language: String,
+    /// Size observed by the discovery walk's metadata probe.
+    pub(crate) size: u64,
+    /// Modified time observed by the discovery walk's metadata probe.
+    pub(crate) modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +269,8 @@ fn file_candidate(workspace: &Path, path: &Path) -> Result<Option<FileCandidate>
         absolute_path: path.to_path_buf(),
         relative_path: storage_relative_path(workspace, path)?,
         language: language.to_string(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
     }))
 }
 
