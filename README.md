@@ -55,6 +55,7 @@ Each row links to the tool's design contract under [`docs/tools/`](./docs/README
 | Move or rename a file or directory | **Tool name**: `Move` | [docs/tools/move.md](./docs/tools/move.md) |
 | Copy a file or directory | **Tool name**: `Copy` | [docs/tools/copy.md](./docs/tools/copy.md) |
 | List directory entries | **Tool name**: `ListDir` | [docs/tools/list-dir.md](./docs/tools/list-dir.md) |
+| Count extension files and non-empty lines by child directory | **Tool name**: `CountLines` | [docs/tools/count-lines.md](./docs/tools/count-lines.md) |
 | Find files by glob pattern | **Tool name**: `Glob` | [docs/tools/glob.md](./docs/tools/glob.md) |
 | Extract source structure (Rust, TS/JS, Python, Go, C++, Markdown) | **Tool name**: `Outline` | [docs/tools/outline.md](./docs/tools/outline.md) |
 | Run PowerShell commands **(gated: `MCP_ENABLE_PWSH_TOOL=true`)** | **Tool name**: `Pwsh` | [docs/tools/pwsh.md](./docs/tools/pwsh.md) |

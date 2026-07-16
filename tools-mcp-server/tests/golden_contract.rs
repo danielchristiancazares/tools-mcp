@@ -36,6 +36,7 @@ fn expected_tool_names_without_pwsh() -> BTreeSet<String> {
         "Move",
         "Copy",
         "ListDir",
+        "CountLines",
         "Glob",
         "Outline",
         "git_snapshot",
@@ -382,6 +383,23 @@ fn golden_all_object_tool_schemas_disallow_unknown_fields() {
             );
         }
     }
+}
+
+#[test]
+fn golden_count_lines_schema_exposes_defaults_and_constraints() {
+    let tools = served_tools_without_pwsh();
+    let schema = tool_schema(&tools, "CountLines");
+
+    assert_eq!(schema["required"], json!(["extension"]));
+    assert_eq!(schema_property(schema, "extension")["minLength"], 1);
+    assert_eq!(schema_property(schema, "path")["default"], ".");
+    assert_eq!(schema_property(schema, "path")["minLength"], 1);
+
+    let exclude = schema_property(schema, "exclude");
+    assert_eq!(exclude["default"], json!(["target", ".git", ".claude"]));
+    assert_eq!(exclude["maxItems"], 128);
+    assert_eq!(exclude["uniqueItems"], true);
+    assert_eq!(exclude["items"]["minLength"], 1);
 }
 
 #[test]

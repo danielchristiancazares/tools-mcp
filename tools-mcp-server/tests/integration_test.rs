@@ -111,6 +111,7 @@ fn expected_tool_names_without_pwsh() -> BTreeSet<&'static str> {
         "Move",
         "Copy",
         "ListDir",
+        "CountLines",
         "Glob",
         "Outline",
         "git_snapshot",
@@ -260,6 +261,56 @@ fn test_tools_list() {
     );
     assert_eq!(tool_names, expected_tool_names_without_pwsh());
     assert!(!tool_names.contains("CodeQuery"));
+}
+
+#[test]
+fn test_count_lines_groups_extension_counts_by_directory() {
+    let root = workspace_tempdir("count-lines-");
+    let alpha = root.path().join("alpha");
+    let beta = root.path().join("beta");
+    let empty = root.path().join("empty");
+    std::fs::create_dir_all(alpha.join("src")).expect("create alpha src");
+    std::fs::create_dir_all(alpha.join("target")).expect("create alpha target");
+    std::fs::create_dir_all(&beta).expect("create beta");
+    std::fs::create_dir_all(&empty).expect("create empty");
+    std::fs::create_dir_all(root.path().join("target")).expect("create root target");
+    std::fs::write(alpha.join("src").join("lib.rs"), "one\ntwo\n").expect("write alpha");
+    std::fs::write(alpha.join("target").join("generated.rs"), "ignored\n")
+        .expect("write generated");
+    std::fs::write(beta.join("main.rs"), "one\r\ntwo\r\nthree").expect("write beta");
+    std::fs::write(root.path().join("target").join("root.rs"), "ignored\n")
+        .expect("write root target");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 302,
+        "method": "mcp/tools/call",
+        "params": {
+            "name": "CountLines",
+            "arguments": {
+                "path": root.path().display().to_string(),
+                "extension": ".rs"
+            }
+        }
+    });
+
+    let response = send_mcp_message(&request).expect("CountLines call");
+    let result = &response["result"];
+    assert_eq!(response["id"], 302);
+    assert_eq!(result["isError"], false, "expected success: {result}");
+    assert_eq!(result["extension"], "rs");
+    assert_eq!(result["directory_count"], 3);
+    assert_eq!(result["total_files"], 2);
+    assert_eq!(result["total_lines"], 5);
+    assert_eq!(result["directories"][0]["directory"], "beta");
+    assert_eq!(result["directories"][0]["files"], 1);
+    assert_eq!(result["directories"][0]["lines"], 3);
+    assert_eq!(result["directories"][1]["directory"], "alpha");
+    assert_eq!(result["directories"][1]["files"], 1);
+    assert_eq!(result["directories"][1]["lines"], 2);
+    assert_eq!(result["directories"][2]["directory"], "empty");
+    assert_eq!(result["directories"][2]["files"], 0);
+    assert_eq!(result["directories"][2]["lines"], 0);
 }
 
 #[test]

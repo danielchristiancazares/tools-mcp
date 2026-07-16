@@ -40,6 +40,7 @@ The SDD template is at [`TEMPLATE_TOOL_SDD.md`](./TEMPLATE_TOOL_SDD.md).
 | `Move` | [tools/move.md](./tools/move.md) | Written |
 | `Copy` | [tools/copy.md](./tools/copy.md) | Written |
 | `ListDir` | [tools/list-dir.md](./tools/list-dir.md) | Written |
+| `CountLines` | [tools/count-lines.md](./tools/count-lines.md) | Written |
 | `Glob` | [tools/glob.md](./tools/glob.md) | Written |
 | `Outline` | [tools/outline.md](./tools/outline.md) | Written |
 

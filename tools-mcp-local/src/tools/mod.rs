@@ -1,3 +1,4 @@
+mod count_lines;
 mod delete;
 mod edit;
 mod fileops;
@@ -25,6 +26,7 @@ pub fn register_tools(registry: &mut ToolRegistry) {
     registry.register::<fileops::MoveTool>();
     registry.register::<fileops::CopyTool>();
     registry.register::<fileops::ListDirTool>();
+    registry.register::<count_lines::CountLinesTool>();
     registry.register::<outline::OutlineTool>();
 
     if env::var("MCP_ENABLE_PWSH_TOOL").ok().as_deref() == Some("true") {
