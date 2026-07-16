@@ -2,6 +2,7 @@
 name = "tools-mcp-semantic"
 version.workspace = true
 edition.workspace = true
+autobenches = false
 
 [lib]
 doctest = false
@@ -58,13 +59,13 @@ tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync
 
 [[bench]]
 name = "semantic_cpu"
-path = "benches/semantic.rs"
+path = "benches/semantic_cpu.rs"
 harness = false
 required-features = ["bench-api"]
 
 [[bench]]
 name = "semantic_gpu"
-path = "benches/semantic.rs"
+path = "benches/semantic_gpu.rs"
 harness = false
 required-features = ["bench-api", "gpu-cuda"]
 

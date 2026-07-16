@@ -38,7 +38,7 @@ This branch started by delivering step 2. After the benchmark baseline was captu
 
 ## 2. What the harness measures
 
-Two bench binaries live in `tools-mcp-semantic`, sharing one source file (`benches/semantic.rs`):
+Two bench binaries live in `tools-mcp-semantic`, sharing the harness module in `benches/semantic.rs`:
 
 | Target | Required features | Purpose |
 |---|---|---|
@@ -245,27 +245,27 @@ When enabled, the production `FastEmbedProvider::new` registers the CUDA executi
 
 **Cost:** when `gpu-cuda` is on, cargo unifies `ort/cuda` with fastembed's transitive `ort/download-binaries`, and both features apply. The `download-binaries` side becomes a no-op when `ORT_LIB_LOCATION` is set, so we don't actually pay for a duplicate download.
 
-### 4.5 Two bench targets, one source file
+### 4.5 Two bench targets, one shared harness
 
 ```toml
 [[bench]]
 name = "semantic_cpu"
-path = "benches/semantic.rs"
+path = "benches/semantic_cpu.rs"
 harness = false
 required-features = ["bench-api"]
 
 [[bench]]
 name = "semantic_gpu"
-path = "benches/semantic.rs"
+path = "benches/semantic_gpu.rs"
 harness = false
 required-features = ["bench-api", "gpu-cuda"]
 ```
 
-Both targets point at `benches/semantic.rs`. The source gates GPU-specific behavior internally via `#[cfg(feature = "gpu-cuda")]` (only in `src/embedding.rs::initialize_model`), so the same source file serves both.
+Each target has a tiny driver that imports `benches/semantic.rs` as a module. The shared harness gates GPU-specific behavior internally via `#[cfg(feature = "gpu-cuda")]` (only in `src/embedding.rs::initialize_model`), so both binaries execute the same scenarios.
 
 **Why two targets rather than one:** with one target, switching between CPU and GPU runs requires toggling `required-features` in `Cargo.toml`, which is bad ergonomics for repeatable side-by-side baselines and risks accidentally measuring the wrong configuration. Two targets give clean separate commands.
 
-**Cost:** Cargo emits one warning per bench invocation: `file 'benches/semantic.rs' found to be present in multiple build targets`. It's informational, not an error. The alternative — moving shared logic into `benches/common/mod.rs` with tiny driver files — is more maintenance overhead than it's worth.
+`autobenches = false` prevents Cargo from treating the shared harness module as a standalone benchmark. The separate drivers avoid duplicate-target warnings while adding only the Criterion entry point for each binary.
 
 ### 4.6 `build.rs` for ORT DLL co-location
 
@@ -381,13 +381,9 @@ The only DLL search step that beats `System32` is step 1: the binary's applicati
 
 **Diagnostic value:** without `.error_on_failure()` on the CUDA EP registration, this entire failure would have manifested as "CUDA EP silently fell back to CPU" — bench numbers would have looked CPU-shaped (Section 4.4 covers why `error_on_failure` was added).
 
-### 5.7 (Non-issue, documented for future you) Cargo warning about multiple bench targets
+### 5.7 Cargo warning about multiple bench targets
 
-```
-warning: ... `benches/semantic.rs` found to be present in multiple build targets
-```
-
-Informational. Section 4.5 explains why two targets share the source. The warning is fixed-once-per-build, not per-iteration; the build itself succeeds.
+This warning was removed by giving `semantic_cpu` and `semantic_gpu` separate driver files. Both drivers import the shared `benches/semantic.rs` harness; Section 4.5 describes the layout.
 
 ---
 
@@ -496,12 +492,14 @@ What changed in this branch:
 | Path | Change |
 |---|---|
 | `Cargo.toml` (workspace) | Added `ort = { version = "=2.0.0-rc.12", default-features = false }` to `[workspace.dependencies]`. |
-| `tools-mcp-semantic/Cargo.toml` | Added `bench-api` and `gpu-cuda` features. Added optional `ort` dep. Added two `[[bench]]` entries (`semantic_cpu`, `semantic_gpu`). Added dev-deps for criterion + futures + tempfile + tokio (rt-multi-thread). |
+| `tools-mcp-semantic/Cargo.toml` | Added `bench-api` and `gpu-cuda` features. Added optional `ort` dep. Added two `[[bench]]` entries (`semantic_cpu`, `semantic_gpu`) with explicit driver files. Disabled automatic bench discovery so the shared harness is not treated as a target. Added dev-deps for criterion + futures + tempfile + tokio (rt-multi-thread). |
 | `tools-mcp-semantic/src/lib.rs` | Added `#[cfg(feature = "bench-api")] pub mod bench` wrapping `FastEmbedProvider` for bench access. |
 | `tools-mcp-semantic/src/embedding.rs` | Extracted `batch_size` as a parameter of `embed_prefixed`. Added `embed_documents_with_batch_size` gated on `bench-api`. Added `default_embedding_batch_size()`, returning 32 for CPU/default builds and 128 for `gpu-cuda`. In `initialize_model`, registers CUDA EP via `with_execution_providers([CUDA::default().build().error_on_failure()])` under `#[cfg(feature = "gpu-cuda")]`. |
 | `tools-mcp-semantic/src/model.rs` | Uses `default_embedding_batch_size()` for semantic indexing batch assembly instead of a hardcoded indexing batch constant. |
 | `tools-mcp-semantic/build.rs` | New file. Copies ORT DLLs from `$ORT_LIB_LOCATION` to `target/<profile>/deps/` to defeat the System32 hijack. Conditional on `CARGO_FEATURE_GPU_CUDA` for the CUDA provider DLL. |
-| `tools-mcp-semantic/benches/semantic.rs` | New file. The harness itself. 8 scenarios across 5 groups. |
+| `tools-mcp-semantic/benches/semantic.rs` | New shared harness module. 8 scenarios across 5 groups. |
+| `tools-mcp-semantic/benches/semantic_cpu.rs` | Criterion entry point for the CPU benchmark target. |
+| `tools-mcp-semantic/benches/semantic_gpu.rs` | Criterion entry point for the GPU benchmark target. |
 | `tools-mcp-local/benches/search_memory.rs` | Added `warm_query_large_workspace_with_ignore` scenario + `large_ignored_fixture_dir` helper. |
 | `tools-mcp-semantic/BENCHMARK_HANDOFF.md` | This file. |
 

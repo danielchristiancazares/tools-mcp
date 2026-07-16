@@ -25,8 +25,8 @@
 //!
 //! ## Targets
 //!
-//! Two bench binaries share this source file, isolated by cargo features so each writes its
-//! own release-mode artifact and there's no accidental cross-contamination:
+//! Two bench drivers share this harness module, isolated by cargo features so each writes its own
+//! release-mode artifact and there's no accidental cross-contamination:
 //!
 //! * `semantic_cpu` — requires `bench-api`. Pure CPU. Use as the comparison baseline.
 //! * `semantic_gpu` — requires `bench-api` and `gpu-cuda`. Registers the CUDA execution
@@ -85,7 +85,7 @@
 //! one workspace and one model cache. All scenario fixtures live as sub-paths under that
 //! workspace; the indexed `path` argument is always relative.
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion};
 use serde_json::{Value, json};
 use std::fs;
 use std::hint::black_box;
@@ -619,7 +619,7 @@ fn relative_to_workspace(path: &Path) -> String {
 // Criterion entry
 // ---------------------------------------------------------------------------
 
-fn run_all(c: &mut Criterion) {
+pub(super) fn run_all(c: &mut Criterion) {
     // Prepend GPU DLL paths to PATH before any fastembed code runs so transitive loads of
     // cuDNN / CUDA-runtime extras resolve correctly. Must happen before the runtime spins up.
     ensure_gpu_dll_paths();
@@ -641,6 +641,3 @@ fn run_all(c: &mut Criterion) {
     bench_search_during_background_index(c, &runtime, registry);
     bench_embed_documents_batch_size(c, &runtime);
 }
-
-criterion_group!(benches, run_all);
-criterion_main!(benches);
