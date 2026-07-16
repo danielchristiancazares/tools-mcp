@@ -28,6 +28,9 @@ tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 tools-mcp-core = { path = "../tools-mcp-core" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true

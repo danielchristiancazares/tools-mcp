@@ -623,6 +623,136 @@ pub struct WindowsMetadataChangeMarker {
     creation_time: u64,
     last_write_time: u64,
     file_attributes: u32,
+    /// NTFS ChangeTime and volume/file identity, present only when the stamp
+    /// was captured through an open handle. Stat-built markers carry `None`.
+    handle_info: Option<WindowsHandleChangeInfo>,
+}
+
+#[cfg(windows)]
+impl WindowsMetadataChangeMarker {
+    /// Fields observable from a plain (handle-free) metadata query.
+    fn stat_fields(&self) -> (u64, u64, u32) {
+        (
+            self.creation_time,
+            self.last_write_time,
+            self.file_attributes,
+        )
+    }
+}
+
+/// By-handle change information equivalent to the Unix `ctime`+`dev`/`ino`
+/// marker: `change_time` is NTFS ChangeTime, which the kernel bumps on every
+/// data or metadata write — including `SetFileTime` calls that restore
+/// `last_write_time` — and which callers cannot set directly. Filesystems
+/// that cannot report it yield `None`, keeping byte/hash comparison
+/// authoritative. Filesystems that merely synthesize ChangeTime from the
+/// write time (e.g. exFAT) cannot distinguish an mtime-restoring rewrite
+/// from no change; NTFS is not affected.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowsHandleChangeInfo {
+    change_time: i64,
+    volume_serial: u64,
+    file_id: u128,
+}
+
+/// Upgrades `stamp` with by-handle change information when the platform
+/// supports it. Must be called before the handle's content is read so a write
+/// racing the read leaves the stamp observably stale rather than silently
+/// current.
+#[cfg(windows)]
+fn attach_handle_change_info_to_stamp(stamp: &mut MetadataStamp, file: &fs::File) {
+    if let Some(marker) = stamp.change_marker.as_mut() {
+        marker.handle_info = windows_handle_change_info(file);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_handle_change_info_to_stamp(_stamp: &mut MetadataStamp, _file: &fs::File) {}
+
+/// Minimum age a ChangeTime must have before it is trusted as a change
+/// marker. NTFS updates timestamps with coarse timer resolution (~16 ms), so
+/// a write landing in the same tick as the recorded ChangeTime would be
+/// invisible to a pure equality check — the same racy-timestamp rule as
+/// [`SCOPE_STAMP_RACY_SLACK`] and git's racy-index handling. Too-fresh
+/// observations return `None`, keeping callers on the byte/hash path.
+#[cfg(windows)]
+const WINDOWS_CHANGE_TIME_RACY_GUARD_TICKS: i64 = 100 * 10_000; // 100 ms in 100 ns ticks
+
+/// Queries ChangeTime plus volume/file identity from an open handle.
+/// Returns `None` when the filesystem cannot answer or the ChangeTime is too
+/// recent to be race-free.
+#[cfg(windows)]
+pub(crate) fn windows_handle_change_info(file: &fs::File) -> Option<WindowsHandleChangeInfo> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FILE_ID_INFO, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let handle = file.as_raw_handle() as HANDLE;
+
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            u32::try_from(size_of::<FILE_BASIC_INFO>()).expect("FILE_BASIC_INFO fits in u32"),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let basic = unsafe { basic.assume_init() };
+    if basic.ChangeTime == 0 {
+        return None;
+    }
+    if let Some(now_ticks) = windows_filetime_now_ticks()
+        && basic.ChangeTime > now_ticks.saturating_sub(WINDOWS_CHANGE_TIME_RACY_GUARD_TICKS)
+    {
+        return None;
+    }
+
+    let mut id = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            id.as_mut_ptr().cast(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO fits in u32"),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let id = unsafe { id.assume_init() };
+
+    Some(WindowsHandleChangeInfo {
+        change_time: basic.ChangeTime,
+        volume_serial: id.VolumeSerialNumber,
+        file_id: u128::from_le_bytes(id.FileId.Identifier),
+    })
+}
+
+/// Current system time in FILETIME ticks (100 ns since 1601-01-01), or `None`
+/// if the clock reads before the Unix epoch.
+#[cfg(windows)]
+fn windows_filetime_now_ticks() -> Option<i64> {
+    const UNIX_EPOCH_AS_FILETIME_SECONDS: u64 = 11_644_473_600;
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+
+    let since_unix_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    let seconds = since_unix_epoch
+        .as_secs()
+        .checked_add(UNIX_EPOCH_AS_FILETIME_SECONDS)?;
+    let ticks = seconds
+        .checked_mul(TICKS_PER_SECOND)?
+        .checked_add(u64::from(since_unix_epoch.subsec_nanos()) / 100)?;
+    i64::try_from(ticks).ok()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -653,17 +783,37 @@ fn build_recursive_scope_snapshot(
     for walked in builder.build() {
         check_deadline(deadline)?;
         let entry = walked.map_err(|err| ScopeCacheError::Walk(err.to_string()))?;
+        // The walker's cached metadata matches `symlink_metadata` semantics
+        // when links are not followed (and is free on Windows, where it comes
+        // from the directory enumeration). Followed links keep the explicit
+        // no-follow stat so symlink entries are stamped as links, as before.
+        let walker_metadata = if key.follow {
+            None
+        } else {
+            Some(entry.metadata())
+        };
         let path = entry.into_path();
 
         if path == key.root {
             continue;
         }
 
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent()
+            && !directory_paths.contains(parent)
+        {
             directory_paths.insert(parent.to_path_buf());
         }
 
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = match walker_metadata {
+            Some(Ok(metadata)) => metadata,
+            Some(Err(err)) => {
+                let message = err.to_string();
+                return Err(err
+                    .into_io_error()
+                    .map_or(ScopeCacheError::Walk(message), ScopeCacheError::Io));
+            }
+            None => fs::symlink_metadata(&path)?,
+        };
         let file_type = scope_file_type_from_file_type(&metadata.file_type());
         if matches!(file_type, ScopeFileType::Dir) {
             directory_paths.insert(path.clone());
@@ -789,12 +939,52 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
-    let current = build_ignore_fingerprint(root, directories, no_ignore, deadline)?;
-    Ok(match (expected, current.as_ref()) {
-        (None, None) => None,
-        (Some(expected), Some(current)) => expected.change_reason(current),
-        (Some(_), None) | (None, Some(_)) => Some("ignore_rules_changed"),
-    })
+    // A fingerprint exists exactly when ignore rules apply, so presence must
+    // match between the recorded state and the requested flags.
+    let Some(expected) = expected else {
+        return Ok(if no_ignore {
+            None
+        } else {
+            Some("ignore_rules_changed")
+        });
+    };
+    if no_ignore {
+        return Ok(Some("ignore_rules_changed"));
+    }
+
+    // Merge-join the freshly enumerated control set (sorted BTreeMap order)
+    // against the recorded entries (built in the same order). Each control is
+    // validated in place; content is only re-hashed when its stamp cannot
+    // prove the file unchanged, instead of unconditionally re-reading every
+    // existing ignore file on every query.
+    let controls = enumerate_ignore_controls(root, directories, deadline)?;
+    let mut expected_entries = expected.entries.iter().peekable();
+
+    for (path, reason) in controls {
+        check_deadline(deadline)?;
+        if let Some(entry) = expected_entries.peek()
+            && entry.path < path
+        {
+            // A recorded control vanished from the candidate set.
+            return Ok(Some(entry.reason));
+        }
+        let matching = match expected_entries.peek() {
+            Some(entry) if entry.path == path => {
+                expected_entries.next().expect("peeked entry present")
+            }
+            // Candidate absent from the recorded fingerprint: control set grew.
+            _ => return Ok(Some(reason)),
+        };
+        if !ignore_control_stamp_is_fresh(&path, matching.stamp.as_ref(), deadline)? {
+            return Ok(Some(matching.reason));
+        }
+    }
+
+    if let Some(entry) = expected_entries.next() {
+        return Ok(Some(entry.reason));
+    }
+
+    Ok(None)
 }
 
 pub fn build_ignore_fingerprint<I, P>(
@@ -811,6 +1001,29 @@ where
         return Ok(None);
     }
 
+    let controls = enumerate_ignore_controls(root, directories, deadline)?;
+    let mut entries = Vec::with_capacity(controls.len());
+    for (path, reason) in controls {
+        check_deadline(deadline)?;
+        entries.push(IgnoreFingerprintEntry {
+            stamp: ignore_control_stamp(&path, deadline)?,
+            path,
+            reason,
+        });
+    }
+
+    Ok(Some(IgnoreFingerprint { entries }))
+}
+
+fn enumerate_ignore_controls<I, P>(
+    root: &Path,
+    directories: I,
+    deadline: Instant,
+) -> Result<BTreeMap<PathBuf, &'static str>, ScopeCacheError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
     let mut controls = BTreeMap::<PathBuf, &'static str>::new();
     for directory in directories {
         check_deadline(deadline)?;
@@ -839,39 +1052,130 @@ where
             .entry(root.join(".git").join("info").join("exclude"))
             .or_insert("git_exclude_changed");
     }
-
-    let mut entries = Vec::with_capacity(controls.len());
-    for (path, reason) in controls {
-        check_deadline(deadline)?;
-        entries.push(IgnoreFingerprintEntry {
-            stamp: ignore_control_stamp(&path, deadline)?,
-            path,
-            reason,
-        });
-    }
-
-    Ok(Some(IgnoreFingerprint { entries }))
+    Ok(controls)
 }
 
 fn ignore_control_stamp(
     path: &Path,
     deadline: Instant,
 ) -> Result<Option<IgnoreControlStamp>, ScopeCacheError> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {
-            check_deadline(deadline)?;
-            let mut file = fs::File::open(path)?;
-            let content_hash = content_hash_from_reader(&mut file, metadata.len(), deadline)?;
-            check_deadline(deadline)?;
-            Ok(Some(IgnoreControlStamp {
-                metadata: metadata_stamp_from_metadata(&metadata),
-                content_hash,
-            }))
+    check_deadline(deadline)?;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            // Windows cannot open directories for read without backup
+            // semantics; a non-file control is recorded as absent, matching
+            // the previous stat-first behavior.
+            return match fs::metadata(path) {
+                Ok(metadata) if !metadata.is_file() => Ok(None),
+                _ => Err(ScopeCacheError::Io(err)),
+            };
         }
-        Ok(_) => Ok(None),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(ScopeCacheError::Io(err)),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
     }
+    // Stamp (including by-handle change info) before hashing content so a
+    // write racing the hash leaves the stamp observably stale.
+    let mut stamp = metadata_stamp_from_metadata(&metadata);
+    attach_handle_change_info_to_stamp(&mut stamp, &file);
+    let content_hash = content_hash_from_reader(&mut file, metadata.len(), deadline)?;
+    check_deadline(deadline)?;
+    Ok(Some(IgnoreControlStamp {
+        metadata: stamp,
+        content_hash,
+    }))
+}
+
+/// Returns whether the on-disk state of `path` still matches the recorded
+/// control stamp, re-hashing content only when no trusted change marker
+/// (Unix ctime, Windows by-handle ChangeTime) can prove the file unchanged.
+fn ignore_control_stamp_is_fresh(
+    path: &Path,
+    expected: Option<&IgnoreControlStamp>,
+    deadline: Instant,
+) -> Result<bool, ScopeCacheError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(expected.is_none()),
+        Err(err) => return Err(ScopeCacheError::Io(err)),
+    };
+    if !metadata.is_file() {
+        return Ok(expected.is_none());
+    }
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+
+    // Any stat-visible difference is a change, exactly as the full stamp
+    // comparison concluded before.
+    if expected.metadata.len != metadata.len()
+        || expected.metadata.modified != metadata.modified().ok()
+        || !change_markers_match_stat_fields(expected.metadata.change_marker.as_ref(), &metadata)
+    {
+        return Ok(false);
+    }
+
+    if change_marker_proves_unchanged(&expected.metadata, path) {
+        return Ok(true);
+    }
+
+    // No trusted marker: fall back to the content hash comparison.
+    check_deadline(deadline)?;
+    let mut file = fs::File::open(path)?;
+    let content_hash = content_hash_from_reader(&mut file, metadata.len(), deadline)?;
+    Ok(content_hash == expected.content_hash)
+}
+
+#[cfg(not(windows))]
+fn change_markers_match_stat_fields(
+    expected: Option<&MetadataChangeMarker>,
+    metadata: &fs::Metadata,
+) -> bool {
+    expected.copied() == metadata_change_marker(metadata)
+}
+
+#[cfg(windows)]
+fn change_markers_match_stat_fields(
+    expected: Option<&MetadataChangeMarker>,
+    metadata: &fs::Metadata,
+) -> bool {
+    match (expected, metadata_change_marker(metadata)) {
+        (Some(expected), Some(current)) => expected.stat_fields() == current.stat_fields(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Whether the recorded marker alone proves content unchanged once the
+/// stat-visible fields match. On Unix marker equality includes ctime, which
+/// any rewrite bumps. On Windows this requires re-observing the recorded
+/// by-handle ChangeTime and file identity.
+#[cfg(unix)]
+fn change_marker_proves_unchanged(expected: &MetadataStamp, _path: &Path) -> bool {
+    expected.change_marker.is_some()
+}
+
+#[cfg(windows)]
+fn change_marker_proves_unchanged(expected: &MetadataStamp, path: &Path) -> bool {
+    let Some(expected_handle) = expected
+        .change_marker
+        .as_ref()
+        .and_then(|marker| marker.handle_info)
+    else {
+        return false;
+    };
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    windows_handle_change_info(&file).is_some_and(|current| current == expected_handle)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn change_marker_proves_unchanged(_expected: &MetadataStamp, _path: &Path) -> bool {
+    false
 }
 
 fn content_hash_from_reader<R: Read>(
@@ -985,6 +1289,7 @@ fn metadata_change_marker(metadata: &fs::Metadata) -> Option<MetadataChangeMarke
         creation_time: metadata.creation_time(),
         last_write_time: metadata.last_write_time(),
         file_attributes: metadata.file_attributes(),
+        handle_info: None,
     })
 }
 
@@ -1226,6 +1531,91 @@ mod tests {
                 .all(|entry| !entry.rendered_path.contains("child.txt")),
             "grandchild file must stay outside max_depth=1 snapshot: {:?}",
             snapshot.entries
+        );
+    }
+
+    #[test]
+    fn ignore_fingerprint_validation_reports_changes_and_passes_fresh_state() {
+        let dir = TestDir::new("ignore-fingerprint-validation");
+        write_file(&dir.path().join(".gitignore"), "aaa\n");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let fingerprint = build_ignore_fingerprint(dir.path(), &dirs, false, deadline())
+            .expect("build fingerprint")
+            .expect("ignore rules apply");
+
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                deadline()
+            )
+            .expect("validate unchanged"),
+            None,
+            "unchanged controls must validate as fresh"
+        );
+
+        // Same-length in-place rewrite must be detected.
+        write_file(&dir.path().join(".gitignore"), "bbb\n");
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                deadline()
+            )
+            .expect("validate rewrite"),
+            Some("gitignore_changed"),
+        );
+
+        // Restore, then create a control recorded as absent.
+        write_file(&dir.path().join(".gitignore"), "aaa\n");
+        let fingerprint = build_ignore_fingerprint(dir.path(), &dirs, false, deadline())
+            .expect("rebuild fingerprint")
+            .expect("ignore rules apply");
+        write_file(&dir.path().join(".ignore"), "fresh\n");
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                deadline()
+            )
+            .expect("validate created control"),
+            Some("ignore_file_changed"),
+        );
+    }
+
+    #[test]
+    fn ignore_fingerprint_validation_detects_control_set_growth() {
+        let dir = TestDir::new("ignore-fingerprint-set-growth");
+        write_file(&dir.path().join(".gitignore"), "aaa\n");
+        let subdir = dir.path().join("nested");
+        fs::create_dir_all(&subdir).expect("create nested dir");
+
+        let built_dirs = vec![dir.path().to_path_buf()];
+        let fingerprint = build_ignore_fingerprint(dir.path(), &built_dirs, false, deadline())
+            .expect("build fingerprint")
+            .expect("ignore rules apply");
+
+        // Validating with an extra directory yields candidate controls the
+        // recorded fingerprint has never seen.
+        let grown_dirs = vec![dir.path().to_path_buf(), subdir];
+        let reason = ignore_fingerprint_change_reason(
+            dir.path(),
+            &grown_dirs,
+            false,
+            Some(&fingerprint),
+            deadline(),
+        )
+        .expect("validate grown set");
+        assert!(
+            reason.is_some(),
+            "a grown control set must be reported as changed"
         );
     }
 

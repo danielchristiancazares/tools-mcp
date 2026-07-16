@@ -7,6 +7,8 @@ use super::search_contract::{
 };
 use super::search_file_selection::{FileSelectionError, FileSelector};
 use crate::tools::scope_cache::{IgnoreFingerprint, ignore_fingerprint_change_reason};
+#[cfg(windows)]
+use crate::tools::scope_cache::{WindowsHandleChangeInfo, windows_handle_change_info};
 use memchr::{memchr, memchr_iter, memchr2};
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::{
@@ -50,6 +52,14 @@ const MAX_REGEX_FINITE_LITERAL_BYTES: usize = 64;
 const MAX_REGEX_FINITE_LITERAL_REPEAT_COUNT: usize = 8;
 const MAX_FUZZY_SEED_PARTITION_PLANS: usize = 128;
 const TARGETED_FRESHNESS_FULL_SCAN_INTERVAL_QUERIES: u64 = 32;
+/// Full-scope scans validate every indexed document; the per-document stat and
+/// handle queries are independent, so large sweeps run on a small worker pool.
+const FULL_SCAN_PARALLEL_MIN_DOCS: usize = 64;
+const FULL_SCAN_MAX_PARALLEL_WORKERS: usize = 8;
+/// Index builds read every in-scope file; the per-file open/read/scan work is
+/// independent, so larger scopes load on a small worker pool.
+const SCOPE_LOAD_PARALLEL_MIN_FILES: usize = 32;
+const SCOPE_LOAD_MAX_PARALLEL_WORKERS: usize = 8;
 /// Minimum age a directory stamp must have (relative to the moment it is re-observed) before a
 /// matching stamp is trusted to prove the directory's direct-child membership is unchanged.
 /// Mirrors git's racy-timestamp rule: a membership change in the same coarse mtime granule as
@@ -780,6 +790,12 @@ impl IndexManager {
     }
 
     fn evict_to_capacity(&mut self, limits: IndexCacheLimits) {
+        // Ready-entry/byte counts do not depend on access_order, so skip the
+        // reconcile scan (which clones every key) on the common under-limit
+        // cache hit; reconciliation runs before any eviction decision below.
+        if !self.exceeds_cache_limits(limits) {
+            return;
+        }
         self.reconcile_access_order();
         while self.exceeds_cache_limits(limits) {
             let Some(evicted_key) = self.access_order.pop_front() else {
@@ -1348,6 +1364,22 @@ struct WindowsMetadataChangeMarker {
     creation_time: u64,
     last_write_time: u64,
     file_attributes: u32,
+    /// NTFS ChangeTime and volume/file identity, available only when the stamp
+    /// was captured through an open handle (`attach_handle_change_info`).
+    /// Stat-built markers carry `None` and keep byte comparison authoritative.
+    handle_info: Option<WindowsHandleChangeInfo>,
+}
+
+#[cfg(windows)]
+impl WindowsMetadataChangeMarker {
+    /// Fields observable from a plain (handle-free) metadata query.
+    fn stat_fields(&self) -> (u64, u64, u32) {
+        (
+            self.creation_time,
+            self.last_write_time,
+            self.file_attributes,
+        )
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1366,11 +1398,13 @@ fn acquire_or_reserve_snapshot_build(
     deadline: Instant,
 ) -> Result<SnapshotBuildDecision, MemoryError> {
     let shared = index_manager();
+    // Read the env-derived limits before taking (and while not holding) the
+    // shared manager lock.
+    let cache_limits = index_cache_limits();
     let mut manager = shared.lock();
     let mut build_deduped = false;
 
     loop {
-        let cache_limits = index_cache_limits();
         if let Some(snapshot) = manager.cached_snapshot_with_limits(key, cache_limits) {
             let cache_telemetry = manager.cache_telemetry(cache_limits);
             return Ok(SnapshotBuildDecision::Cached {
@@ -1418,9 +1452,9 @@ fn publish_snapshot_if_absent(
     snapshot: Arc<IndexSnapshot>,
 ) -> (Arc<IndexSnapshot>, IndexCacheTelemetry) {
     let shared = index_manager();
+    let cache_limits = index_cache_limits();
     let (snapshot, cache_telemetry, condvar) = {
         let mut manager = shared.lock();
-        let cache_limits = index_cache_limits();
         let snapshot =
             manager.publish_snapshot_if_absent_with_limits(key.clone(), snapshot, cache_limits);
         let cache_telemetry = manager.cache_telemetry(cache_limits);
@@ -2655,28 +2689,77 @@ fn build_index_with_selector(
     let mut indexed_bytes = 0_u64;
     let mut all_content_utf8 = true;
 
-    for path in discovered_scope.files {
-        check_cancellation(cancel)?;
-        check_deadline(deadline)?;
-        let metadata = fs::metadata(&path).map_err(|err| {
-            MemoryError::new(
-                "search_index_incomplete",
-                "metadata_error",
-                format!("failed to read metadata for {}: {err}", path.display()),
-            )
-        })?;
-        check_deadline(deadline)?;
+    let files = discovered_scope.files;
+    let mut outcomes: Vec<Option<ScopeLoadOutcome>> = Vec::new();
+    outcomes.resize_with(files.len(), || None);
 
-        if !metadata.is_file() {
-            continue;
-        }
-        if metadata.len() > limits.max_file_bytes {
-            return Err(MemoryError::new(
-                "resource_limit_exceeded",
-                "max_file_bytes_exceeded",
-                format!("file exceeds memory search size limit: {}", path.display()),
-            ));
-        }
+    // Load documents in parallel: workers own contiguous ranges writing into
+    // disjoint outcome slots. Approximate byte/file gates stop workers once
+    // the scope clearly exceeds limits; the in-order reduce below stays
+    // authoritative for which error surfaces, so results are identical to the
+    // serial loop. Slots a worker never reached are loaded inline during the
+    // reduce (which returns at the first over-limit file anyway).
+    if files.len() >= SCOPE_LOAD_PARALLEL_MIN_FILES {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            .min(SCOPE_LOAD_MAX_PARALLEL_WORKERS);
+        let range = files.len().div_ceil(workers);
+        let gate_bytes = std::sync::atomic::AtomicU64::new(0);
+        let gate_files = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for (chunk_paths, chunk_slots) in files.chunks(range).zip(outcomes.chunks_mut(range)) {
+                let gate_bytes = &gate_bytes;
+                let gate_files = &gate_files;
+                scope.spawn(move || {
+                    for (path, slot) in chunk_paths.iter().zip(chunk_slots.iter_mut()) {
+                        use std::sync::atomic::Ordering::Relaxed;
+
+                        if gate_bytes.load(Relaxed) > limits.max_total_bytes
+                            || gate_files.load(Relaxed) > limits.max_files
+                        {
+                            break;
+                        }
+                        let outcome =
+                            load_scope_document(path, limits, require_utf8_scope, deadline, cancel);
+                        if let Ok(Some(loaded)) = &outcome {
+                            gate_bytes.fetch_add(loaded.metadata_len, Relaxed);
+                            gate_files.fetch_add(1, Relaxed);
+                        }
+                        let failed = outcome.is_err();
+                        *slot = Some(outcome);
+                        if failed {
+                            // The reduce returns at or before this index, so
+                            // the rest of this range can never be observed.
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    for (path, slot) in files.into_iter().zip(outcomes) {
+        let outcome = match slot {
+            Some(outcome) => outcome,
+            None => load_scope_document(&path, limits, require_utf8_scope, deadline, cancel),
+        };
+        let loaded = match outcome {
+            Ok(Some(loaded)) => Ok(loaded),
+            Ok(None) => continue,
+            Err((ScopeLoadStage::BeforeCumulativeLimits, err)) => return Err(err),
+            Err((ScopeLoadStage::AfterCumulativeLimits { metadata_len }, err)) => {
+                Err((metadata_len, err))
+            }
+        };
+
+        // Cumulative limits are evaluated in file order between the per-file
+        // size check and the content stages, exactly as the serial loop did.
+        let metadata_len = match &loaded {
+            Ok(loaded) => loaded.metadata_len,
+            Err((metadata_len, _)) => *metadata_len,
+        };
         if documents.len() >= limits.max_files {
             return Err(MemoryError::new(
                 "resource_limit_exceeded",
@@ -2684,7 +2767,7 @@ fn build_index_with_selector(
                 "memory search file count limit exceeded",
             ));
         }
-        indexed_bytes = indexed_bytes.checked_add(metadata.len()).ok_or_else(|| {
+        indexed_bytes = indexed_bytes.checked_add(metadata_len).ok_or_else(|| {
             MemoryError::new(
                 "resource_limit_exceeded",
                 "max_total_bytes_exceeded",
@@ -2699,60 +2782,20 @@ fn build_index_with_selector(
             ));
         }
 
-        check_deadline(deadline)?;
-        let content = fs::read(&path).map_err(|err| {
-            MemoryError::new(
-                "search_index_incomplete",
-                "read_error",
-                format!("failed to read {}: {err}", path.display()),
-            )
-        })?;
-        check_deadline(deadline)?;
-        if content_contains_nul(&content) {
-            if require_utf8_scope {
-                return Err(MemoryError::new(
-                    "search_index_incomplete",
-                    "fuzzy_scope_not_utf8",
-                    format!(
-                        "memory fuzzy search requires non-binary UTF-8 text in {}",
-                        path.display()
-                    ),
-                ));
-            }
-            return Err(MemoryError::new(
-                "search_index_incomplete",
-                "binary_file_in_scope",
-                format!(
-                    "memory search cannot prove binary parity for {}",
-                    path.display()
-                ),
-            ));
-        }
-        if std::str::from_utf8(&content).is_err() {
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err((_, err)) => return Err(err),
+        };
+        if !loaded.content_utf8 {
             all_content_utf8 = false;
-            if require_utf8_scope {
-                return Err(MemoryError::new(
-                    "search_index_incomplete",
-                    "fuzzy_scope_not_utf8",
-                    format!(
-                        "memory fuzzy search requires valid UTF-8 text in {}",
-                        path.display()
-                    ),
-                ));
-            }
         }
-
-        check_deadline(deadline)?;
-        let stamp = file_stamp_from_parts_with_deadline(&metadata, deadline)?;
         let rendered_path = selector.render_path(&path);
-        let lines = line_ranges_with_deadline(&content, deadline)?;
-        check_deadline(deadline)?;
         documents.push(Document {
             path,
             rendered_path,
-            stamp,
-            lines,
-            content,
+            stamp: loaded.stamp,
+            lines: loaded.lines,
+            content: loaded.content,
         });
     }
 
@@ -2787,6 +2830,151 @@ fn build_index_with_selector(
         indexed_bytes,
         all_content_utf8,
     })
+}
+
+/// Which side of the order-dependent cumulative limit checks a per-file
+/// error belongs to, so the in-order reduce can interleave them exactly as
+/// the serial loop did.
+enum ScopeLoadStage {
+    BeforeCumulativeLimits,
+    AfterCumulativeLimits { metadata_len: u64 },
+}
+
+struct LoadedScopeDocument {
+    metadata_len: u64,
+    stamp: FileStamp,
+    content: Vec<u8>,
+    lines: Vec<LineRange>,
+    content_utf8: bool,
+}
+
+/// `Ok(None)` is a silently skipped non-file entry.
+type ScopeLoadOutcome = Result<Option<LoadedScopeDocument>, (ScopeLoadStage, MemoryError)>;
+
+/// Performs the per-file portion of index building: open, stamp through the
+/// handle, read, and scan. Free of cross-file state so scopes can load files
+/// concurrently; cumulative limits stay with the caller.
+fn load_scope_document(
+    path: &Path,
+    limits: &Limits,
+    require_utf8_scope: bool,
+    deadline: Instant,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> ScopeLoadOutcome {
+    let before = |err: MemoryError| (ScopeLoadStage::BeforeCumulativeLimits, err);
+
+    check_cancellation(cancel).map_err(before)?;
+    check_deadline(deadline).map_err(before)?;
+    // Open first and stamp through the handle: one open serves the metadata
+    // query, the by-handle change info, and the content read, and it pins the
+    // stamp to the same file object the content comes from.
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(open_err) => {
+            // Preserve the silent skip for non-file entries (Windows cannot
+            // open directories for read without backup semantics).
+            if fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+                return Ok(None);
+            }
+            let (reason, message) = if open_err.kind() == std::io::ErrorKind::NotFound {
+                (
+                    "metadata_error",
+                    format!("failed to read metadata for {}: {open_err}", path.display()),
+                )
+            } else {
+                (
+                    "read_error",
+                    format!("failed to read {}: {open_err}", path.display()),
+                )
+            };
+            return Err(before(MemoryError::new(
+                "search_index_incomplete",
+                reason,
+                message,
+            )));
+        }
+    };
+    let metadata = file.metadata().map_err(|err| {
+        before(MemoryError::new(
+            "search_index_incomplete",
+            "metadata_error",
+            format!("failed to read metadata for {}: {err}", path.display()),
+        ))
+    })?;
+    check_deadline(deadline).map_err(before)?;
+
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    if metadata.len() > limits.max_file_bytes {
+        return Err(before(MemoryError::new(
+            "resource_limit_exceeded",
+            "max_file_bytes_exceeded",
+            format!("file exceeds memory search size limit: {}", path.display()),
+        )));
+    }
+
+    let metadata_len = metadata.len();
+    let after =
+        move |err: MemoryError| (ScopeLoadStage::AfterCumulativeLimits { metadata_len }, err);
+
+    check_deadline(deadline).map_err(after)?;
+    // Stamp (including by-handle change info) before reading content so a
+    // write racing the read leaves the stamp observably stale rather than
+    // silently current.
+    let mut stamp = file_stamp_from_parts_with_deadline(&metadata, deadline).map_err(after)?;
+    attach_handle_change_info(&mut stamp, &file);
+    let mut content = Vec::with_capacity(usize::try_from(metadata_len).unwrap_or(0));
+    file.read_to_end(&mut content).map_err(|err| {
+        after(MemoryError::new(
+            "search_index_incomplete",
+            "read_error",
+            format!("failed to read {}: {err}", path.display()),
+        ))
+    })?;
+    check_deadline(deadline).map_err(after)?;
+    if content_contains_nul(&content) {
+        if require_utf8_scope {
+            return Err(after(MemoryError::new(
+                "search_index_incomplete",
+                "fuzzy_scope_not_utf8",
+                format!(
+                    "memory fuzzy search requires non-binary UTF-8 text in {}",
+                    path.display()
+                ),
+            )));
+        }
+        return Err(after(MemoryError::new(
+            "search_index_incomplete",
+            "binary_file_in_scope",
+            format!(
+                "memory search cannot prove binary parity for {}",
+                path.display()
+            ),
+        )));
+    }
+    let content_utf8 = std::str::from_utf8(&content).is_ok();
+    if !content_utf8 && require_utf8_scope {
+        return Err(after(MemoryError::new(
+            "search_index_incomplete",
+            "fuzzy_scope_not_utf8",
+            format!(
+                "memory fuzzy search requires valid UTF-8 text in {}",
+                path.display()
+            ),
+        )));
+    }
+
+    check_deadline(deadline).map_err(after)?;
+    let lines = line_ranges_with_deadline(&content, deadline).map_err(after)?;
+    check_deadline(deadline).map_err(after)?;
+    Ok(Some(LoadedScopeDocument {
+        metadata_len,
+        stamp,
+        content,
+        lines,
+        content_utf8,
+    }))
 }
 
 #[cfg(test)]
@@ -3412,7 +3600,9 @@ fn union_postings(
     let mut left_index = 0;
     let mut right_index = 0;
     while left_index < left.len() && right_index < right.len() {
-        check_deadline(deadline)?;
+        if (left_index + right_index).is_multiple_of(POSTINGS_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         match left[left_index].cmp(&right[right_index]) {
             std::cmp::Ordering::Equal => {
                 push_candidate(&mut merged, left[left_index], max_candidates)?;
@@ -3429,12 +3619,16 @@ fn union_postings(
             }
         }
     }
-    for &candidate in &left[left_index..] {
-        check_deadline(deadline)?;
+    for (offset, &candidate) in left[left_index..].iter().enumerate() {
+        if offset.is_multiple_of(POSTINGS_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         push_candidate(&mut merged, candidate, max_candidates)?;
     }
-    for &candidate in &right[right_index..] {
-        check_deadline(deadline)?;
+    for (offset, &candidate) in right[right_index..].iter().enumerate() {
+        if offset.is_multiple_of(POSTINGS_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         push_candidate(&mut merged, candidate, max_candidates)?;
     }
     Ok(merged)
@@ -3450,7 +3644,9 @@ fn intersect_doc_id_sets(
     let mut left_index = 0;
     let mut right_index = 0;
     while left_index < left.len() && right_index < right.len() {
-        check_deadline(deadline)?;
+        if (left_index + right_index).is_multiple_of(POSTINGS_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         match left[left_index].cmp(&right[right_index]) {
             std::cmp::Ordering::Equal => {
                 result.push(left[left_index]);
@@ -3612,7 +3808,9 @@ fn candidates_for_short_literal_direct_scan(
         check_deadline(deadline)?;
         let mut doc_matches = false;
         for range in &doc.lines {
-            check_deadline(deadline)?;
+            if scanned_lines.is_multiple_of(LINE_VERIFY_DEADLINE_CHECK_STRIDE) {
+                check_deadline(deadline)?;
+            }
             record_short_literal_scan_line(
                 &mut scanned_lines,
                 limits.max_short_literal_scan_lines,
@@ -4006,6 +4204,9 @@ fn check_targeted_snapshot_fresh(
         if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
             continue;
         }
+        if file_stamp_matches_via_handle_refresh(&doc.stamp, &metadata, &doc.path) {
+            continue;
+        }
 
         validate_result_file_content_matches(doc, &metadata, deadline)?;
     }
@@ -4085,28 +4286,80 @@ fn check_snapshot_fresh(
         ));
     }
 
-    for doc in &snapshot.documents {
-        check_deadline(deadline)?;
-        let metadata = fs::metadata(&doc.path).map_err(|err| {
-            MemoryError::new(
-                "file_changed_during_verification",
-                "file_changed_during_verification",
-                format!(
-                    "failed to re-read metadata for {}: {err}",
-                    doc.path.display()
-                ),
-            )
-        })?;
-        check_deadline(deadline)?;
-        stats.indexed_files_checked = stats.indexed_files_checked.saturating_add(1);
-        if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
-            continue;
-        }
-
-        validate_result_file_content_matches(doc, &metadata, deadline)?;
-    }
+    validate_indexed_documents_fresh(&snapshot.documents, deadline)?;
+    stats.indexed_files_checked = stats
+        .indexed_files_checked
+        .saturating_add(snapshot.documents.len());
 
     Ok(stats)
+}
+
+/// Validates that every indexed document is unchanged on disk.
+///
+/// Documents are checked in parallel above [`FULL_SCAN_PARALLEL_MIN_DOCS`]:
+/// each worker owns a contiguous chunk and checks it in order, and chunk
+/// results are consumed in index order, so the returned error is the same
+/// first-failing-document error the serial loop would produce.
+fn validate_indexed_documents_fresh(
+    documents: &[Document],
+    deadline: Instant,
+) -> Result<(), MemoryError> {
+    if documents.len() < FULL_SCAN_PARALLEL_MIN_DOCS {
+        for doc in documents {
+            validate_indexed_document_fresh(doc, deadline)?;
+        }
+        return Ok(());
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+        .min(FULL_SCAN_MAX_PARALLEL_WORKERS);
+    let chunk_size = documents.len().div_ceil(workers);
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = documents
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    for doc in chunk {
+                        validate_indexed_document_fresh(doc, deadline)?;
+                    }
+                    Ok::<(), MemoryError>(())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("freshness validation worker panicked")?;
+        }
+        Ok(())
+    })
+}
+
+fn validate_indexed_document_fresh(doc: &Document, deadline: Instant) -> Result<(), MemoryError> {
+    check_deadline(deadline)?;
+    let metadata = fs::metadata(&doc.path).map_err(|err| {
+        MemoryError::new(
+            "file_changed_during_verification",
+            "file_changed_during_verification",
+            format!(
+                "failed to re-read metadata for {}: {err}",
+                doc.path.display()
+            ),
+        )
+    })?;
+    check_deadline(deadline)?;
+    if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
+        return Ok(());
+    }
+    if file_stamp_matches_via_handle_refresh(&doc.stamp, &metadata, &doc.path) {
+        return Ok(());
+    }
+
+    validate_result_file_content_matches(doc, &metadata, deadline)
 }
 
 fn check_snapshot_file_set(
@@ -4962,9 +5215,12 @@ fn seed_byte_len(byte_offsets: &[usize], start_scalar: usize, end_scalar: usize)
 }
 
 fn char_count_exceeds(text: &str, limit: usize, deadline: Instant) -> Result<bool, MemoryError> {
+    check_deadline(deadline)?;
     let mut count = 0_usize;
     for _ in text.chars() {
-        check_deadline(deadline)?;
+        if count.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         count = count.saturating_add(1);
         if count > limit {
             return Ok(true);
@@ -4974,9 +5230,12 @@ fn char_count_exceeds(text: &str, limit: usize, deadline: Instant) -> Result<boo
 }
 
 fn collect_chars_with_deadline(text: &str, deadline: Instant) -> Result<Vec<char>, MemoryError> {
-    let mut chars = Vec::new();
-    for ch in text.chars() {
-        check_deadline(deadline)?;
+    check_deadline(deadline)?;
+    let mut chars = Vec::with_capacity(text.len());
+    for (index, ch) in text.chars().enumerate() {
+        if index.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         chars.push(ch);
     }
     Ok(chars)
@@ -5142,7 +5401,9 @@ fn bounded_edit_distance(
     }
 
     for (left_index, left_char) in left.iter().enumerate() {
-        check_deadline(deadline)?;
+        if left_index.is_multiple_of(FUZZY_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         let row = left_index + 1;
         let min_column = row.saturating_sub(max_distance).max(1);
         let max_column = row.saturating_add(max_distance).min(right.len());
@@ -5211,7 +5472,12 @@ fn render_line_indexes_with_deadline(
         deadline,
         |start, end| {
             for line in start..=end {
-                check_deadline(deadline)?;
+                if lines
+                    .len()
+                    .is_multiple_of(LINE_VERIFY_DEADLINE_CHECK_STRIDE)
+                {
+                    check_deadline(deadline)?;
+                }
                 lines.push(line);
             }
             Ok(false)
@@ -5256,8 +5522,10 @@ fn for_each_render_interval(
     mut emit: impl FnMut(usize, usize) -> Result<bool, MemoryError>,
 ) -> Result<bool, MemoryError> {
     let mut current_interval: Option<(usize, usize)> = None;
-    for &match_line in matched_lines {
-        check_deadline(deadline)?;
+    for (visited, &match_line) in matched_lines.iter().enumerate() {
+        if visited.is_multiple_of(LINE_VERIFY_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         let Some((start, end)) = render_interval(match_line, line_count, context) else {
             continue;
         };
@@ -5321,8 +5589,10 @@ where
         matched_lines.next();
     }
 
-    for line_index in start..=end {
-        check_deadline(deadline)?;
+    for (offset, line_index) in (start..=end).enumerate() {
+        if offset.is_multiple_of(LINE_VERIFY_DEADLINE_CHECK_STRIDE) {
+            check_deadline(deadline)?;
+        }
         let is_match = matched_lines
             .peek()
             .is_some_and(|matched_line| *matched_line == line_index);
@@ -5662,13 +5932,69 @@ fn metadata_change_marker(metadata: &fs::Metadata) -> Option<MetadataChangeMarke
     use std::os::windows::fs::MetadataExt;
 
     // Stable Rust exposes Windows creation, write-time, and attribute metadata,
-    // but not file_index/change_time. Use the stable fields as a no-dependency
-    // identity/change marker and keep byte comparison as the authoritative guard.
+    // but not file_index/change_time; those require a handle-based query and are
+    // attached separately via `attach_handle_change_info`. Stamps without them
+    // keep byte comparison as the authoritative guard.
     Some(WindowsMetadataChangeMarker {
         creation_time: metadata.creation_time(),
         last_write_time: metadata.last_write_time(),
         file_attributes: metadata.file_attributes(),
+        handle_info: None,
     })
+}
+
+/// Upgrades `stamp` with by-handle change information when the platform
+/// supports it. Must be called before the handle's content is read so a write
+/// racing the read leaves the stamp observably stale rather than silently
+/// current.
+#[cfg(windows)]
+fn attach_handle_change_info(stamp: &mut FileStamp, file: &fs::File) {
+    if let Some(marker) = stamp.change_marker.as_mut() {
+        marker.handle_info = windows_handle_change_info(file);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_handle_change_info(_stamp: &mut FileStamp, _file: &fs::File) {}
+
+/// Windows counterpart of the Unix no-hash fast path: a stamp that captured
+/// by-handle change information can prove the file unchanged by re-observing
+/// the same ChangeTime and file identity, skipping the content re-read.
+/// Any failure along the way returns `false`, falling back to byte validation.
+#[cfg(windows)]
+fn file_stamp_matches_via_handle_refresh(
+    stamp: &FileStamp,
+    metadata: &fs::Metadata,
+    path: &Path,
+) -> bool {
+    let Some(expected_marker) = stamp.change_marker.as_ref() else {
+        return false;
+    };
+    let Some(expected_handle) = expected_marker.handle_info else {
+        return false;
+    };
+    if stamp.len != metadata.len() || stamp.modified != metadata.modified().ok() {
+        return false;
+    }
+    let Some(current_marker) = metadata_change_marker(metadata) else {
+        return false;
+    };
+    if expected_marker.stat_fields() != current_marker.stat_fields() {
+        return false;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    windows_handle_change_info(&file).is_some_and(|current| current == expected_handle)
+}
+
+#[cfg(not(windows))]
+fn file_stamp_matches_via_handle_refresh(
+    _stamp: &FileStamp,
+    _metadata: &fs::Metadata,
+    _path: &Path,
+) -> bool {
+    false
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -8423,6 +8749,139 @@ mod tests {
 
         assert!(!metadata_stamp_can_validate_without_hash(&stamp));
         assert!(!file_metadata_matches_without_hash(&stamp, &metadata));
+        // Stat-built stamps carry no handle info, so the handle fast path
+        // must refuse them as well.
+        assert!(!file_stamp_matches_via_handle_refresh(
+            &stamp, &metadata, &file_path
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_handle_stamp_validates_unchanged_file_without_byte_read() {
+        let root = workspace_test_dir("windows_handle_stamp_validates_unchanged_file");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        let file_path = root.join("sample.txt");
+        fs::write(&file_path, "needle\n").expect("write initial file");
+        // Age the file past the racy-ChangeTime guard so the stamp is trusted.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let file = fs::File::open(&file_path).expect("open");
+        let metadata = file.metadata().expect("handle metadata");
+        let mut stamp = file_stamp_from_parts(&metadata);
+        attach_handle_change_info(&mut stamp, &file);
+        drop(file);
+
+        assert!(
+            stamp
+                .change_marker
+                .as_ref()
+                .is_some_and(|marker| marker.handle_info.is_some()),
+            "NTFS must provide by-handle change info"
+        );
+
+        let fresh = fs::metadata(&file_path).expect("fresh metadata");
+        assert!(file_stamp_matches_via_handle_refresh(
+            &stamp, &fresh, &file_path
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_handle_stamp_rejects_mtime_restoring_rewrite() {
+        use std::fs::FileTimes;
+        use std::os::windows::fs::FileTimesExt;
+
+        let root = workspace_test_dir("windows_handle_stamp_rejects_mtime_restoring_rewrite");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        let file_path = root.join("sample.txt");
+        fs::write(&file_path, "needle\n").expect("write initial file");
+        // Age the file past the racy-ChangeTime guard so the stamp is trusted.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let file = fs::File::open(&file_path).expect("open");
+        let metadata = file.metadata().expect("handle metadata");
+        let mut stamp = file_stamp_from_parts(&metadata);
+        attach_handle_change_info(&mut stamp, &file);
+        let original_modified = metadata.modified().expect("modified");
+        let original_accessed = metadata.accessed().expect("accessed");
+        let original_created = metadata.created().expect("created");
+        drop(file);
+
+        // Same-length rewrite, then restore every stat-visible timestamp to
+        // forge an "unchanged" stat view.
+        fs::write(&file_path, "change\n").expect("same-length rewrite");
+        let restore = fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .expect("open for time restore");
+        restore
+            .set_times(
+                FileTimes::new()
+                    .set_modified(original_modified)
+                    .set_accessed(original_accessed)
+                    .set_created(original_created),
+            )
+            .expect("restore times");
+        drop(restore);
+
+        let fresh = fs::metadata(&file_path).expect("fresh metadata");
+        // Prove the forgery produced a stat view identical to the stamp...
+        assert_eq!(stamp.len, fresh.len());
+        assert_eq!(stamp.modified, fresh.modified().ok());
+        assert_eq!(
+            stamp.change_marker.as_ref().expect("marker").stat_fields(),
+            metadata_change_marker(&fresh)
+                .expect("fresh marker")
+                .stat_fields(),
+        );
+        // ...and that ChangeTime still exposes the rewrite.
+        assert!(!file_stamp_matches_via_handle_refresh(
+            &stamp, &fresh, &file_path
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_build_index_stamps_carry_handle_info() {
+        let root = workspace_test_dir("windows_build_index_stamps_carry_handle_info");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test dir");
+        fs::write(root.join("match.txt"), "needle\n").expect("write matching file");
+        // Age the file past the racy-ChangeTime guard so the stamp is trusted.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let req = memory_req(&root).normalize();
+        let snapshot = build_index(
+            &req,
+            &test_limits(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+            1,
+        )
+        .expect("index");
+        let doc = snapshot.documents.first().expect("indexed document");
+
+        assert!(
+            doc.stamp
+                .change_marker
+                .as_ref()
+                .is_some_and(|marker| marker.handle_info.is_some()),
+            "index-built stamps must carry by-handle change info"
+        );
+
+        let fresh = fs::metadata(&doc.path).expect("fresh metadata");
+        assert!(file_stamp_matches_via_handle_refresh(
+            &doc.stamp, &fresh, &doc.path
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
