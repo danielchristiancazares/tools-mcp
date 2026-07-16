@@ -213,22 +213,26 @@ pub(crate) async fn index_workspace(options: IndexOptions) -> Result<IndexSummar
     let mut deleted_chunks = manifest.chunk_count_for_paths(stale_paths.iter());
 
     if total_chunks == 0 {
-        if let (Some(table), Some(dim)) = (manifest.table_name.clone(), manifest.vector_dim) {
-            let store =
-                SemanticStore::open_existing(backend, &scope.index_dir, &table, dim).await?;
-            store
-                .delete_paths(&workspace_key(&scope), &stale_paths)
-                .await
-                .context("failed to delete stale semantic chunks")?;
+        // Nothing changed and nothing went stale: skip the store round trip and the manifest
+        // rewrite entirely. Both would be byte-identical no-ops.
+        if !stale_paths.is_empty() {
+            if let (Some(table), Some(dim)) = (manifest.table_name.clone(), manifest.vector_dim) {
+                let store =
+                    SemanticStore::open_existing(backend, &scope.index_dir, &table, dim).await?;
+                store
+                    .delete_paths(&workspace_key(&scope), &stale_paths)
+                    .await
+                    .context("failed to delete stale semantic chunks")?;
+            }
+            manifest.remove_paths(stale_paths);
+            save_manifest(
+                &manifest,
+                backend,
+                &scope.index_dir,
+                model_slug,
+                manifest_file,
+            )?;
         }
-        manifest.remove_paths(stale_paths);
-        save_manifest(
-            &manifest,
-            backend,
-            &scope.index_dir,
-            model_slug,
-            manifest_file,
-        )?;
         let (indexed_files, indexed_chunks) = indexed_counts_under(&manifest, &scope.target_filter);
         let store_path = manifest
             .table_name
