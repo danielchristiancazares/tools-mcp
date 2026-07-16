@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "read_file_memory"
 harness = false
+
+[[bench]]
+name = "glob_memory"
+harness = false

@@ -91,6 +91,26 @@ fn expand_single_brace(pattern: &str) -> Result<Option<Vec<String>>, String> {
     Ok(None)
 }
 
+/// Returns the literal tail of `pattern` after the last glob metacharacter,
+/// usable as a cheap `ends_with` prefilter before full glob matching.
+///
+/// Returns `None` (no prefilter) unless the tail is non-empty, contains no
+/// path separators (glob matching treats `/` and `\` as equivalent, which a
+/// byte comparison would not), and matching is case-sensitive. `]` is treated
+/// as a metacharacter so a tail is never taken from inside a `[...]` class.
+fn required_literal_suffix(pattern: &str) -> Option<&str> {
+    let tail_start = pattern
+        .rfind(['*', '?', '[', ']'])
+        .map_or(0, |index| index + 1);
+    let suffix = &pattern[tail_start..];
+
+    if suffix.is_empty() || suffix.contains(is_glob_separator) {
+        return None;
+    }
+
+    Some(suffix)
+}
+
 fn glob_traversal_max_depth(patterns: &[String]) -> Option<usize> {
     let mut max_depth = 0;
 
@@ -255,6 +275,19 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
         }
     };
 
+    // Precompute a required literal suffix per pattern (e.g. ".rs" for "**/*.rs")
+    // so most non-matching entries are rejected with one byte comparison instead
+    // of a full backtracking glob match.
+    let pattern_suffixes: Vec<Option<&str>> = expanded
+        .iter()
+        .map(|pattern| {
+            match_options
+                .case_sensitive
+                .then(|| required_literal_suffix(pattern))
+                .flatten()
+        })
+        .collect();
+
     let mut files: Vec<String> = Vec::with_capacity(limit.min(snapshot.entries.len()));
     let mut truncated = false;
 
@@ -265,12 +298,18 @@ async fn handle_glob(_id: Option<Value>, args: Value) -> ToolCallOutcome {
             continue;
         }
 
-        let rel_path = Path::new(entry.rendered_path.as_str());
-
         // Check if the relative path matches any of the expanded patterns.
-        let matches = patterns
-            .iter()
-            .any(|p| p.matches_path_with(rel_path, match_options));
+        // `rendered_path` is already the relative path as a UTF-8 string, so
+        // matching the string directly is equivalent to `matches_path_with`
+        // (which round-trips through `Path::to_str`).
+        let matches = patterns.iter().zip(&pattern_suffixes).any(|(p, suffix)| {
+            if let Some(suffix) = suffix
+                && !entry.rendered_path.ends_with(suffix)
+            {
+                return false;
+            }
+            p.matches_with(&entry.rendered_path, match_options)
+        });
         if !matches {
             continue;
         }
@@ -405,6 +444,72 @@ mod tests {
 
         let err = expand_braces(&pattern).expect_err("expected expansion limit failure");
         assert!(err.contains(&MAX_EXPANDED_PATTERNS.to_string()));
+    }
+
+    #[test]
+    fn required_literal_suffix_extracts_conservative_tails() {
+        use super::required_literal_suffix;
+
+        assert_eq!(required_literal_suffix("**/*.rs"), Some(".rs"));
+        assert_eq!(required_literal_suffix("src/*.ts"), Some(".ts"));
+        assert_eq!(required_literal_suffix("README.md"), Some("README.md"));
+        // Tail inside or ending a character class must not become a prefilter.
+        assert_eq!(required_literal_suffix("*.r[sx]"), None);
+        // Separators in the tail are excluded: glob treats `/` and `\` as equal.
+        assert_eq!(required_literal_suffix("docs/README.md"), None);
+        assert_eq!(required_literal_suffix("src/**"), None);
+        assert_eq!(required_literal_suffix("*?"), None);
+    }
+
+    #[test]
+    fn required_literal_suffix_never_rejects_a_matching_path() {
+        use super::required_literal_suffix;
+        use glob::{MatchOptions, Pattern};
+
+        let options = MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: true,
+        };
+        let patterns = [
+            "**/*.rs",
+            "*.r[sx]",
+            "src/*.ts",
+            "README.md",
+            "docs/*.md",
+            "a?c.txt",
+            "*",
+            "file.[tx]xt",
+        ];
+        let paths = [
+            "lib.rs",
+            "a.rx",
+            "a.rs",
+            "src\\x.ts",
+            "src/x.ts",
+            "README.md",
+            "docs\\guide.md",
+            "docs/guide.md",
+            "abc.txt",
+            "x",
+            "nested\\deep\\mod.rs",
+            "nested/deep/mod.rs",
+            "file.txt",
+            "file.xxt",
+        ];
+
+        for pattern in patterns {
+            let compiled = Pattern::new(pattern).expect("valid pattern");
+            let suffix = required_literal_suffix(pattern);
+            for path in paths {
+                if compiled.matches_with(path, options) {
+                    assert!(
+                        suffix.is_none_or(|suffix| path.ends_with(suffix)),
+                        "prefilter for {pattern:?} must accept matching path {path:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
