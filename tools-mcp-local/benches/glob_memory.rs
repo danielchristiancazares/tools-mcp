@@ -18,10 +18,14 @@ fn bench_glob_memory(c: &mut Criterion) {
         b.iter_batched(
             || fixture_dir("glob-cold", 16, 32),
             |fixture| {
-                runtime.block_on(glob_once(json!({
+                let result = runtime.block_on(glob_once(json!({
                     "pattern": "**/*.rs",
                     "path": fixture.path().display().to_string(),
-                })))
+                })));
+                // Return the fixture so the TempDir's recursive delete happens
+                // outside the timed region; dropping it here would charge ~512
+                // file deletions to the "cold walk" measurement.
+                (result, fixture)
             },
             BatchSize::SmallInput,
         )

@@ -17,7 +17,7 @@ fn bench_search_memory(c: &mut Criterion) {
         b.iter_batched(
             || fixture_dir("cold", 256, 8),
             |fixture| {
-                runtime.block_on(search_once(
+                let result = runtime.block_on(search_once(
                     fixture.path(),
                     json!({
                         "pattern": "needle",
@@ -29,26 +29,43 @@ fn bench_search_memory(c: &mut Criterion) {
                         "max_results": 10,
                         "timeout_ms": 300000
                     }),
-                ))
+                ));
+                // Return the fixture so the TempDir's recursive delete happens
+                // outside the timed region; dropping it here would charge ~256
+                // file deletions to the "cold index" measurement.
+                (result, fixture)
             },
             BatchSize::SmallInput,
         )
     });
 
+    // Create every warm fixture up front, then age them together past the
+    // git-style racy window (`SCOPE_STAMP_RACY_SLACK`, 2 s): file-set
+    // certification only engages once directory stamps are provably non-racy.
+    // Without the aging sleep, early iterations pay a full rediscovery walk
+    // (uncertified) while later ones skip it (certified), and the measured
+    // distribution becomes a timing-dependent mixture of the two regimes.
+    // Two priming queries per fixture: the first builds the index and grants
+    // certification, the second confirms the steady certified regime.
     let warm_fixture = fixture_dir("warm", 512, 4);
-    runtime.block_on(search_once(
-        warm_fixture.path(),
-        json!({
-            "pattern": "needle",
-            "path": warm_fixture.path().display().to_string(),
-            "fixed_strings": true,
-            "case": "sensitive",
-            "hidden": false,
-            "no_ignore": false,
-            "max_results": 10,
-            "timeout_ms": 300000
-        }),
-    ));
+    let postings_fixture = fixture_dir("postings", 1024, 2);
+    let large_ignored_fixture = large_ignored_fixture_dir("large_ignored", 16, 256);
+    std::thread::sleep(Duration::from_millis(2200));
+    for _ in 0..2 {
+        runtime.block_on(search_once(
+            warm_fixture.path(),
+            json!({
+                "pattern": "needle",
+                "path": warm_fixture.path().display().to_string(),
+                "fixed_strings": true,
+                "case": "sensitive",
+                "hidden": false,
+                "no_ignore": false,
+                "max_results": 10,
+                "timeout_ms": 300000
+            }),
+        ));
+    }
     group.bench_function("warm_query_default_ignore_validation", |b| {
         b.iter(|| {
             runtime.block_on(search_once(
@@ -67,20 +84,21 @@ fn bench_search_memory(c: &mut Criterion) {
         })
     });
 
-    let postings_fixture = fixture_dir("postings", 1024, 2);
-    runtime.block_on(search_once(
-        postings_fixture.path(),
-        json!({
-            "pattern": "needle common token",
-            "path": postings_fixture.path().display().to_string(),
-            "fixed_strings": true,
-            "case": "sensitive",
-            "hidden": false,
-            "no_ignore": true,
-            "max_results": 20,
-            "timeout_ms": 300000
-        }),
-    ));
+    for _ in 0..2 {
+        runtime.block_on(search_once(
+            postings_fixture.path(),
+            json!({
+                "pattern": "needle common token",
+                "path": postings_fixture.path().display().to_string(),
+                "fixed_strings": true,
+                "case": "sensitive",
+                "hidden": false,
+                "no_ignore": true,
+                "max_results": 20,
+                "timeout_ms": 300000
+            }),
+        ));
+    }
     group.bench_function("large_postings_intersection", |b| {
         b.iter(|| {
             runtime.block_on(search_once(
@@ -103,20 +121,22 @@ fn bench_search_memory(c: &mut Criterion) {
     // validation hot path flagged in the optimization triage — directory fingerprint checks,
     // ignore-fingerprint rebuilds, and per-indexed-file metadata sweeps all scale with the
     // indexed corpus, so a bigger corpus gives a clearer signal than the 512-file warm fixture.
-    let large_ignored_fixture = large_ignored_fixture_dir("large_ignored", 16, 256);
-    runtime.block_on(search_once(
-        large_ignored_fixture.path(),
-        json!({
-            "pattern": "needle",
-            "path": large_ignored_fixture.path().display().to_string(),
-            "fixed_strings": true,
-            "case": "sensitive",
-            "hidden": false,
-            "no_ignore": false,
-            "max_results": 20,
-            "timeout_ms": 300000
-        }),
-    ));
+    // (Fixture created above so all warm fixtures age past the racy window together.)
+    for _ in 0..2 {
+        runtime.block_on(search_once(
+            large_ignored_fixture.path(),
+            json!({
+                "pattern": "needle",
+                "path": large_ignored_fixture.path().display().to_string(),
+                "fixed_strings": true,
+                "case": "sensitive",
+                "hidden": false,
+                "no_ignore": false,
+                "max_results": 20,
+                "timeout_ms": 300000
+            }),
+        ));
+    }
     group.bench_function("warm_query_large_workspace_with_ignore", |b| {
         b.iter(|| {
             runtime.block_on(search_once(
