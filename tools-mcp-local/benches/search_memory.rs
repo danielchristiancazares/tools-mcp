@@ -51,6 +51,8 @@ fn bench_search_memory(c: &mut Criterion) {
     let postings_fixture = fixture_dir("postings", 1024, 2);
     let large_ignored_fixture = large_ignored_fixture_dir("large_ignored", 16, 256);
     let many_match_fixture = many_match_fixture_dir("many_match", 24_576);
+    let verify_bound_fixture = verify_bound_fixture_dir("verify_bound", 24_576, 500);
+    let touched_fixture = large_ignored_fixture_dir("touched", 16, 256);
     std::thread::sleep(Duration::from_millis(2200));
     for _ in 0..2 {
         runtime.block_on(search_once(
@@ -196,6 +198,42 @@ fn bench_search_memory(c: &mut Criterion) {
         })
     });
 
+    // Verification-bound scenario: sparse matches (one every 500 lines) never
+    // saturate the default event budget, so every line of the candidate
+    // document is verified with the per-line literal matcher.
+    for _ in 0..2 {
+        runtime.block_on(search_once(
+            verify_bound_fixture.path(),
+            json!({
+                "pattern": "verify_bound_token",
+                "path": verify_bound_fixture.path().display().to_string(),
+                "fixed_strings": true,
+                "case": "sensitive",
+                "hidden": false,
+                "no_ignore": false,
+                "max_results": 100,
+                "timeout_ms": 300000
+            }),
+        ));
+    }
+    group.bench_function("verify_bound_sparse_matches", |b| {
+        b.iter(|| {
+            runtime.block_on(search_once(
+                verify_bound_fixture.path(),
+                json!({
+                    "pattern": "verify_bound_token",
+                    "path": verify_bound_fixture.path().display().to_string(),
+                    "fixed_strings": true,
+                    "case": "sensitive",
+                    "hidden": false,
+                    "no_ignore": false,
+                    "max_results": 100,
+                    "timeout_ms": 300000
+                }),
+            ))
+        })
+    });
+
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.bench_function("budget_render_many_match_10k", |b| {
@@ -210,6 +248,65 @@ fn bench_search_memory(c: &mut Criterion) {
                     "hidden": false,
                     "no_ignore": false,
                     "max_results": 10000,
+                    "timeout_ms": 300000
+                }),
+            ))
+        })
+    });
+
+    // Steady state after a transient directory touch: prime the certified
+    // fast path, create-and-remove a directory under the root (bumping the
+    // root directory stamp without changing the file set), age past the racy
+    // window, and re-prime. Recorded directory stamps no longer match the
+    // snapshot's fingerprint, so every query escalates to full-scope
+    // validation (walk + all-file stat sweep) until something refreshes the
+    // recorded observations.
+    for _ in 0..2 {
+        runtime.block_on(search_once(
+            touched_fixture.path(),
+            json!({
+                "pattern": "needle",
+                "path": touched_fixture.path().display().to_string(),
+                "fixed_strings": true,
+                "case": "sensitive",
+                "hidden": false,
+                "no_ignore": false,
+                "max_results": 20,
+                "timeout_ms": 300000
+            }),
+        ));
+    }
+    let transient_dir = touched_fixture.path().join("transient_probe_dir");
+    fs::create_dir(&transient_dir).expect("transient dir");
+    fs::remove_dir(&transient_dir).expect("remove transient dir");
+    std::thread::sleep(Duration::from_millis(2200));
+    for _ in 0..2 {
+        runtime.block_on(search_once(
+            touched_fixture.path(),
+            json!({
+                "pattern": "needle",
+                "path": touched_fixture.path().display().to_string(),
+                "fixed_strings": true,
+                "case": "sensitive",
+                "hidden": false,
+                "no_ignore": false,
+                "max_results": 20,
+                "timeout_ms": 300000
+            }),
+        ));
+    }
+    group.bench_function("warm_query_after_transient_dir_touch", |b| {
+        b.iter(|| {
+            runtime.block_on(search_once(
+                touched_fixture.path(),
+                json!({
+                    "pattern": "needle",
+                    "path": touched_fixture.path().display().to_string(),
+                    "fixed_strings": true,
+                    "case": "sensitive",
+                    "hidden": false,
+                    "no_ignore": false,
+                    "max_results": 20,
                     "timeout_ms": 300000
                 }),
             ))
@@ -313,6 +410,28 @@ fn many_match_fixture_dir(prefix: &str, lines: usize) -> TempDir {
         }
     }
     fs::write(dir.path().join("dense.txt"), content).expect("fixture file");
+    dir
+}
+
+/// Builds a fixture with one `lines`-line document where the needle appears
+/// only every `match_stride` lines, so the default event budget never
+/// saturates and verification visits every line. The 18-byte needle makes
+/// per-line searcher construction a visible share of the verify cost.
+fn verify_bound_fixture_dir(prefix: &str, lines: usize, match_stride: usize) -> TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    fs::write(dir.path().join(".gitignore"), "# benchmark fixture\n").expect("gitignore");
+    let mut content = String::with_capacity(lines * 24);
+    for line in 0..lines {
+        if line % match_stride == 0 {
+            content.push_str(&format!("verify_bound_token line_{line}\n"));
+        } else {
+            content.push_str(&format!("filler line_{line} pad\n"));
+        }
+    }
+    fs::write(dir.path().join("sparse.txt"), content).expect("fixture file");
     dir
 }
 

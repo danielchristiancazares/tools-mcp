@@ -3803,6 +3803,9 @@ fn candidates_for_short_literal_direct_scan(
     check_deadline(deadline)?;
     let mut candidates = Vec::new();
     let mut scanned_lines = 0_usize;
+    // One searcher for the whole scan (see `matching_line_indexes_with_budget`).
+    let sensitive_finder = (matches!(case, LiteralCase::Sensitive) && !literal.is_empty())
+        .then(|| memchr::memmem::Finder::new(literal));
 
     for (doc_index, doc) in snapshot.documents.iter().enumerate() {
         check_deadline(deadline)?;
@@ -3817,7 +3820,9 @@ fn candidates_for_short_literal_direct_scan(
             )?;
             let line = &doc.content[range.start..range.end];
             let line_matches = match case {
-                LiteralCase::Sensitive => contains_subslice(line, literal),
+                LiteralCase::Sensitive => sensitive_finder
+                    .as_ref()
+                    .is_some_and(|finder| finder.find(line).is_some()),
                 LiteralCase::AsciiInsensitive => {
                     contains_subslice_ascii_case_insensitive(line, literal)
                 }
@@ -4892,6 +4897,20 @@ fn matching_line_indexes_with_budget(
     verification_stats: &mut VerificationStats,
     budget: Option<LineMatchBudget>,
 ) -> Result<MatchingLineOutcome, MemoryError> {
+    // One searcher for the whole document: `memmem::find` rebuilds its needle
+    // tables on every call, which is a visible share of verifying thousands of
+    // short lines. Empty needles keep `contains_subslice`'s no-match contract.
+    let exact_finder = match plan {
+        QueryPlan::Exact {
+            literal,
+            case: LiteralCase::Sensitive,
+        }
+        | QueryPlan::ShortExact {
+            literal,
+            case: LiteralCase::Sensitive,
+        } => (!literal.is_empty()).then(|| memchr::memmem::Finder::new(literal.as_slice())),
+        _ => None,
+    };
     let mut matched = BTreeSet::new();
     let mut budget_saturated_scan_until = None;
     // Incremental view of the render expansion over `matched`: because matches
@@ -4911,7 +4930,9 @@ fn matching_line_indexes_with_budget(
         let is_match = match plan {
             QueryPlan::Exact { literal, case } | QueryPlan::ShortExact { literal, case } => {
                 match case {
-                    LiteralCase::Sensitive => contains_subslice(line, literal),
+                    LiteralCase::Sensitive => exact_finder
+                        .as_ref()
+                        .is_some_and(|finder| finder.find(line).is_some()),
                     LiteralCase::AsciiInsensitive => {
                         contains_subslice_ascii_case_insensitive(line, literal)
                     }
