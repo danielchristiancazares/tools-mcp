@@ -65,7 +65,7 @@ const SCOPE_LOAD_MAX_PARALLEL_WORKERS: usize = 8;
 /// Mirrors git's racy-timestamp rule: a membership change in the same coarse mtime granule as
 /// the recorded stamp can leave the stamp unchanged, so recently-modified directories are
 /// never used to certify the file set. 2 s covers the coarsest common filesystem granularity.
-const SCOPE_STAMP_RACY_SLACK: Duration = Duration::from_secs(2);
+use crate::tools::scope_cache::SCOPE_STAMP_RACY_SLACK;
 const WARM_CACHE_PATTERN: &str = "__tools_mcp_search_warm_cache__";
 
 #[derive(Clone, Debug)]
@@ -4018,21 +4018,6 @@ impl<'a> SnapshotValidation<'a> {
             ));
         }
 
-        if !self.req.no_ignore()
-            && let Some(reason) = check_ignore_fingerprint(
-                self.req,
-                snapshot,
-                snapshot.ignore_fingerprint.as_ref(),
-                deadline,
-            )?
-        {
-            let stats = check_snapshot_fresh(self.req, snapshot, deadline)?;
-            return Ok(FreshnessValidationResult::verified_full_scope(
-                stats,
-                Some(reason),
-            ));
-        }
-
         match check_targeted_snapshot_fresh(
             self.req,
             snapshot,
@@ -4158,6 +4143,29 @@ fn check_targeted_snapshot_fresh(
         return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
     }
 
+    // Ignore controls are checked after (and under the protection of) the
+    // directory-stamp verification above. Once the file set is certified,
+    // every recorded directory stamp was proven race-free and the certifying
+    // query's full probe pass confirmed the recorded control set matched the
+    // disk, so controls recorded as absent cannot have appeared without a
+    // directory stamp changing — their existence probes are skipped. Content
+    // changes to present controls are still validated per query.
+    if !req.no_ignore()
+        && let Some(reason) = check_ignore_fingerprint(
+            req,
+            snapshot,
+            snapshot.ignore_fingerprint.as_ref(),
+            if file_set_certified {
+                crate::tools::scope_cache::AbsentControlSkip::AllVerifiedDirs
+            } else {
+                crate::tools::scope_cache::AbsentControlSkip::ProbeAll
+            },
+            deadline,
+        )?
+    {
+        return Ok(TargetedFreshnessOutcome::NeedsFullScope { reason, stats });
+    }
+
     // With every directory stamp re-verified as matching, a certified file set cannot have
     // gained or lost entries: any direct-child add/remove/rename bumps its parent directory's
     // stamp, and certification proved the recorded stamps were non-racy. Only uncertified
@@ -4239,6 +4247,7 @@ fn check_ignore_fingerprint(
     req: &NormalizedSearchRequest,
     snapshot: &IndexSnapshot,
     expected: Option<&IgnoreFingerprint>,
+    absent_skip: crate::tools::scope_cache::AbsentControlSkip<'_>,
     deadline: Instant,
 ) -> Result<Option<&'static str>, MemoryError> {
     ignore_fingerprint_change_reason(
@@ -4250,6 +4259,7 @@ fn check_ignore_fingerprint(
             .map(|entry| entry.path.as_path()),
         req.no_ignore(),
         expected,
+        absent_skip,
         deadline,
     )
     .map_err(|err| match err {

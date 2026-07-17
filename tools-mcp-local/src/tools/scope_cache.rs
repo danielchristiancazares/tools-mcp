@@ -9,7 +9,14 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Racy-timestamp slack shared by every stamp-trust rule in the local tools,
+/// mirroring git's racy-index handling: a stamp only proves "nothing changed"
+/// when the recorded mtime is at least this much older than the observation
+/// that recorded it, so a write landing in the same filesystem timestamp
+/// granule can never hide behind an unchanged stamp.
+pub(crate) const SCOPE_STAMP_RACY_SLACK: Duration = Duration::from_secs(2);
 
 const DEFAULT_REPO_SCOPE_CACHE_MAX_ENTRIES: usize = 32;
 const DEFAULT_REPO_SCOPE_CACHE_MAX_FILES_TOTAL: usize = 200_000;
@@ -55,16 +62,29 @@ pub struct RecursiveScopeSnapshot {
     pub ignore_fingerprint: Option<IgnoreFingerprint>,
     pub generation: u64,
     pub built_at: Instant,
+    /// Wall-clock instant captured before the build's walk started. Every
+    /// stamp in the snapshot was observed at or after this floor, so a
+    /// directory stamp whose mtime is at least [`SCOPE_STAMP_RACY_SLACK`]
+    /// older than it is race-free: any later change to the directory's
+    /// direct-child membership must produce a different stamp.
+    pub stamp_observation_floor: SystemTime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IgnoreFingerprint {
     entries: Vec<IgnoreFingerprintEntry>,
+    /// Scope directories that contained a `.git` directory when the
+    /// fingerprint was built. A recorded-absent `.git/info/exclude` control
+    /// in a directory outside this set can only start existing if a `.git`
+    /// directory appears first, which bumps the scope directory's own stamp;
+    /// inside this set the exclude file can appear without touching any
+    /// stamped directory, so it must keep being probed.
+    git_dirs: BTreeSet<PathBuf>,
 }
 
 impl IgnoreFingerprint {
     pub fn change_reason(&self, current: &Self) -> Option<&'static str> {
-        if self.entries == current.entries {
+        if self == current {
             return None;
         }
 
@@ -242,6 +262,9 @@ impl RepoScopeCache {
             return self.rebuild_and_store(key, deadline);
         }
 
+        // Directory stamps were just re-verified, so recorded-absent controls
+        // under race-free directories can skip their existence probes.
+        let umbrella_eligible_dirs = umbrella_eligible_directories(&current_snapshot);
         if ignore_fingerprint_change_reason(
             &current_snapshot.root,
             current_snapshot
@@ -250,6 +273,7 @@ impl RepoScopeCache {
                 .map(|entry| entry.path.as_path()),
             key.no_ignore,
             current_snapshot.ignore_fingerprint.as_ref(),
+            AbsentControlSkip::VerifiedDirs(&umbrella_eligible_dirs),
             deadline,
         )?
         .is_some()
@@ -778,12 +802,32 @@ fn windows_filetime_now_ticks() -> Option<i64> {
 #[cfg(not(any(unix, windows)))]
 pub type MetadataChangeMarker = ();
 
+/// Directories whose recorded stamps are race-free relative to the
+/// snapshot's observation floor: their direct-child membership provably
+/// cannot change without producing a different stamp, and the build's own
+/// probes already saw anything created inside the stamp's timestamp granule.
+fn umbrella_eligible_directories(snapshot: &RecursiveScopeSnapshot) -> BTreeSet<PathBuf> {
+    snapshot
+        .directories
+        .iter()
+        .filter(|entry| {
+            entry.stamp.modified.is_some_and(|modified| {
+                modified
+                    .checked_add(SCOPE_STAMP_RACY_SLACK)
+                    .is_some_and(|threshold| threshold <= snapshot.stamp_observation_floor)
+            })
+        })
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
 fn build_recursive_scope_snapshot(
     key: &RepoScopeKey,
     generation: u64,
     deadline: Instant,
 ) -> Result<RecursiveScopeSnapshot, ScopeCacheError> {
     check_deadline(deadline)?;
+    let stamp_observation_floor = SystemTime::now();
 
     let mut builder = WalkBuilder::new(&key.root);
     // Mirror the file selection walker semantics in search_file_selection.rs.
@@ -885,6 +929,7 @@ fn build_recursive_scope_snapshot(
         ignore_fingerprint,
         generation,
         built_at: Instant::now(),
+        stamp_observation_floor,
     })
 }
 
@@ -948,11 +993,62 @@ fn directory_fingerprints_match(
     Ok(true)
 }
 
+/// How recorded-absent controls may be validated without probing the disk.
+///
+/// Skipping is sound only when the caller has, in the same validation pass,
+/// re-verified that the owning directory's stamp still matches AND the
+/// recorded stamp is race-free (`mtime + SCOPE_STAMP_RACY_SLACK` at or before
+/// the observation floor of the pass that proved the control absent): under
+/// those conditions a direct-child control cannot have appeared without
+/// changing the directory stamp, and the race-free rule guarantees the
+/// recording probe already saw anything created in the stamp's granule.
+#[derive(Clone, Copy, Debug)]
+pub enum AbsentControlSkip<'a> {
+    /// Probe every candidate control on disk (previous behavior).
+    ProbeAll,
+    /// Every recorded scope directory's stamp was re-verified this pass and
+    /// is race-free (the search index's certified file-set state).
+    AllVerifiedDirs,
+    /// Only these directories' stamps were re-verified as race-free.
+    VerifiedDirs(&'a BTreeSet<PathBuf>),
+}
+
+impl AbsentControlSkip<'_> {
+    fn directory_is_covered(&self, directory: &Path) -> bool {
+        match self {
+            Self::ProbeAll => false,
+            Self::AllVerifiedDirs => true,
+            Self::VerifiedDirs(dirs) => dirs.contains(directory),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IgnoreControlKind {
+    /// `<dir>/.ignore` or `<dir>/.gitignore`: a direct child of a stamped
+    /// scope directory.
+    DirectChild,
+    /// `<dir>/.git/info/exclude`: only its `.git` ancestor is a direct child
+    /// of a stamped directory.
+    GitExclude,
+    /// The gitconfig `core.excludesFile`, outside the scope entirely.
+    Global,
+}
+
+struct IgnoreControlCandidate {
+    reason: &'static str,
+    kind: IgnoreControlKind,
+    /// Owning scope directory for umbrella decisions; `None` for the global
+    /// control.
+    directory: Option<PathBuf>,
+}
+
 pub fn ignore_fingerprint_change_reason<I, P>(
     root: &Path,
     directories: I,
     no_ignore: bool,
     expected: Option<&IgnoreFingerprint>,
+    absent_skip: AbsentControlSkip<'_>,
     deadline: Instant,
 ) -> Result<Option<&'static str>, ScopeCacheError>
 where
@@ -980,7 +1076,7 @@ where
     let controls = enumerate_ignore_controls(root, directories, deadline)?;
     let mut expected_entries = expected.entries.iter().peekable();
 
-    for (path, reason) in controls {
+    for (path, candidate) in controls {
         check_deadline(deadline)?;
         if let Some(entry) = expected_entries.peek()
             && entry.path < path
@@ -993,8 +1089,13 @@ where
                 expected_entries.next().expect("peeked entry present")
             }
             // Candidate absent from the recorded fingerprint: control set grew.
-            _ => return Ok(Some(reason)),
+            _ => return Ok(Some(candidate.reason)),
         };
+        if matching.stamp.is_none()
+            && absent_control_still_absent(&candidate, expected, absent_skip)
+        {
+            continue;
+        }
         if !ignore_control_stamp_is_fresh(&path, matching.stamp.as_ref(), deadline)? {
             return Ok(Some(matching.reason));
         }
@@ -1005,6 +1106,29 @@ where
     }
 
     Ok(None)
+}
+
+/// Whether a control recorded as absent can be concluded still absent from
+/// directory-stamp verification alone, without a disk probe.
+fn absent_control_still_absent(
+    candidate: &IgnoreControlCandidate,
+    expected: &IgnoreFingerprint,
+    absent_skip: AbsentControlSkip<'_>,
+) -> bool {
+    let Some(directory) = candidate.directory.as_deref() else {
+        return false;
+    };
+    if !absent_skip.directory_is_covered(directory) {
+        return false;
+    }
+    match candidate.kind {
+        // A direct-child control appearing bumps the directory stamp itself.
+        IgnoreControlKind::DirectChild => true,
+        // The exclude file can only appear without touching a stamped
+        // directory if a `.git` directory already existed at build time.
+        IgnoreControlKind::GitExclude => !expected.git_dirs.contains(directory),
+        IgnoreControlKind::Global => false,
+    }
 }
 
 pub fn build_ignore_fingerprint<I, P>(
@@ -1021,56 +1145,81 @@ where
         return Ok(None);
     }
 
-    let controls = enumerate_ignore_controls(root, directories, deadline)?;
+    let directories: Vec<PathBuf> = directories
+        .into_iter()
+        .map(|directory| directory.as_ref().to_path_buf())
+        .collect();
+    let controls = enumerate_ignore_controls(root, directories.iter(), deadline)?;
     let mut entries = Vec::with_capacity(controls.len());
-    for (path, reason) in controls {
+    for (path, candidate) in controls {
         check_deadline(deadline)?;
         entries.push(IgnoreFingerprintEntry {
             stamp: ignore_control_stamp(&path, deadline)?,
             path,
-            reason,
+            reason: candidate.reason,
         });
     }
 
-    Ok(Some(IgnoreFingerprint { entries }))
+    let mut git_dirs = BTreeSet::new();
+    for directory in &directories {
+        check_deadline(deadline)?;
+        if directory.join(".git").is_dir() {
+            git_dirs.insert(directory.clone());
+        }
+    }
+
+    Ok(Some(IgnoreFingerprint { entries, git_dirs }))
 }
 
 fn enumerate_ignore_controls<I, P>(
     root: &Path,
     directories: I,
     deadline: Instant,
-) -> Result<BTreeMap<PathBuf, &'static str>, ScopeCacheError>
+) -> Result<BTreeMap<PathBuf, IgnoreControlCandidate>, ScopeCacheError>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
-    let mut controls = BTreeMap::<PathBuf, &'static str>::new();
+    let mut controls = BTreeMap::<PathBuf, IgnoreControlCandidate>::new();
+    let push_directory_controls =
+        |controls: &mut BTreeMap<PathBuf, IgnoreControlCandidate>, directory: &Path| {
+            controls
+                .entry(directory.join(".ignore"))
+                .or_insert_with(|| IgnoreControlCandidate {
+                    reason: "ignore_file_changed",
+                    kind: IgnoreControlKind::DirectChild,
+                    directory: Some(directory.to_path_buf()),
+                });
+            controls
+                .entry(directory.join(".gitignore"))
+                .or_insert_with(|| IgnoreControlCandidate {
+                    reason: "gitignore_changed",
+                    kind: IgnoreControlKind::DirectChild,
+                    directory: Some(directory.to_path_buf()),
+                });
+            controls
+                .entry(directory.join(".git").join("info").join("exclude"))
+                .or_insert_with(|| IgnoreControlCandidate {
+                    reason: "git_exclude_changed",
+                    kind: IgnoreControlKind::GitExclude,
+                    directory: Some(directory.to_path_buf()),
+                });
+        };
     for directory in directories {
         check_deadline(deadline)?;
-        let directory = directory.as_ref();
-        controls
-            .entry(directory.join(".ignore"))
-            .or_insert("ignore_file_changed");
-        controls
-            .entry(directory.join(".gitignore"))
-            .or_insert("gitignore_changed");
-        controls
-            .entry(directory.join(".git").join("info").join("exclude"))
-            .or_insert("git_exclude_changed");
+        push_directory_controls(&mut controls, directory.as_ref());
     }
     if let Some(path) = ignore::gitignore::gitconfig_excludes_path() {
-        controls.entry(path).or_insert("global_ignore_changed");
+        controls
+            .entry(path)
+            .or_insert_with(|| IgnoreControlCandidate {
+                reason: "global_ignore_changed",
+                kind: IgnoreControlKind::Global,
+                directory: None,
+            });
     }
     if controls.is_empty() {
-        controls
-            .entry(root.join(".ignore"))
-            .or_insert("ignore_file_changed");
-        controls
-            .entry(root.join(".gitignore"))
-            .or_insert("gitignore_changed");
-        controls
-            .entry(root.join(".git").join("info").join("exclude"))
-            .or_insert("git_exclude_changed");
+        push_directory_controls(&mut controls, root);
     }
     Ok(controls)
 }
@@ -1609,6 +1758,7 @@ mod tests {
                 &dirs,
                 false,
                 Some(&fingerprint),
+                AbsentControlSkip::ProbeAll,
                 deadline()
             )
             .expect("validate unchanged"),
@@ -1624,6 +1774,7 @@ mod tests {
                 &dirs,
                 false,
                 Some(&fingerprint),
+                AbsentControlSkip::ProbeAll,
                 deadline()
             )
             .expect("validate rewrite"),
@@ -1642,10 +1793,103 @@ mod tests {
                 &dirs,
                 false,
                 Some(&fingerprint),
+                AbsentControlSkip::ProbeAll,
                 deadline()
             )
             .expect("validate created control"),
             Some("ignore_file_changed"),
+        );
+    }
+
+    #[test]
+    fn absent_control_probes_skip_only_under_verified_race_free_directories() {
+        let dir = TestDir::new("ignore-umbrella-skip");
+        write_file(&dir.path().join(".gitignore"), "aaa\n");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let fingerprint = build_ignore_fingerprint(dir.path(), &dirs, false, deadline())
+            .expect("build fingerprint")
+            .expect("ignore rules apply");
+
+        // Create a control that the fingerprint recorded as absent. A caller
+        // that has re-verified this directory's stamp as race-free may skip
+        // the existence probe, so the change is (by contract) not visible
+        // through this path — the directory stamp itself is the detector.
+        write_file(&dir.path().join(".ignore"), "fresh\n");
+        let eligible: BTreeSet<PathBuf> = dirs.iter().cloned().collect();
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                AbsentControlSkip::VerifiedDirs(&eligible),
+                deadline()
+            )
+            .expect("validate with umbrella"),
+            None,
+            "recorded-absent controls under verified directories skip probes"
+        );
+
+        // Without eligibility the probe still runs and detects the file.
+        let no_dirs = BTreeSet::new();
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                AbsentControlSkip::VerifiedDirs(&no_dirs),
+                deadline()
+            )
+            .expect("validate without umbrella"),
+            Some("ignore_file_changed"),
+        );
+
+        // Content changes to a PRESENT control are always detected, umbrella
+        // or not.
+        write_file(&dir.path().join(".gitignore"), "bbb\n");
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                AbsentControlSkip::AllVerifiedDirs,
+                deadline()
+            )
+            .expect("validate present-control change"),
+            Some("gitignore_changed"),
+        );
+    }
+
+    #[test]
+    fn git_exclude_probe_survives_umbrella_when_git_dir_was_recorded() {
+        let dir = TestDir::new("ignore-umbrella-git-exclude");
+        let git_info = dir.path().join(".git").join("info");
+        fs::create_dir_all(&git_info).expect("create .git/info");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let fingerprint = build_ignore_fingerprint(dir.path(), &dirs, false, deadline())
+            .expect("build fingerprint")
+            .expect("ignore rules apply");
+
+        // The exclude file appears inside a pre-existing `.git` directory:
+        // no stamped scope directory changes, so the umbrella must NOT skip
+        // this probe.
+        write_file(&git_info.join("exclude"), "secret\n");
+        assert_eq!(
+            ignore_fingerprint_change_reason(
+                dir.path(),
+                &dirs,
+                false,
+                Some(&fingerprint),
+                AbsentControlSkip::AllVerifiedDirs,
+                deadline()
+            )
+            .expect("validate exclude creation"),
+            Some("git_exclude_changed"),
+            "exclude probes must keep running when .git existed at build time"
         );
     }
 
@@ -1669,6 +1913,7 @@ mod tests {
             &grown_dirs,
             false,
             Some(&fingerprint),
+            AbsentControlSkip::ProbeAll,
             deadline(),
         )
         .expect("validate grown set");
