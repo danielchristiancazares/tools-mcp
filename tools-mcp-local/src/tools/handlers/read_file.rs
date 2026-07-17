@@ -406,11 +406,27 @@ fn render_numbered_bytes_lossy(bytes: &[u8], start_line: usize, resolved_end: us
         push_number_prefix(&mut body, line_no, width);
         // Equivalent to `String::from_utf8_lossy` (one U+FFFD per maximal
         // invalid subpart) but streamed into `body` without intermediate
-        // allocations.
-        for chunk in bytes[line_start..line_end].utf8_chunks() {
-            body.push_str(chunk.valid());
-            if !chunk.invalid().is_empty() {
-                body.push(char::REPLACEMENT_CHARACTER);
+        // allocations. Valid runs are located with `from_utf8`, which
+        // validates word-at-a-time, instead of `utf8_chunks`, whose scalar
+        // decoder dominated this path for mostly-valid lines.
+        let mut rest = &bytes[line_start..line_end];
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    body.push_str(text);
+                    break;
+                }
+                Err(err) => {
+                    let (valid, after_valid) = rest.split_at(err.valid_up_to());
+                    body.push_str(
+                        std::str::from_utf8(valid).expect("validated prefix is valid UTF-8"),
+                    );
+                    body.push(char::REPLACEMENT_CHARACTER);
+                    // `error_len() == None` means the slice ends mid-sequence;
+                    // the truncated tail is one maximal invalid subpart.
+                    let skip = err.error_len().unwrap_or(after_valid.len());
+                    rest = &after_valid[skip..];
+                }
             }
         }
         line_no += 1;
