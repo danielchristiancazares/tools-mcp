@@ -32,8 +32,13 @@ fn bench_glob_memory(c: &mut Criterion) {
     });
 
     // Warm: repeated queries against one root reuse the cached scope
-    // snapshot, isolating pattern matching and payload rendering.
+    // snapshot, isolating pattern matching and payload rendering. Age the
+    // fixture past the racy-stamp window (2 s) before the snapshot builds so
+    // directory stamps are race-free, as they are for real workspaces that
+    // were not created milliseconds before the query; recorded-absent
+    // ignore-control probes are only skippable for race-free directories.
     let warm_fixture = fixture_dir("glob-warm", 16, 64);
+    std::thread::sleep(Duration::from_millis(2200));
     runtime.block_on(glob_once(json!({
         "pattern": "**/*.rs",
         "path": warm_fixture.path().display().to_string(),
