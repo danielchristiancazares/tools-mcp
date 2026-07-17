@@ -4894,6 +4894,14 @@ fn matching_line_indexes_with_budget(
 ) -> Result<MatchingLineOutcome, MemoryError> {
     let mut matched = BTreeSet::new();
     let mut budget_saturated_scan_until = None;
+    // Incremental view of the render expansion over `matched`: because matches
+    // arrive in ascending line order, each match's context interval only ever
+    // appends rendered lines strictly above `rendered_max` (the merge rule in
+    // `for_each_render_interval` collapses to this run), so the rendered-line
+    // count and the budget-th rendered line can be maintained in O(1) per match
+    // instead of re-materializing the full render set.
+    let mut rendered_count = 0_usize;
+    let mut rendered_max: Option<usize> = None;
     for (line_index, range) in doc.lines.iter().enumerate() {
         if line_index.is_multiple_of(LINE_VERIFY_DEADLINE_CHECK_STRIDE) {
             check_deadline(deadline)?;
@@ -4982,26 +4990,39 @@ fn matching_line_indexes_with_budget(
                 stopped_after_budget: true,
             });
         }
-        if (is_match || budget_saturated_scan_until.is_some())
+        if is_match
+            && budget_saturated_scan_until.is_none()
             && let Some(budget) = budget
             && budget.event_budget > 0
-            && !matched.is_empty()
+            && let Some((start, end)) =
+                render_interval(line_index, doc.lines.len(), budget.context)
         {
-            let render_lines = render_line_indexes_with_deadline(
-                &matched,
-                doc.lines.len(),
-                budget.context,
-                deadline,
-            )?;
-            if render_lines.len() >= budget.event_budget {
-                let scan_until = render_lines[budget.event_budget - 1];
-                if line_index >= scan_until {
-                    return Ok(MatchingLineOutcome {
-                        lines: matched,
-                        stopped_after_budget: true,
-                    });
+            // Lines this match adds to the render set: the run strictly above
+            // whatever is already rendered (`end` is non-decreasing across
+            // matches, so nothing lands below `rendered_max`).
+            let append_from = match rendered_max {
+                Some(rendered_max) if start <= rendered_max => rendered_max + 1,
+                _ => start,
+            };
+            if append_from <= end {
+                let appended = end - append_from + 1;
+                let remaining = budget.event_budget - rendered_count;
+                if appended >= remaining {
+                    // The budget-th rendered line just materialized inside this
+                    // appended run; rendered lines only ever append above it,
+                    // so it is final and scanning past it cannot change the
+                    // first `event_budget` rendered lines.
+                    let scan_until = append_from + remaining - 1;
+                    if line_index >= scan_until {
+                        return Ok(MatchingLineOutcome {
+                            lines: matched,
+                            stopped_after_budget: true,
+                        });
+                    }
+                    budget_saturated_scan_until = Some(scan_until);
                 }
-                budget_saturated_scan_until = Some(scan_until);
+                rendered_count += appended;
+                rendered_max = Some(end);
             }
         }
     }
@@ -5458,6 +5479,7 @@ fn render_line_indexes(
     )
 }
 
+#[cfg(test)]
 fn render_line_indexes_with_deadline(
     matched_lines: &BTreeSet<usize>,
     line_count: usize,
@@ -5567,6 +5589,7 @@ fn render_interval(match_line: usize, line_count: usize, context: usize) -> Opti
     Some((start, end))
 }
 
+#[cfg(test)]
 fn rendered_line_capacity(matched_line_count: usize, line_count: usize, context: usize) -> usize {
     let context_width = context.saturating_mul(2).saturating_add(1);
     matched_line_count
@@ -6742,6 +6765,105 @@ mod tests {
             render_line_indexes(&matched, doc.lines.len(), 1).expect("render lines"),
             vec![0, 1, 2, 3, 4]
         );
+    }
+
+    /// Reference for the budgeted line scan: re-derives the full render
+    /// expansion after every match (the pre-optimization semantics) and stops
+    /// exactly where the original algorithm stopped.
+    fn reference_budget_outcome(
+        match_mask: &[bool],
+        context: usize,
+        event_budget: usize,
+    ) -> (BTreeSet<usize>, bool) {
+        let line_count = match_mask.len();
+        let mut matched = BTreeSet::new();
+        let mut scan_until: Option<usize> = None;
+        for (line_index, &is_match) in match_mask.iter().enumerate() {
+            if is_match {
+                matched.insert(line_index);
+            }
+            if let Some(until) = scan_until
+                && line_index >= until
+            {
+                return (matched, true);
+            }
+            if (is_match || scan_until.is_some()) && event_budget > 0 && !matched.is_empty() {
+                let render_lines =
+                    render_line_indexes(&matched, line_count, context).expect("render lines");
+                if render_lines.len() >= event_budget {
+                    let until = render_lines[event_budget - 1];
+                    if line_index >= until {
+                        return (matched, true);
+                    }
+                    scan_until = Some(until);
+                }
+            }
+        }
+        (matched, false)
+    }
+
+    #[test]
+    fn budget_scan_matches_full_render_reference_across_cases() {
+        // Deterministic LCG-driven grid: the incremental budget tracker must
+        // report the same matched lines and the same stop decision as the
+        // reference that re-materializes the render set per match.
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % bound
+        };
+        for case in 0..500 {
+            let line_count = next(40) + 1;
+            let context = next(4);
+            let event_budget = next(8) + 1;
+            let match_mask: Vec<bool> = (0..line_count).map(|_| next(3) == 0).collect();
+
+            let mut content = Vec::new();
+            for &is_match in &match_mask {
+                content.extend_from_slice(if is_match { b"hit\n" } else { b"miss\n" });
+            }
+            let doc = Document {
+                path: PathBuf::from("budget.txt"),
+                rendered_path: "budget.txt".to_string(),
+                stamp: FileStamp {
+                    len: 0,
+                    modified: None,
+                    change_marker: None,
+                },
+                lines: line_ranges(&content),
+                content,
+            };
+            let mut verification_stats = VerificationStats::default();
+            let outcome = matching_line_indexes_with_budget(
+                &doc,
+                &QueryPlan::Exact {
+                    literal: b"hit".to_vec(),
+                    case: LiteralCase::Sensitive,
+                },
+                None,
+                &test_limits(),
+                Instant::now() + Duration::from_secs(30),
+                &mut verification_stats,
+                Some(LineMatchBudget {
+                    context,
+                    event_budget,
+                }),
+            )
+            .expect("budgeted match scan");
+
+            let (expected_lines, expected_stopped) =
+                reference_budget_outcome(&match_mask, context, event_budget);
+            assert_eq!(
+                outcome.lines, expected_lines,
+                "case {case}: lines diverged (mask {match_mask:?}, context {context}, budget {event_budget})"
+            );
+            assert_eq!(
+                outcome.stopped_after_budget, expected_stopped,
+                "case {case}: stop decision diverged (mask {match_mask:?}, context {context}, budget {event_budget})"
+            );
+        }
     }
 
     #[test]
