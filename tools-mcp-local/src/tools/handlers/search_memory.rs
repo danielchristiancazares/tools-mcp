@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -4188,8 +4188,8 @@ fn check_targeted_snapshot_fresh(
         stats.indexed_files_checked = stats.indexed_files_checked.saturating_add(1);
         stats.result_files_checked = stats.result_files_checked.saturating_add(1);
 
-        let metadata = match fs::metadata(&doc.path) {
-            Ok(metadata) => metadata,
+        let observation = match observe_file_stamp(&doc.stamp, &doc.path) {
+            Ok(observation) => observation,
             Err(err) => {
                 return Err(file_changed_error(
                     format!(
@@ -4201,14 +4201,11 @@ fn check_targeted_snapshot_fresh(
             }
         };
         check_deadline(deadline)?;
-        if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
-            continue;
-        }
-        if file_stamp_matches_via_handle_refresh(&doc.stamp, &metadata, &doc.path) {
+        if observation.matches_without_content {
             continue;
         }
 
-        validate_result_file_content_matches(doc, &metadata, deadline)?;
+        validate_result_file_content_matches(doc, &observation.metadata, deadline)?;
     }
 
     Ok(TargetedFreshnessOutcome::Verified {
@@ -4341,7 +4338,7 @@ fn validate_indexed_documents_fresh(
 
 fn validate_indexed_document_fresh(doc: &Document, deadline: Instant) -> Result<(), MemoryError> {
     check_deadline(deadline)?;
-    let metadata = fs::metadata(&doc.path).map_err(|err| {
+    let observation = observe_file_stamp(&doc.stamp, &doc.path).map_err(|err| {
         MemoryError::new(
             "file_changed_during_verification",
             "file_changed_during_verification",
@@ -4352,14 +4349,11 @@ fn validate_indexed_document_fresh(doc: &Document, deadline: Instant) -> Result<
         )
     })?;
     check_deadline(deadline)?;
-    if file_metadata_matches_without_hash(&doc.stamp, &metadata) {
-        return Ok(());
-    }
-    if file_stamp_matches_via_handle_refresh(&doc.stamp, &metadata, &doc.path) {
+    if observation.matches_without_content {
         return Ok(());
     }
 
-    validate_result_file_content_matches(doc, &metadata, deadline)
+    validate_result_file_content_matches(doc, &observation.metadata, deadline)
 }
 
 fn check_snapshot_file_set(
@@ -5961,11 +5955,37 @@ fn attach_handle_change_info(_stamp: &mut FileStamp, _file: &fs::File) {}
 /// by-handle change information can prove the file unchanged by re-observing
 /// the same ChangeTime and file identity, skipping the content re-read.
 /// Any failure along the way returns `false`, falling back to byte validation.
+/// (Production Windows callers hold the handle already and go through
+/// [`file_stamp_matches_via_handle`]; this path-based form serves tests.)
 #[cfg(windows)]
+#[cfg_attr(windows, allow(dead_code))]
 fn file_stamp_matches_via_handle_refresh(
     stamp: &FileStamp,
     metadata: &fs::Metadata,
     path: &Path,
+) -> bool {
+    let Ok(file) = crate::tools::scope_cache::open_for_attributes(path) else {
+        return false;
+    };
+    file_stamp_matches_via_handle(stamp, metadata, &file)
+}
+
+#[cfg(not(windows))]
+fn file_stamp_matches_via_handle_refresh(
+    _stamp: &FileStamp,
+    _metadata: &fs::Metadata,
+    _path: &Path,
+) -> bool {
+    false
+}
+
+/// Handle-based form of [`file_stamp_matches_via_handle_refresh`] for callers
+/// that already hold an attribute handle on the file.
+#[cfg(windows)]
+fn file_stamp_matches_via_handle(
+    stamp: &FileStamp,
+    metadata: &fs::Metadata,
+    file: &fs::File,
 ) -> bool {
     let Some(expected_marker) = stamp.change_marker.as_ref() else {
         return false;
@@ -5982,19 +6002,44 @@ fn file_stamp_matches_via_handle_refresh(
     if expected_marker.stat_fields() != current_marker.stat_fields() {
         return false;
     }
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    windows_handle_change_info(&file).is_some_and(|current| current == expected_handle)
+    windows_handle_change_info(file).is_some_and(|current| current == expected_handle)
+}
+
+/// One freshness observation of a file's stamp-visible state.
+///
+/// `matches_without_content` is true when the recorded stamp proves the file
+/// unchanged without reading content: on Unix a plain stat suffices (marker
+/// equality includes ctime), while on Windows the stat-visible fields and the
+/// by-handle ChangeTime are read through a single attribute-only handle.
+/// `std::fs::metadata` on Windows opens a handle internally anyway, so the
+/// previous stat-then-reopen sequence paid two `CreateFile` calls per file;
+/// this shape pays one, and both reads observe the same open file object.
+struct FileStampObservation {
+    metadata: fs::Metadata,
+    matches_without_content: bool,
+}
+
+#[cfg(windows)]
+fn observe_file_stamp(stamp: &FileStamp, path: &Path) -> io::Result<FileStampObservation> {
+    let file = crate::tools::scope_cache::open_for_attributes(path)?;
+    let metadata = file.metadata()?;
+    let matches_without_content = file_metadata_matches_without_hash(stamp, &metadata)
+        || file_stamp_matches_via_handle(stamp, &metadata, &file);
+    Ok(FileStampObservation {
+        metadata,
+        matches_without_content,
+    })
 }
 
 #[cfg(not(windows))]
-fn file_stamp_matches_via_handle_refresh(
-    _stamp: &FileStamp,
-    _metadata: &fs::Metadata,
-    _path: &Path,
-) -> bool {
-    false
+fn observe_file_stamp(stamp: &FileStamp, path: &Path) -> io::Result<FileStampObservation> {
+    let metadata = fs::metadata(path)?;
+    let matches_without_content = file_metadata_matches_without_hash(stamp, &metadata)
+        || file_stamp_matches_via_handle_refresh(stamp, &metadata, path);
+    Ok(FileStampObservation {
+        metadata,
+        matches_without_content,
+    })
 }
 
 #[cfg(not(any(unix, windows)))]

@@ -679,6 +679,26 @@ fn attach_handle_change_info_to_stamp(_stamp: &mut MetadataStamp, _file: &fs::Fi
 #[cfg(windows)]
 const WINDOWS_CHANGE_TIME_RACY_GUARD_TICKS: i64 = 100 * 10_000; // 100 ms in 100 ns ticks
 
+/// Opens `path` with attribute-only access (`FILE_READ_ATTRIBUTES`), which is
+/// all `GetFileInformationByHandleEx` metadata queries need. Unlike a
+/// `GENERIC_READ` open, this does not trigger antivirus on-access content
+/// scanning and cannot conflict with a writer holding the file exclusively,
+/// so change-marker re-observation stays cheap and succeeds in strictly more
+/// cases. Directories still fail to open (no `FILE_FLAG_BACKUP_SEMANTICS`),
+/// matching `File::open` behavior.
+#[cfg(windows)]
+pub(crate) fn open_for_attributes(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+}
+
 /// Queries ChangeTime plus volume/file identity from an open handle.
 /// Returns `None` when the filesystem cannot answer or the ChangeTime is too
 /// recent to be race-free.
@@ -1092,19 +1112,21 @@ fn ignore_control_stamp(
 /// Returns whether the on-disk state of `path` still matches the recorded
 /// control stamp, re-hashing content only when no trusted change marker
 /// (Unix ctime, Windows by-handle ChangeTime) can prove the file unchanged.
+///
+/// On Windows the stat fields and the ChangeTime re-observation both come
+/// from one attribute-only handle: a path-based metadata query would open a
+/// handle internally anyway, so splitting the two reads doubled the
+/// `CreateFile` cost per control on every warm query.
 fn ignore_control_stamp_is_fresh(
     path: &Path,
     expected: Option<&IgnoreControlStamp>,
     deadline: Instant,
 ) -> Result<bool, ScopeCacheError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(expected.is_none()),
+    let (metadata, marker_proves_unchanged) = match observe_control_stamp(path, expected) {
+        Ok(Some(observation)) => observation,
+        Ok(None) => return Ok(expected.is_none()),
         Err(err) => return Err(ScopeCacheError::Io(err)),
     };
-    if !metadata.is_file() {
-        return Ok(expected.is_none());
-    }
     let Some(expected) = expected else {
         return Ok(false);
     };
@@ -1118,7 +1140,7 @@ fn ignore_control_stamp_is_fresh(
         return Ok(false);
     }
 
-    if change_marker_proves_unchanged(&expected.metadata, path) {
+    if marker_proves_unchanged {
         return Ok(true);
     }
 
@@ -1151,31 +1173,68 @@ fn change_markers_match_stat_fields(
 
 /// Whether the recorded marker alone proves content unchanged once the
 /// stat-visible fields match. On Unix marker equality includes ctime, which
-/// any rewrite bumps. On Windows this requires re-observing the recorded
-/// by-handle ChangeTime and file identity.
+/// any rewrite bumps. (Windows proves this by re-observing the recorded
+/// by-handle ChangeTime and file identity inside [`observe_control_stamp`].)
 #[cfg(unix)]
 fn change_marker_proves_unchanged(expected: &MetadataStamp, _path: &Path) -> bool {
     expected.change_marker.is_some()
 }
 
-#[cfg(windows)]
-fn change_marker_proves_unchanged(expected: &MetadataStamp, path: &Path) -> bool {
-    let Some(expected_handle) = expected
-        .change_marker
-        .as_ref()
-        .and_then(|marker| marker.handle_info)
-    else {
-        return false;
-    };
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    windows_handle_change_info(&file).is_some_and(|current| current == expected_handle)
-}
-
 #[cfg(not(any(unix, windows)))]
 fn change_marker_proves_unchanged(_expected: &MetadataStamp, _path: &Path) -> bool {
     false
+}
+
+/// One-handle control observation: `Ok(None)` when the control is absent (or
+/// not a regular file), otherwise the live metadata plus whether the recorded
+/// change marker proves the content unchanged.
+#[cfg(windows)]
+fn observe_control_stamp(
+    path: &Path,
+    expected: Option<&IgnoreControlStamp>,
+) -> io::Result<Option<(fs::Metadata, bool)>> {
+    let file = match open_for_attributes(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            // Windows cannot open directories without backup semantics; a
+            // non-file control is treated as absent, exactly as the
+            // stat-first form concluded.
+            return match fs::metadata(path) {
+                Ok(metadata) if !metadata.is_file() => Ok(None),
+                _ => Err(err),
+            };
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let marker_proves_unchanged = expected
+        .and_then(|expected| expected.metadata.change_marker.as_ref())
+        .and_then(|marker| marker.handle_info)
+        .is_some_and(|expected_handle| {
+            windows_handle_change_info(&file).is_some_and(|current| current == expected_handle)
+        });
+    Ok(Some((metadata, marker_proves_unchanged)))
+}
+
+#[cfg(not(windows))]
+fn observe_control_stamp(
+    path: &Path,
+    expected: Option<&IgnoreControlStamp>,
+) -> io::Result<Option<(fs::Metadata, bool)>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let marker_proves_unchanged =
+        expected.is_some_and(|expected| change_marker_proves_unchanged(&expected.metadata, path));
+    Ok(Some((metadata, marker_proves_unchanged)))
 }
 
 fn content_hash_from_reader<R: Read>(
