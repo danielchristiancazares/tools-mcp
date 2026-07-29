@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::io::{self, BufReader, Stdout};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tools_mcp_core::{
@@ -25,6 +25,7 @@ mod mcp_server;
 mod ping;
 
 type SharedWriter = Arc<Mutex<Stdout>>;
+const MAX_INFLIGHT_DISPATCH_TASKS: usize = 64;
 
 enum ServerControl {
     GracefulShutdown,
@@ -85,6 +86,7 @@ async fn main() -> Result<()> {
     let mut tasks = JoinSet::new();
     let mut abort_pending_tasks = false;
     let abort_requested = Arc::new(AtomicBool::new(false));
+    let task_limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCH_TASKS));
 
     'read_loop: loop {
         while let Some(join_result) = tasks.try_join_next() {
@@ -200,6 +202,10 @@ async fn main() -> Result<()> {
             }
             RpcMessage::Request(req) => {
                 let should_stop_reading = request_requests_shutdown(&req);
+                let Ok(task_permit) = Arc::clone(&task_limiter).acquire_owned().await else {
+                    abort_pending_tasks = true;
+                    break 'read_loop;
+                };
                 let registry = Arc::clone(&registry);
                 let static_payloads = Arc::clone(&static_payloads);
                 let writer = Arc::clone(&writer);
@@ -219,6 +225,7 @@ async fn main() -> Result<()> {
                 });
 
                 tasks.spawn(async move {
+                    let _task_permit = task_permit;
                     let _guard = inflight_guard;
                     let Some((resp, should_exit)) = dispatch_jsonrpc_request(
                         req,
@@ -253,6 +260,10 @@ async fn main() -> Result<()> {
             }
             RpcMessage::Batch(items) => {
                 let should_stop_reading = batch_requests_shutdown(&items);
+                let Ok(task_permit) = Arc::clone(&task_limiter).acquire_owned().await else {
+                    abort_pending_tasks = true;
+                    break 'read_loop;
+                };
                 let registry = Arc::clone(&registry);
                 let static_payloads = Arc::clone(&static_payloads);
                 let writer = Arc::clone(&writer);
@@ -261,6 +272,7 @@ async fn main() -> Result<()> {
                 let abort_requested = Arc::clone(&abort_requested);
 
                 tasks.spawn(async move {
+                    let _task_permit = task_permit;
                     let Some((responses, should_exit)) = dispatch_jsonrpc_batch(
                         items,
                         registry.as_ref(),
